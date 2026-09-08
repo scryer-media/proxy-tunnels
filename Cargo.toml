@@ -2,7 +2,7 @@
 name = "proxy-tunnels"
 version = "0.20.0"
 edition = "2024"
-description = "First-party SSH and userspace WireGuard tunnels for Scryer and Weaver"
+description = "First-party SSH, userspace WireGuard and optional HTTP/3 tunnels for Scryer and Weaver"
 license = "GPL-3.0-only"
 repository = "https://github.com/scryer-media/proxy-tunnels"
 readme = "README.md"
@@ -15,6 +15,7 @@ default = []
 # `scryer-plugins` and `scryer-infrastructure-acquisition` that prove their
 # egress really travels through a tunnel. Never enabled in a product build.
 test-support = []
+http3 = ["dep:bytes", "dep:http", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
 # The whole reason this crate exists: russh (and only russh) may depend on the
@@ -32,8 +33,8 @@ russh = { version = "0.63.1", default-features = false, features = ["aws-lc-rs"]
 #
 # `default-features = false` on gotatun exists to name `aws-lc-rs` explicitly
 # rather than inherit it: that keeps the workspace on one crypto backend and
-# keeps `ring` out of the graph entirely (gotatun's `ring` feature is the only
-# path to it). `tun`, `daita`, `pcap` and `windows-gro` stay off.
+# keeps gotatun's `ring` backend disabled. `tun`, `daita`, `pcap` and
+# `windows-gro` stay off.
 #
 # smoltcp is compiled down to exactly what a point-to-point tunnel needs:
 # `medium-ip` (no Ethernet, so no ARP and no neighbour cache), both IP
@@ -52,5 +53,19 @@ async-trait = "0.1"
 thiserror = "2.0"
 tracing = "0.1"
 
+# Optional HTTP/3 CONNECT transport. Keep the existing AWS-LC backend;
+# Quinn's default features would otherwise introduce ring.
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+h3 = { version = "0.0.8", path = "vendor/h3", optional = true }
+h3-quinn = { version = "0.0.10", path = "vendor/h3-quinn", optional = true }
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"], optional = true }
+webpki-roots = { version = "1", optional = true }
+
 [dev-dependencies]
 tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "test-util"] }
+
+[[example]]
+name = "http3_interop"
+required-features = ["http3"]

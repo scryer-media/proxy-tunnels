@@ -159,8 +159,25 @@ impl TunnelRegistry {
         })
     }
 
+    /// Start a lazy HTTP/3 CONNECT front using the public TLS root store.
+    /// Private root stores can use `ensure_tunnel_with` and a custom provider.
+    #[cfg(feature = "http3")]
+    pub fn ensure_http3_tunnel(
+        &self,
+        spec: crate::Http3TunnelSpec,
+        observer: Arc<dyn TunnelObserver>,
+        credentials: Socks5Credentials,
+    ) -> Result<TunnelFront, TunnelError> {
+        let id = spec.proxy_config_id.clone();
+        let revision = spec.revision.clone();
+        let timeout = spec.request_timeout;
+        self.ensure_tunnel_with(&id, &revision, timeout, observer, credentials, move || {
+            Ok(Arc::new(crate::Http3TunnelProvider::new(spec)?) as Arc<dyn TunnelProvider>)
+        })
+    }
+
     /// The technology-independent half: everything except which provider gets
-    /// built. Both `ensure_*` entry points call this with a different factory
+    /// built. The `ensure_*` entry points call this with a different factory
     /// and inherit the front, the keying, the lifecycle and every consumer
     /// unchanged.
     pub fn ensure_tunnel_with<F>(

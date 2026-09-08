@@ -41,6 +41,8 @@
 //! repository.
 
 mod error;
+#[cfg(feature = "http3")]
+pub mod http3;
 mod provider;
 mod registry;
 pub mod socks5;
@@ -51,6 +53,8 @@ pub mod wireguard;
 pub mod test_support;
 
 pub use error::TunnelError;
+#[cfg(feature = "http3")]
+pub use http3::{Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec};
 pub use provider::{
     ED25519_ONLY_PRIVATE_KEY_MESSAGE, NoopTunnelObserver, TunnelObserver, TunnelProvider,
     TunnelSpec, TunnelStream,
