@@ -124,6 +124,26 @@ pub struct SshServerDouble {
 impl SshServerDouble {
     /// Start on an ephemeral loopback port.
     pub async fn start(options: SshServerOptions) -> Self {
+        Self::start_inner(options, None).await
+    }
+
+    /// Forward only explicitly mapped names to isolated loopback fixtures.
+    pub async fn start_with_destinations(
+        options: SshServerOptions,
+        destinations: std::collections::HashMap<(String, u16), SocketAddr>,
+    ) -> Self {
+        assert!(
+            destinations
+                .values()
+                .all(|address| address.ip().is_loopback())
+        );
+        Self::start_inner(options, Some(destinations)).await
+    }
+
+    async fn start_inner(
+        options: SshServerOptions,
+        destinations: Option<std::collections::HashMap<(String, u16), SocketAddr>>,
+    ) -> Self {
         let host_key = russh::keys::decode_secret_key(options.host_key_pem, None)
             .expect("test host key parses");
         let authorized_fingerprint = options.authorized_key_pem.map(|pem| {
@@ -151,11 +171,13 @@ impl SshServerDouble {
         let accepted_auth = Arc::new(Mutex::new(Vec::new()));
 
         let options = Arc::new(options);
+        let destinations = Arc::new(destinations);
         let forwarded_for_task = Arc::clone(&forwarded);
         let accepted_for_task = Arc::clone(&accepted_auth);
         tokio::spawn(async move {
             while let Ok((stream, _peer)) = listener.accept().await {
                 let handler = DoubleHandler {
+                    destinations: destinations.clone(),
                     options: Arc::clone(&options),
                     authorized_fingerprint: authorized_fingerprint.clone(),
                     forwarded: Arc::clone(&forwarded_for_task),
@@ -203,6 +225,7 @@ impl SshServerDouble {
 }
 
 struct DoubleHandler {
+    destinations: Arc<Option<std::collections::HashMap<(String, u16), SocketAddr>>>,
     options: Arc<SshServerOptions>,
     authorized_fingerprint: Option<String>,
     forwarded: Arc<Mutex<Vec<(String, u16)>>>,
@@ -268,7 +291,18 @@ impl server::Handler for DoubleHandler {
             return Ok(());
         }
 
-        match tokio::net::TcpStream::connect((host_to_connect, port)).await {
+        let connected = if let Some(destinations) = self.destinations.as_ref() {
+            match destinations.get(&(host_to_connect.to_owned(), port)) {
+                Some(address) => tokio::net::TcpStream::connect(address).await,
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "unmapped fixture destination",
+                )),
+            }
+        } else {
+            tokio::net::TcpStream::connect((host_to_connect, port)).await
+        };
+        match connected {
             Ok(mut upstream) => {
                 reply.accept().await;
                 tokio::spawn(async move {

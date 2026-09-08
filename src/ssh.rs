@@ -70,6 +70,7 @@ pub struct SshTunnelProvider {
     observer: Arc<dyn TunnelObserver>,
     host_key: Arc<Mutex<HostKeyState>>,
     session: tokio::sync::Mutex<Option<Arc<client::Handle<SshClientHandler>>>>,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl SshTunnelProvider {
@@ -82,6 +83,7 @@ impl SshTunnelProvider {
             observer,
             host_key: Arc::new(Mutex::new(HostKeyState::default())),
             session: tokio::sync::Mutex::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -250,6 +252,9 @@ impl SshTunnelProvider {
     /// seedbox costs one connect attempt per request rather than a spin.
     async fn session(&self) -> Result<Arc<client::Handle<SshClientHandler>>, TunnelError> {
         let mut guard = self.session.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(TunnelError::Engine("tunnel provider stopped".into()));
+        }
         if let Some(existing) = guard.as_ref() {
             return Ok(Arc::clone(existing));
         }
@@ -264,6 +269,9 @@ impl SshTunnelProvider {
         stale: &Arc<client::Handle<SshClientHandler>>,
     ) -> Result<Arc<client::Handle<SshClientHandler>>, TunnelError> {
         let mut guard = self.session.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(TunnelError::Engine("tunnel provider stopped".into()));
+        }
         if let Some(current) = guard.as_ref()
             && !Arc::ptr_eq(current, stale)
         {
@@ -326,6 +334,19 @@ enum ChannelFailure {
 
 #[async_trait::async_trait]
 impl TunnelProvider for SshTunnelProvider {
+    async fn shutdown(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(session) = self.session.lock().await.take() {
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "profile revoked", "en")
+                .await;
+            if let Ok(handle) = Arc::try_unwrap(session) {
+                let _ = handle.await;
+            }
+        }
+    }
+
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let session = self.session().await?;
         match self.open_channel(&session, host, port).await {

@@ -697,3 +697,55 @@ async fn a_rebuilt_tunnel_reaches_the_same_peer_again() {
         .expect("second tunnel");
     let _ = http_get_through(&mut stream, "origin.tunnel.test").await;
 }
+
+#[tokio::test]
+async fn large_download_drains_after_receive_backpressure() {
+    let body: String = (0..40_000)
+        .map(|index| {
+            format!("{index:08}:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n")
+        })
+        .collect();
+    assert!(body.len() > 2 * 1024 * 1024);
+    let peer = WireGuardTestPeer::start_for_downloads(
+        WireGuardTestPeerOptions {
+            body: body.clone(),
+            ..Default::default()
+        },
+        None,
+        Duration::from_millis(10),
+        true,
+    )
+    .await;
+    let provider = WireGuardTunnelProvider::new(
+        peer.client_spec("download-backpressure"),
+        Arc::new(NoopTunnelObserver),
+    )
+    .with_download_tuning();
+    let mut stream = provider
+        .dial(&TEST_PEER_ADDRESS.to_string(), peer.http_port())
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    // Let the receiver fill before draining more than two complete windows.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        stream.read_to_string(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.split_once("\r\n\r\n").unwrap().1, body);
+    drop(stream);
+    provider.shutdown().await;
+    assert!(
+        provider
+            .dial(&TEST_PEER_ADDRESS.to_string(), peer.http_port())
+            .await
+            .is_err()
+    );
+}
