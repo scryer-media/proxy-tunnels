@@ -38,7 +38,7 @@ Replace the placeholder with a reviewed commit and commit the consumer's
 development dependencies. The package version is inherited from the initial
 Scryer extraction; the Git revision identifies the code being consumed.
 
-## Development
+## Download tuning and lifecycle
 
 `WireGuardTunnelProvider::new` retains the original 64 KiB TCP buffers and OS
 UDP defaults. Weaver opts into `.with_download_tuning()` for 1 MiB buffers in
@@ -55,14 +55,34 @@ shutdown then stops the owned session and prevents further dials. WireGuard's
 adapters belong in the host application; `TunnelStream` already implements
 the asynchronous read/write interface required by s2n's Tokio integration.
 
+## Development
+
+Install Gitleaks and enable the versioned hooks after cloning:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The pre-commit hook rejects staged local usernames and home-directory paths
+(macOS, Linux, and Windows), then scans staged changes for secrets with Gitleaks.
+Missing Gitleaks blocks the commit. Conventional documentation/test account
+placeholders are allowed; real local account details are not.
+Only the five fixed public SSH test identities have a narrowly scoped private-key
+exception. New keys do not inherit a blanket test-file exemption.
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo nextest run --locked --all-features --no-fail-fast
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 Tests create local SSH, HTTP, and WireGuard fixtures and require local socket
 access. There is no package-publication workflow.
+
+CodeQL scans Rust and GitHub Actions every Wednesday at 03:17 UTC, with an
+optional manual run. Actions are restricted to GitHub-owned actions, and workflow
+references are pinned to full commit SHAs. Pushes do not trigger scans.
 
 ## License
 

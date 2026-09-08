@@ -1,0 +1,27 @@
+title = "proxy-tunnels gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "allow obvious examples and test placeholders"
+regexes = [
+  '''example\.com''',
+  '''(?i)(example|sample|placeholder|changeme|replace-me|replace_me|dummy|fake|test[-_]?key|test[-_]?token)''',
+]
+
+[[rules]]
+id = "private-key"
+
+[[rules.allowlists]]
+description = "Five public, fixed SSH test identities; not a general test-file exemption"
+condition = "AND"
+paths = ['''^src/test_support\.rs$''']
+regexTarget = "match"
+regexes = [
+  '''QyNTUxOQAAACC38FwBXgj0y7rMebgdLLDy\+IwkZVhKmDCFN8oWk21ZCQAAAKB1XfQmdV30''',
+  '''QyNTUxOQAAACCPoM0fbYEPxX9ZFw7u064oRYMqOrGC2ZR9Blmut5BbzAAAAKBbh53tW4ed''',
+  '''QyNTUxOQAAACCPI7e9nBVpGV9WOOQn4t8L\+GsmFEn\+AeRM1AUt283uWgAAAKC\+Y9ahvmPW''',
+  '''5Cfi3wv4ayYUSf4B5EzUBS3bze5aAAAAoNFwhbRiUaKIIOL3/P2xOY\+4YVqvXRiTY0X6zo''',
+  '''1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQWriC8c6nHcAetEvSHW/K\+MaX9SfQA''',
+]
