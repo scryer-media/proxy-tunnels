@@ -32,7 +32,7 @@ It is not published to crates.io; the manifest sets `publish = false`.
 
 ```toml
 [dependencies]
-proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.20.0" }
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.21.0" }
 ```
 
 Tags are signed, annotated, and immutable: never move an existing version tag.
