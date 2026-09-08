@@ -1,6 +1,6 @@
 [package]
 name = "proxy-tunnels"
-version = "0.21.0"
+version = "0.1.0"
 edition = "2024"
 description = "First-party SSH, userspace WireGuard and optional HTTP/3 tunnels for Scryer and Weaver"
 license = "GPL-3.0-only"

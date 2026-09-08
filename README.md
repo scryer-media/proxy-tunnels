@@ -32,13 +32,13 @@ It is not published to crates.io; the manifest sets `publish = false`.
 
 ```toml
 [dependencies]
-proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.21.0" }
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.1.0" }
 ```
 
 Tags are signed, annotated, and immutable: never move an existing version tag.
 Commit the consumer's `Cargo.lock` so it records the exact resolved commit.
 Do not track a moving branch. Enable `test-support` only in development
-dependencies. The initial `v0.20.0` version follows the Scryer extraction.
+dependencies. Versioning starts at `v0.1.0` for this standalone crate.
 
 ## Download tuning and lifecycle
 
