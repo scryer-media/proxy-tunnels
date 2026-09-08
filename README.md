@@ -25,18 +25,18 @@ These tunnels carry explicitly routed application traffic, not all host traffic.
 
 ## Consumption
 
-Scryer and Weaver consume this repository through **full Git commit pins**.
+Scryer and Weaver consume this repository through **signed version tags**.
 It is not published to crates.io; the manifest sets `publish = false`.
 
 ```toml
 [dependencies]
-proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", rev = "<full-40-character-commit-SHA>" }
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.20.0" }
 ```
 
-Replace the placeholder with a reviewed commit and commit the consumer's
-`Cargo.lock`. Do not track a moving branch. Enable `test-support` only in
-development dependencies. The package version is inherited from the initial
-Scryer extraction; the Git revision identifies the code being consumed.
+Tags are signed, annotated, and immutable: never move an existing version tag.
+Commit the consumer's `Cargo.lock` so it records the exact resolved commit.
+Do not track a moving branch. Enable `test-support` only in development
+dependencies. The initial `v0.20.0` version follows the Scryer extraction.
 
 ## Download tuning and lifecycle
 
