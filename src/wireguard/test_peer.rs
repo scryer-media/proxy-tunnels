@@ -120,6 +120,19 @@ impl WireGuardTestPeer {
 
     /// Start a peer.
     pub async fn start_with(options: WireGuardTestPeerOptions) -> Self {
+        Self::start_for_downloads(options, None, Duration::ZERO, false).await
+    }
+
+    /// Start an isolated download fixture, optionally forwarding to a local
+    /// TCP service and delaying inbound packets to model acknowledgement RTT.
+    /// Existing fixtures keep their original options and buffer defaults.
+    pub async fn start_for_downloads(
+        options: WireGuardTestPeerOptions,
+        tcp_forward: Option<SocketAddr>,
+        ingress_delay: Duration,
+        download_tuning: bool,
+    ) -> Self {
+        assert!(tcp_forward.is_none_or(|address| address.ip().is_loopback()));
         // Ask the operating system for a free UDP port, then let gotatun bind
         // it. A test-only race, and the alternative — reading the port back
         // off the device — is not exposed by gotatun.
@@ -131,12 +144,22 @@ impl WireGuardTestPeer {
 
         let shutdown = Arc::new(Notify::new());
         let (to_stack, to_device, inbound, outbound) = ip_channels(DEFAULT_WIREGUARD_MTU);
+        let (inbound, delay_task) = if ingress_delay.is_zero() {
+            (inbound, None)
+        } else {
+            let (tx, rx) = tokio::sync::mpsc::channel(super::adapter::PACKET_QUEUE_DEPTH);
+            (
+                rx,
+                Some(tokio::spawn(delay_ingress(inbound, tx, ingress_delay))),
+            )
+        };
         let (stack, pump) = WgStack::start(
             StackConfig {
                 addresses: vec![IpCidr::host(IpAddr::V4(TEST_PEER_ADDRESS))],
                 dns_servers: Vec::new(),
                 mtu: DEFAULT_WIREGUARD_MTU,
                 proxy_config_id: "wireguard-test-peer".to_string(),
+                download_tuning,
             },
             inbound,
             outbound,
@@ -151,7 +174,7 @@ impl WireGuardTestPeer {
         peer.preshared_key = options.preshared_key;
 
         let device = DeviceBuilder::new()
-            .with_default_udp()
+            .with_udp(super::transport::TunnelUdpFactory(download_tuning))
             .with_ip_pair(to_stack, to_device)
             .with_listen_port(port)
             .with_private_key(StaticSecret::from(options.private_key))
@@ -162,11 +185,12 @@ impl WireGuardTestPeer {
 
         let dns_queries = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let tasks = vec![
+        let mut tasks = vec![
             tokio::spawn(serve_http(
                 stack.clone(),
                 options.http_port,
                 options.body.clone(),
+                tcp_forward,
                 Arc::clone(&requests),
             )),
             tokio::spawn(serve_dns(
@@ -176,6 +200,7 @@ impl WireGuardTestPeer {
             )),
         ];
 
+        tasks.extend(delay_task);
         Self {
             endpoint,
             public_key: *PublicKey::from(&StaticSecret::from(options.private_key)).as_bytes(),
@@ -266,19 +291,67 @@ impl Drop for WireGuardTestPeer {
     }
 }
 
+async fn delay_ingress(
+    mut inbound: super::adapter::InboundRx,
+    outbound: super::adapter::OutboundTx,
+    delay: Duration,
+) {
+    use tokio::time::Instant;
+    let mut queue = std::collections::VecDeque::new();
+    let mut batch = Vec::with_capacity(64);
+    loop {
+        let deadline = queue
+            .front()
+            .map(|(at, _)| *at)
+            .unwrap_or_else(|| Instant::now() + delay);
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline), if !queue.is_empty() => {
+                for _ in 0..64 {
+                    if !queue.front().is_some_and(|(at, _)| *at <= Instant::now()) { break; }
+                    let (_, packet) = queue.pop_front().unwrap();
+                    if outbound.send(packet).await.is_err() { return; }
+                }
+            }
+            received = inbound.recv_many(&mut batch, 64), if queue.len() <= 16384 - 64 => {
+                if received == 0 { return; }
+                let at = Instant::now() + delay;
+                queue.extend(batch.drain(..).map(|packet| (at, packet)));
+            }
+        }
+    }
+}
+
 /// A tiny HTTP origin inside the tunnel: answers every request with the same
 /// body, and records the request line.
-async fn serve_http(stack: WgStack, port: u16, body: String, requests: Arc<Mutex<Vec<String>>>) {
+async fn serve_http(
+    stack: WgStack,
+    port: u16,
+    body: String,
+    tcp_forward: Option<SocketAddr>,
+    requests: Arc<Mutex<Vec<String>>>,
+) {
     let Ok(mut listener) = stack.listen(port, 4) else {
         return;
     };
+    let mut connections = tokio::task::JoinSet::new();
     loop {
+        while connections.try_join_next().is_some() {}
+        if connections.len() >= super::MAX_SOCKETS {
+            connections.join_next().await;
+            continue;
+        }
         let Ok(mut stream) = listener.accept().await else {
             return;
         };
         let body = body.clone();
         let requests = Arc::clone(&requests);
-        tokio::spawn(async move {
+        connections.spawn(async move {
+            if let Some(addr) = tcp_forward {
+                if let Ok(mut upstream) = tokio::net::TcpStream::connect(addr).await {
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                }
+                return;
+            }
             let mut buffer = vec![0u8; 8192];
             let read = stream.read(&mut buffer).await.unwrap_or(0);
             if read == 0 {

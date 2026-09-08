@@ -31,6 +31,10 @@ impl<T> TunnelStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 /// consumer without another line changing.
 #[async_trait::async_trait]
 pub trait TunnelProvider: Send + Sync {
+    /// Stop the provider's owned session permanently. Callers revoke their
+    /// streams and cancel pending dials before awaiting this method.
+    async fn shutdown(&self) {}
+
     /// Open a stream to `host:port`, resolving `host` **on the far side**.
     ///
     /// `host` may be a name; that is the point of a tunnel. A seedbox's

@@ -41,6 +41,7 @@ mod phy;
 mod spec;
 mod stack;
 mod tcp;
+mod transport;
 mod udp;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -54,7 +55,6 @@ use std::time::Duration;
 
 use gotatun::device::{Device, DeviceBuilder, Peer};
 use gotatun::packet::{Ip, IpNextProtocol, Ipv4Header, Packet};
-use gotatun::udp::socket::UdpSocketFactory;
 use gotatun::x25519::{PublicKey, StaticSecret};
 use ipnetwork::IpNetwork;
 use tokio::sync::Notify;
@@ -99,7 +99,7 @@ const RECENT_HANDSHAKE: Duration = Duration::from_secs(120);
 
 /// The transports one of our devices is built from.
 pub(crate) type WgTransports = (
-    UdpSocketFactory,
+    transport::TunnelUdpFactory,
     adapter::DeviceToStack,
     adapter::StackToDevice,
 );
@@ -125,8 +125,8 @@ pub struct WireGuardHandshake {
 struct WgTunnel {
     stack: WgStack,
     /// `Option` only so [`Drop`] can take it and drop it *inside* the runtime
-    /// context; it is `Some` for the whole life of the tunnel.
-    device: Option<Device<WgTransports>>,
+    /// context, or explicit shutdown can await device termination.
+    device: tokio::sync::Mutex<Option<Device<WgTransports>>>,
     pump: tokio::task::JoinHandle<()>,
     shutdown: Arc<Notify>,
     peer_public_key: PublicKey,
@@ -158,7 +158,7 @@ impl WgTunnel {
     }
 
     async fn last_handshake_age(&self) -> Option<Duration> {
-        match self.device.as_ref() {
+        match self.device.lock().await.as_ref() {
             Some(device) => last_handshake_age(device, &self.peer_public_key).await,
             None => None,
         }
@@ -184,7 +184,7 @@ impl Drop for WgTunnel {
         // Then the device, from inside its runtime's context whatever thread
         // this drop runs on — see the field's comment for why that matters.
         let _entered = self.runtime.enter();
-        drop(self.device.take());
+        drop(self.device.get_mut().take());
     }
 }
 
@@ -193,6 +193,8 @@ pub struct WireGuardTunnelProvider {
     spec: WireGuardSpec,
     observer: Arc<dyn TunnelObserver>,
     tunnel: tokio::sync::Mutex<Option<Arc<WgTunnel>>>,
+    download_tuning: bool,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl WireGuardTunnelProvider {
@@ -209,7 +211,27 @@ impl WireGuardTunnelProvider {
             spec,
             observer,
             tunnel: tokio::sync::Mutex::new(None),
+            download_tuning: false,
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Opt into 1 MiB TCP buffers in each direction and a larger UDP receive
+    /// buffer for concurrent bulk downloads. At the 256-socket limit, TCP
+    /// buffers alone can consume 512 MiB. Ordinary providers retain 64 KiB
+    /// buffers and the operating system's UDP defaults.
+    pub fn with_download_tuning(mut self) -> Self {
+        self.download_tuning = true;
+        self
+    }
+
+    /// Resolve a destination using only this tunnel's configured DNS servers.
+    pub async fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, TunnelError> {
+        self.tunnel()
+            .await?
+            .stack
+            .resolve(host, self.spec.request_timeout)
+            .await
     }
 
     /// Bring a tunnel up, report what the handshake established, tear it down.
@@ -243,6 +265,9 @@ impl WireGuardTunnelProvider {
     /// discovered by a dial that then has to unwind.
     async fn tunnel(&self) -> Result<Arc<WgTunnel>, TunnelError> {
         let mut guard = self.tunnel.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(TunnelError::Engine("tunnel provider stopped".into()));
+        }
         if let Some(existing) = guard.as_ref() {
             if existing.is_alive().await {
                 return Ok(Arc::clone(existing));
@@ -262,6 +287,9 @@ impl WireGuardTunnelProvider {
     /// Drop `stale` if it is still the current tunnel, and build a new one.
     async fn replace_tunnel(&self, stale: &Arc<WgTunnel>) -> Result<Arc<WgTunnel>, TunnelError> {
         let mut guard = self.tunnel.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(TunnelError::Engine("tunnel provider stopped".into()));
+        }
         if let Some(current) = guard.as_ref()
             && !Arc::ptr_eq(current, stale)
         {
@@ -296,6 +324,7 @@ impl WireGuardTunnelProvider {
                 dns_servers: self.spec.dns_servers.clone(),
                 mtu: self.spec.mtu,
                 proxy_config_id: self.spec.proxy_config_id.clone(),
+                download_tuning: self.download_tuning,
             },
             inbound,
             outbound,
@@ -313,7 +342,7 @@ impl WireGuardTunnelProvider {
         let device = DeviceBuilder::new()
             // An ephemeral local port on an ordinary UDP socket. No listen
             // port is configured: nothing dials *us*.
-            .with_default_udp()
+            .with_udp(transport::TunnelUdpFactory(self.download_tuning))
             .with_ip_pair(to_stack, to_device)
             .with_private_key(StaticSecret::from(self.spec.private_key))
             .with_peer(peer)
@@ -359,7 +388,7 @@ impl WireGuardTunnelProvider {
 
         Ok(WgTunnel {
             stack,
-            device: Some(device),
+            device: tokio::sync::Mutex::new(Some(device)),
             pump,
             shutdown,
             peer_public_key,
@@ -531,6 +560,21 @@ fn relabel(error: TunnelError, host: &str, port: u16) -> TunnelError {
 
 #[async_trait::async_trait]
 impl TunnelProvider for WireGuardTunnelProvider {
+    async fn shutdown(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(tunnel) = self.tunnel.lock().await.take() {
+            tunnel.shutdown.notify_waiters();
+            tunnel.pump.abort();
+            if let Some(device) = tunnel.device.lock().await.take() {
+                device.stop().await;
+            }
+            if let Ok(mut tunnel) = Arc::try_unwrap(tunnel) {
+                let _ = (&mut tunnel.pump).await;
+            }
+        }
+    }
+
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let tunnel = self.tunnel().await.inspect_err(|error| {
             self.observer

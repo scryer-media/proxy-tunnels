@@ -38,6 +38,23 @@ Replace the placeholder with a reviewed commit and commit the consumer's
 development dependencies. The package version is inherited from the initial
 Scryer extraction; the Git revision identifies the code being consumed.
 
+## Download tuning and lifecycle
+
+`WireGuardTunnelProvider::new` retains the original 64 KiB TCP buffers and OS
+UDP defaults. Weaver opts into `.with_download_tuning()` for 1 MiB buffers in
+each TCP direction and a best-effort 4 MiB UDP receive buffer. Twenty TCP
+connections then reserve 40 MiB; the 256-socket production limit bounds TCP
+buffers to 512 MiB, including connections still closing. DNS admission and
+deadlines are unchanged. Scryer's existing constructors and spec literals need
+no changes.
+
+Providers expose an additive `shutdown().await` operation through
+`TunnelProvider`. Hosts revoke their streams and cancel pending dials first;
+shutdown then stops the owned session and prevents further dials. WireGuard's
+`resolve_host` resolves through its configured tunnel DNS only. Direct TLS I/O
+adapters belong in the host application; `TunnelStream` already implements
+the asynchronous read/write interface required by s2n's Tokio integration.
+
 ## Development
 
 Install Gitleaks and enable the versioned hooks after cloning:

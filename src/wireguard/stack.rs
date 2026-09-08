@@ -110,6 +110,7 @@ pub(crate) struct StackConfig {
     pub(crate) mtu: u16,
     /// For log lines only.
     pub(crate) proxy_config_id: String,
+    pub(crate) download_tuning: bool,
 }
 
 impl StackConfig {
@@ -167,6 +168,9 @@ impl StackShared {
 
     /// Claim one of the [`MAX_SOCKETS`] slots.
     fn claim_socket(&self) -> Result<SocketSlot<'_>, TunnelError> {
+        if self.open_sockets.load(Ordering::SeqCst) >= MAX_SOCKETS {
+            self.with_stack(|inner| inner.reclaim_finished(inner.now(), true));
+        }
         let claimed = self
             .open_sockets
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
@@ -221,6 +225,7 @@ pub(crate) struct StackInner {
     next_port: u16,
     closing: Vec<Closing>,
     open_sockets: Arc<AtomicUsize>,
+    tcp_buffer_bytes: usize,
 }
 
 impl StackInner {
@@ -244,8 +249,8 @@ impl StackInner {
 
     pub(crate) fn add_tcp_socket(&mut self) -> SocketHandle {
         let socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]),
-            tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]),
+            tcp::SocketBuffer::new(vec![0u8; self.tcp_buffer_bytes]),
+            tcp::SocketBuffer::new(vec![0u8; self.tcp_buffer_bytes]),
         );
         self.sockets.add(socket)
     }
@@ -322,6 +327,10 @@ impl StackInner {
 
     /// Free the slots of sockets that finished closing.
     fn reclaim(&mut self, now: Instant) {
+        self.reclaim_finished(now, false);
+    }
+
+    fn reclaim_finished(&mut self, now: Instant, under_pressure: bool) {
         let mut index = 0;
         while index < self.closing.len() {
             let Closing {
@@ -330,7 +339,11 @@ impl StackInner {
                 counted,
             } = self.closing[index];
             let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-            let finished = socket.state() == tcp::State::Closed;
+            // Retired TIME-WAIT sockets have no payload or FIN awaiting ACK.
+            // Preserve their linger normally, but do not block new downloads
+            // solely on those buffers. Other closing states stay charged.
+            let finished = socket.state() == tcp::State::Closed
+                || (under_pressure && socket.state() == tcp::State::TimeWait);
             if !finished && now < deadline {
                 index += 1;
                 continue;
@@ -441,6 +454,11 @@ impl WgStack {
         let open_sockets = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(StackShared {
             inner: Mutex::new(StackInner {
+                tcp_buffer_bytes: if config.download_tuning {
+                    1024 * 1024
+                } else {
+                    TCP_BUFFER_BYTES
+                },
                 iface,
                 sockets,
                 phy,
@@ -730,6 +748,7 @@ async fn pump(shared: Arc<StackShared>, mut inbound: InboundRx, shutdown: Arc<No
 /// Sleep for smoltcp's advisory delay, or forever when it has nothing pending.
 async fn sleep_for(delay: Option<Duration>) {
     match delay {
+        Some(delay) if delay.is_zero() => tokio::task::yield_now().await,
         Some(delay) => tokio::time::sleep(delay).await,
         None => std::future::pending().await,
     }
@@ -748,6 +767,7 @@ mod resource_tests {
                 dns_servers: vec!["10.0.0.2".parse().unwrap()],
                 mtu: 1280,
                 proxy_config_id: "resource-test".into(),
+                download_tuning: false,
             },
             inbound,
             outbound,
