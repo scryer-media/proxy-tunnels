@@ -12,6 +12,8 @@ are not accepted.
 
 - SSH TCP forwarding with Ed25519 key authentication and host-key pinning.
 - Userspace WireGuard with an in-memory IP stack; no TUN device or routing-table changes.
+- Optional HTTP/3 CONNECT over QUIC, with verified proxy TLS and HTTP Basic
+  authentication. See [HTTP/3 configuration and interoperability](docs/http3.md).
 - Authenticated, loopback-only SOCKS5 CONNECT fronts, tunnel lifecycle management,
   and bounded connection admission.
 - An optional `test-support` feature for first-party integration fixtures.

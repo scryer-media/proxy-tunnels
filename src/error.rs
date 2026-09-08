@@ -70,6 +70,26 @@ pub enum TunnelError {
         detail: String,
     },
 
+    /// The QUIC/HTTP/3 proxy transport could not be established.
+    #[cfg(feature = "http3")]
+    #[error("could not establish HTTP/3 CONNECT to {host}:{port}: {detail}")]
+    Http3Connect {
+        host: String,
+        port: u16,
+        detail: String,
+    },
+
+    /// A TLS alert prevented authentication of the HTTP/3 proxy.
+    #[cfg(feature = "http3")]
+    #[error("HTTP/3 proxy TLS authentication failed for {host}:{port}")]
+    Http3Tls { host: String, port: u16 },
+
+    /// CONNECT was refused. Includes 407 authentication failures; never retried
+    /// or followed as a redirect by this provider. No response body is exposed.
+    #[cfg(feature = "http3")]
+    #[error("HTTP/3 proxy refused CONNECT with HTTP {status}")]
+    Http3ProxyStatus { status: u16 },
+
     /// The engine itself could not start (no runtime, no loopback socket).
     #[error("tunnel engine unavailable: {0}")]
     Engine(String),
