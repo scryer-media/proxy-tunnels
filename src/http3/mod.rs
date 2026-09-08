@@ -165,7 +165,7 @@ impl Http3TunnelProvider {
         }
     }
 
-    async fn session(&self) -> Result<Arc<Session>, TunnelError> {
+    async fn session(&self, deadline: tokio::time::Instant) -> Result<Arc<Session>, TunnelError> {
         let _connecting = self.connect_lock.lock().await;
         {
             let mut sessions = self.sessions.lock().expect("HTTP/3 sessions lock");
@@ -191,8 +191,26 @@ impl Http3TunnelProvider {
                 .take(8)
                 .collect()
         };
+        self.connect_addresses(host, &addresses, deadline).await
+    }
+
+    // Called under connect_lock after checking the session limit.
+    async fn connect_addresses(
+        &self,
+        host: &str,
+        addresses: &[SocketAddr],
+        deadline: tokio::time::Instant,
+    ) -> Result<Arc<Session>, TunnelError> {
         let mut last = self.connect_error("proxy endpoint has no addresses");
-        for address in addresses {
+        for (index, &address) in addresses.iter().enumerate() {
+            // Share the remaining dial budget so one unresponsive address cannot
+            // starve later resolver results. A lone address keeps the full budget.
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                return Err(self.connect_error("HTTP/3 dial deadline exceeded"));
+            }
+            let attempt_deadline = now + remaining / (addresses.len() - index) as u32;
             let bind = if address.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -203,26 +221,41 @@ impl Http3TunnelProvider {
             let connecting = endpoint
                 .connect_with(self.config.clone(), address, host)
                 .map_err(|_| self.connect_error("invalid QUIC endpoint configuration"))?;
-            let connection = match connecting.await {
-                Ok(connection) => connection,
-                Err(quinn::ConnectionError::TransportError(error))
+            let connection = match tokio::time::timeout_at(attempt_deadline, connecting).await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(quinn::ConnectionError::TransportError(error)))
                     if (0x100..=0x1ff).contains(&u64::from(error.code)) =>
                 {
+                    endpoint.close(0u32.into(), b"TLS failed");
                     return Err(TunnelError::Http3Tls {
                         host: self.spec.host.clone(),
                         port: self.spec.port,
                     });
                 }
-                Err(_) => {
+                Ok(Err(_)) => {
+                    endpoint.close(0u32.into(), b"handshake failed");
                     last = self.connect_error("QUIC handshake failed");
                     continue;
                 }
+                Err(_) => {
+                    endpoint.close(0u32.into(), b"address attempt timed out");
+                    last = self.connect_error("QUIC address attempt deadline exceeded");
+                    continue;
+                }
             };
-            let (mut driver, sender) = h3::client::builder()
+            let mut builder = h3::client::builder();
+            let initializing = builder
                 .max_field_section_size(MAX_RESPONSE_HEADERS)
-                .build(h3_quinn::Connection::new(connection.clone()))
-                .await
-                .map_err(|_| self.connect_error("HTTP/3 initialization failed"))?;
+                .build(h3_quinn::Connection::new(connection.clone()));
+            let (mut driver, sender) =
+                match tokio::time::timeout_at(attempt_deadline, initializing).await {
+                    Ok(Ok(initialized)) => initialized,
+                    _ => {
+                        endpoint.close(0u32.into(), b"HTTP/3 initialization failed");
+                        last = self.connect_error("HTTP/3 initialization failed or timed out");
+                        continue;
+                    }
+                };
             let task = tokio::spawn(async move {
                 let _ = poll_fn(|cx| driver.poll_close(cx)).await;
             });
@@ -268,6 +301,7 @@ impl TunnelProvider for Http3TunnelProvider {
         if *stop.borrow() {
             return Err(self.connect_error("provider stopped"));
         }
+        let deadline = tokio::time::Instant::now() + self.spec.request_timeout;
         let dial = async {
             let permit = self
                 .permits
@@ -275,7 +309,7 @@ impl TunnelProvider for Http3TunnelProvider {
                 .acquire_owned()
                 .await
                 .map_err(|_| self.connect_error("provider stopped"))?;
-            let session = self.session().await?;
+            let session = self.session(deadline).await?;
             let mut request = http::Request::builder()
                 .method(http::Method::CONNECT)
                 .uri(authority.as_str())
@@ -292,13 +326,22 @@ impl TunnelProvider for Http3TunnelProvider {
                 self.connect_error("HTTP/3 connection cannot open a new stream")
             })?;
             let mut pending = PendingRequest(Some(request));
-            let response = pending
-                .0
-                .as_mut()
-                .expect("pending request")
-                .recv_response()
-                .await
-                .map_err(|_| self.connect_error("invalid or interrupted CONNECT response"))?;
+            let response = loop {
+                let response = pending
+                    .0
+                    .as_mut()
+                    .expect("pending request")
+                    .recv_response()
+                    .await
+                    .map_err(|_| self.connect_error("invalid or interrupted CONNECT response"))?;
+                // HTTP/3 permits interim headers, but never Switching Protocols.
+                // All header sections remain within the original dial deadline.
+                if !response.status().is_informational()
+                    || response.status() == http::StatusCode::SWITCHING_PROTOCOLS
+                {
+                    break response;
+                }
+            };
             if !response.status().is_success() {
                 return Err(TunnelError::Http3ProxyStatus {
                     status: response.status().as_u16(),
@@ -315,7 +358,7 @@ impl TunnelProvider for Http3TunnelProvider {
         tokio::select! {
             biased;
             _ = stop.changed() => Err(self.connect_error("provider stopped")),
-            result = tokio::time::timeout(self.spec.request_timeout, dial) => result.unwrap_or_else(|_| Err(self.connect_error("HTTP/3 dial deadline exceeded"))),
+            result = tokio::time::timeout_at(deadline, dial) => result.unwrap_or_else(|_| Err(self.connect_error("HTTP/3 dial deadline exceeded"))),
         }
     }
 

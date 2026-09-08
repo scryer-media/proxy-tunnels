@@ -15,6 +15,7 @@ const KEY: &[u8] = include_bytes!("../../tests/fixtures/http3/server-key.der");
 enum Mode {
     Echo,
     Refuse(u16),
+    Informational(Option<u16>),
     Hang,
     Reset,
     Trailers,
@@ -116,14 +117,28 @@ impl Fixture {
                                 stream.finish().await?;
                                 return Ok::<_, h3::error::StreamError>(());
                             }
-                            if matches!(mode, Mode::Hang) {
+                            if matches!(mode, Mode::Informational(_)) {
+                                for status in [100, 103] {
+                                    stream
+                                        .send_response(
+                                            http::Response::builder()
+                                                .status(status)
+                                                .body(())
+                                                .unwrap(),
+                                        )
+                                        .await?;
+                                }
+                            }
+                            if matches!(mode, Mode::Hang | Mode::Informational(None)) {
                                 if stream.recv_data().await.is_err() {
                                     cancellations.fetch_add(1, Ordering::SeqCst);
                                 }
                                 return Ok(());
                             }
                             let mut response = http::Response::builder().status(
-                                if let Mode::Refuse(status) = mode {
+                                if let Mode::Refuse(status) | Mode::Informational(Some(status)) =
+                                    mode
+                                {
                                     status
                                 } else {
                                     200
@@ -154,7 +169,7 @@ impl Fixture {
                                 Mode::NoRead => {
                                     std::future::pending::<()>().await;
                                 }
-                                Mode::Echo | Mode::Goaway => {
+                                Mode::Echo | Mode::Goaway | Mode::Informational(Some(200)) => {
                                     while let Some(mut data) = stream.recv_data().await? {
                                         stream
                                             .send_data(data.copy_to_bytes(data.remaining()))
@@ -162,7 +177,10 @@ impl Fixture {
                                     }
                                     stream.finish().await?;
                                 }
-                                Mode::Hang => unreachable!(),
+                                Mode::Informational(Some(_)) => {
+                                    stream.finish().await?;
+                                }
+                                Mode::Hang | Mode::Informational(None) => unreachable!(),
                             }
                             Ok(())
                         });
@@ -224,6 +242,75 @@ async fn echo(provider: &Http3TunnelProvider, host: &str) {
         .unwrap()
         .unwrap();
     assert_eq!(&answer, b"article payload");
+}
+
+#[tokio::test]
+async fn informational_responses_wait_for_final_connect_status() {
+    let fixture = Fixture::start(Mode::Informational(Some(200))).await;
+    let provider = fixture.provider();
+    echo(&provider, "informational.invalid").await;
+    provider.shutdown().await;
+
+    let fixture = Fixture::start(Mode::Informational(Some(407))).await;
+    let provider = fixture.provider();
+    assert!(matches!(
+        provider.dial("refused.invalid", 563).await,
+        Err(TunnelError::Http3ProxyStatus { status: 407 })
+    ));
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn informational_responses_do_not_extend_the_dial_deadline() {
+    let fixture = Fixture::start(Mode::Informational(None)).await;
+    let mut spec = fixture.spec();
+    spec.request_timeout = Duration::from_millis(300);
+    let provider = Http3TunnelProvider::with_root_certificates(spec, roots()).unwrap();
+    let result = timeout(
+        Duration::from_secs(2),
+        provider.dial("pending.invalid", 563),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(TunnelError::Http3Connect { detail, .. }) if detail.contains("deadline"))
+    );
+    wait_until(|| fixture.cancelled.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(provider.permits.available_permits(), MAX_STREAMS);
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn blackholed_first_proxy_address_leaves_time_for_reachable_address() {
+    // Supply the resolver result directly, without changing the host resolver.
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::start(Mode::Echo).await;
+    let provider = fixture.provider();
+    let addresses = [
+        blackhole.local_addr().unwrap(),
+        fixture.endpoint.local_addr().unwrap(),
+    ];
+    let deadline = tokio::time::Instant::now() + provider.spec.request_timeout;
+    {
+        let _connecting = provider.connect_lock.lock().await;
+        tokio::time::timeout_at(
+            deadline,
+            provider.connect_addresses(&provider.spec.host, &addresses, deadline),
+        )
+        .await
+        .expect("first address must not consume the whole deadline")
+        .unwrap();
+    }
+    let mut packet = [0; 2048];
+    assert!(
+        blackhole.try_recv(&mut packet).is_ok(),
+        "first address was attempted"
+    );
+    tokio::time::timeout_at(deadline, echo(&provider, "never-resolve-locally.invalid"))
+        .await
+        .unwrap();
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), 1);
+    provider.shutdown().await;
 }
 
 #[tokio::test]
@@ -297,7 +384,7 @@ async fn authentication_and_http_errors_do_not_retry_or_follow_redirects() {
     ));
     assert_eq!(fixture.authorities.lock().unwrap().len(), 1);
     provider.shutdown().await;
-    for status in [302, 403, 502] {
+    for status in [101, 302, 403, 502] {
         let fixture = Fixture::start(Mode::Refuse(status)).await;
         let provider = fixture.provider();
         assert!(
@@ -549,7 +636,10 @@ async fn concurrent_shutdown_cannot_leave_registered_writers() {
     for _ in 0..10 {
         let fixture = Fixture::start(Mode::Echo).await;
         let provider = Arc::new(fixture.provider());
-        let session = provider.session().await.unwrap();
+        let session = provider
+            .session(tokio::time::Instant::now() + provider.spec.request_timeout)
+            .await
+            .unwrap();
         let mut tasks = JoinSet::new();
         for _ in 0..20 {
             let provider = provider.clone();
