@@ -13,19 +13,23 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gotatun::device::{Device, DeviceBuilder, Peer};
+use gotatun::udp::socket::UdpSocket;
+use gotatun::udp::{UdpTransportFactory, UdpTransportFactoryParams};
 use gotatun::x25519::{PublicKey, StaticSecret};
 use ipnetwork::IpNetwork;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
-use crate::wireguard::adapter::ip_channels;
+use crate::wireguard::WireGuardSpec;
+use crate::wireguard::adapter::{DeviceToStack, StackToDevice, ip_channels};
 use crate::wireguard::spec::{DEFAULT_WIREGUARD_KEEPALIVE, DEFAULT_WIREGUARD_MTU, IpCidr};
 use crate::wireguard::stack::{StackConfig, WgStack};
-use crate::wireguard::{WgTransports, WireGuardSpec};
+use crate::wireguard::transport::TunnelUdpFactory;
 
 /// The peer's tunnel address — the "server" side of the point-to-point link.
 pub const TEST_PEER_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 63, 0, 1);
@@ -107,9 +111,34 @@ pub struct WireGuardTestPeer {
     requests: Arc<Mutex<Vec<String>>>,
     shutdown: Arc<Notify>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    _device: Device<WgTransports>,
+    _device: Device<TestPeerTransports>,
     _stack: WgStack,
     _pump: tokio::task::JoinHandle<()>,
+}
+
+/// The engine's transports, with a UDP factory that reports its port.
+type TestPeerTransports = (PortReportingUdpFactory, DeviceToStack, StackToDevice);
+
+/// Binds exactly as the engine's factory does, then records the port the
+/// socket landed on. gotatun keeps that port to itself.
+struct PortReportingUdpFactory {
+    inner: TunnelUdpFactory,
+    bound_port: Arc<AtomicU16>,
+}
+
+impl UdpTransportFactory for PortReportingUdpFactory {
+    type Send = UdpSocket;
+    type Recv = UdpSocket;
+
+    async fn bind(
+        &mut self,
+        params: &UdpTransportFactoryParams,
+    ) -> std::io::Result<(UdpSocket, UdpSocket)> {
+        let (send, recv) = self.inner.bind(params).await?;
+        self.bound_port
+            .store(send.local_addr()?.port(), Ordering::Relaxed);
+        Ok((send, recv))
+    }
 }
 
 impl WireGuardTestPeer {
@@ -133,14 +162,6 @@ impl WireGuardTestPeer {
         download_tuning: bool,
     ) -> Self {
         assert!(tcp_forward.is_none_or(|address| address.ip().is_loopback()));
-        // Ask the operating system for a free UDP port, then let gotatun bind
-        // it. A test-only race, and the alternative — reading the port back
-        // off the device — is not exposed by gotatun.
-        let port = {
-            let probe = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("a free UDP port");
-            probe.local_addr().expect("the probe's address").port()
-        };
-        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
         let shutdown = Arc::new(Notify::new());
         let (to_stack, to_device, inbound, outbound) = ip_channels(DEFAULT_WIREGUARD_MTU);
@@ -173,15 +194,25 @@ impl WireGuardTestPeer {
             ]);
         peer.preshared_key = options.preshared_key;
 
+        // Port 0: the operating system picks the port as the socket binds, and
+        // the factory reports it. Probing for a free port first and binding it
+        // afterwards races every other test on the machine for that port.
+        let bound_port = Arc::new(AtomicU16::new(0));
         let device = DeviceBuilder::new()
-            .with_udp(super::transport::TunnelUdpFactory(download_tuning))
+            .with_udp(PortReportingUdpFactory {
+                inner: TunnelUdpFactory(download_tuning),
+                bound_port: Arc::clone(&bound_port),
+            })
             .with_ip_pair(to_stack, to_device)
-            .with_listen_port(port)
+            .with_listen_port(0)
             .with_private_key(StaticSecret::from(options.private_key))
             .with_peer(peer)
             .build()
             .await
             .expect("the test peer's device binds");
+        let port = bound_port.load(Ordering::Relaxed);
+        assert_ne!(port, 0, "the test peer's device reports its bound port");
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
         let dns_queries = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(Mutex::new(Vec::new()));
