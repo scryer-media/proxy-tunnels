@@ -1,6 +1,6 @@
 [package]
 name = "proxy-tunnels"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "First-party SSH, userspace WireGuard and optional HTTP/3 tunnels for Scryer and Weaver"
 license = "GPL-3.0-only"
@@ -25,12 +25,12 @@ http3 = ["dep:bytes", "dep:http", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:ru
 # compression, useless for proxied HTTPS) and `rsa` (which pulls an RSA
 # release candidate). Ed25519 is the only accepted private-key and host-key
 # type, so the NIST curve stack, the classic DH groups and AES-CBC stay out
-# too. `ml-kem` keeps the post-quantum hybrid key exchange; `aes-gcm` costs no
-# crates.
+# too, and so does the ML-KEM hybrid key exchange for now: key exchange is
+# `curve25519-sha256` only. `aes-gcm` costs no crates.
 #
 # Pinned to a fork until the algorithm feature gates land upstream
 # (https://github.com/Eugeny/russh/pull/777); go back to crates.io then.
-russh = { git = "https://github.com/NZBMan/russh.git", tag = "v0.63.3-algorithm-gates.1", default-features = false, features = ["aws-lc-rs", "aes-gcm", "ml-kem"] }
+russh = { git = "https://github.com/NZBMan/russh.git", tag = "v0.63.3-algorithm-gates.1", default-features = false, features = ["aws-lc-rs", "aes-gcm"] }
 # The WireGuard half. `gotatun` owns the protocol — handshakes, encryption,
 # rekeying, keepalives, peers, timers — and the Tokio UDP transport; `smoltcp`
 # owns IP/TCP/UDP/DNS above it. Neither ever touches an OS interface: the two
