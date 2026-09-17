@@ -27,7 +27,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use russh::client;
-use russh::keys::{Algorithm, EcdsaCurve, HashAlg, PrivateKey, PublicKeyOrCertificate};
+use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKeyOrCertificate};
 
 use crate::error::TunnelError;
 use crate::provider::{
@@ -123,22 +123,12 @@ impl SshTunnelProvider {
 
         let config = Arc::new(client::Config {
             // russh's default preference list advertises RSA host-key
-            // algorithms, which this build cannot verify (no `rsa` feature).
-            // Advertising only what we can check turns "signature verification
-            // failed" into an honest "no matching host key algorithm".
+            // algorithms, which this build cannot verify (no `rsa` feature),
+            // and ECDSA is compiled out the same way. Advertising only what we
+            // can check turns "signature verification failed" into an honest
+            // "no matching host key algorithm".
             preferred: russh::Preferred {
-                key: Cow::Owned(vec![
-                    Algorithm::Ed25519,
-                    Algorithm::Ecdsa {
-                        curve: EcdsaCurve::NistP256,
-                    },
-                    Algorithm::Ecdsa {
-                        curve: EcdsaCurve::NistP384,
-                    },
-                    Algorithm::Ecdsa {
-                        curve: EcdsaCurve::NistP521,
-                    },
-                ]),
+                key: Cow::Owned(vec![Algorithm::Ed25519]),
                 ..russh::Preferred::DEFAULT
             },
             keepalive_interval: Some(KEEPALIVE_INTERVAL),
