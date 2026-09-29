@@ -40,6 +40,7 @@
 //! [`TunnelObserver`] supplied by the caller, which owns the ledgers and the
 //! repository.
 
+pub mod endpoint;
 mod error;
 #[cfg(feature = "http3")]
 pub mod http3;

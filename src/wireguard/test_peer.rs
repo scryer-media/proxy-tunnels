@@ -18,8 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gotatun::device::{Device, DeviceBuilder, Peer};
-use gotatun::udp::socket::UdpSocket;
-use gotatun::udp::{UdpTransportFactory, UdpTransportFactoryParams};
+use gotatun::udp::{UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
 use gotatun::x25519::{PublicKey, StaticSecret};
 use ipnetwork::IpNetwork;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,7 +28,7 @@ use crate::wireguard::WireGuardSpec;
 use crate::wireguard::adapter::{DeviceToStack, StackToDevice, ip_channels};
 use crate::wireguard::spec::{DEFAULT_WIREGUARD_KEEPALIVE, DEFAULT_WIREGUARD_MTU, IpCidr};
 use crate::wireguard::stack::{StackConfig, WgStack};
-use crate::wireguard::transport::TunnelUdpFactory;
+use crate::wireguard::transport::{TunnelSocket, TunnelUdpFactory};
 
 /// The peer's tunnel address — the "server" side of the point-to-point link.
 pub const TEST_PEER_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 63, 0, 1);
@@ -127,16 +126,18 @@ struct PortReportingUdpFactory {
 }
 
 impl UdpTransportFactory for PortReportingUdpFactory {
-    type Send = UdpSocket;
-    type Recv = UdpSocket;
+    type Send = TunnelSocket;
+    type Recv = TunnelSocket;
 
     async fn bind(
         &mut self,
         params: &UdpTransportFactoryParams,
-    ) -> std::io::Result<(UdpSocket, UdpSocket)> {
+    ) -> std::io::Result<(TunnelSocket, TunnelSocket)> {
         let (send, recv) = self.inner.bind(params).await?;
-        self.bound_port
-            .store(send.local_addr()?.port(), Ordering::Relaxed);
+        self.bound_port.store(
+            send.local_addr()?.expect("bound UDP address").port(),
+            Ordering::Relaxed,
+        );
         Ok((send, recv))
     }
 }
@@ -200,7 +201,11 @@ impl WireGuardTestPeer {
         let bound_port = Arc::new(AtomicU16::new(0));
         let device = DeviceBuilder::new()
             .with_udp(PortReportingUdpFactory {
-                inner: TunnelUdpFactory(download_tuning),
+                inner: TunnelUdpFactory {
+                    tuning: download_tuning,
+                    bound: None,
+                    source: Arc::new(Mutex::new(None)),
+                },
                 bound_port: Arc::clone(&bound_port),
             })
             .with_ip_pair(to_stack, to_device)

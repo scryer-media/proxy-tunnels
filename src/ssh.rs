@@ -68,6 +68,8 @@ struct HostKeyState {
 pub struct SshTunnelProvider {
     spec: TunnelSpec,
     observer: Arc<dyn TunnelObserver>,
+    transport: Arc<dyn crate::endpoint::EndpointTransport>,
+    source: Mutex<Option<std::net::SocketAddr>>,
     host_key: Arc<Mutex<HostKeyState>>,
     session: tokio::sync::Mutex<Option<Arc<client::Handle<SshClientHandler>>>>,
     closed: std::sync::atomic::AtomicBool,
@@ -81,10 +83,20 @@ impl SshTunnelProvider {
         Self {
             spec,
             observer,
+            transport: Arc::new(crate::endpoint::SystemEndpointTransport),
+            source: Mutex::new(None),
             host_key: Arc::new(Mutex::new(HostKeyState::default())),
             session: tokio::sync::Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn with_transport(
+        mut self,
+        transport: Arc<dyn crate::endpoint::EndpointTransport>,
+    ) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Connect, authenticate, report the host key, disconnect.
@@ -144,10 +156,15 @@ impl SshTunnelProvider {
             state: Arc::clone(&self.host_key),
         };
 
-        let connected = tokio::time::timeout(
-            self.spec.request_timeout,
-            client::connect(config, (self.spec.host.as_str(), self.spec.port), handler),
-        )
+        let connected = tokio::time::timeout(self.spec.request_timeout, async {
+            let endpoint = self
+                .transport
+                .connect(&self.spec.host, self.spec.port)
+                .await?;
+            let handle = client::connect_stream(config, endpoint.stream, handler).await?;
+            *self.source.lock().expect("SSH source") = endpoint.source;
+            Ok::<_, TunnelError>(handle)
+        })
         .await
         .map_err(|_| TunnelError::Connect {
             host: self.spec.host.clone(),
@@ -324,9 +341,20 @@ enum ChannelFailure {
 
 #[async_trait::async_trait]
 impl TunnelProvider for SshTunnelProvider {
+    async fn prepare(&self) -> Result<(), TunnelError> {
+        self.session().await.map(|_| ())
+    }
+
+    fn source_address(&self) -> Option<std::net::SocketAddr> {
+        *self.source.lock().expect("SSH source")
+    }
+
     async fn shutdown(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
+        self.retire().await;
+    }
+    async fn retire(&self) {
         if let Some(session) = self.session.lock().await.take() {
             let _ = session
                 .disconnect(russh::Disconnect::ByApplication, "profile revoked", "en")
@@ -538,6 +566,58 @@ mod tests {
         let mut answer = Vec::new();
         stream.read_to_end(&mut answer).await.expect("response");
         String::from_utf8_lossy(&answer).to_string()
+    }
+
+    #[tokio::test]
+    async fn caller_inner_stream_carries_ssh_traffic() {
+        struct Inner {
+            host: String,
+            port: u16,
+        }
+        #[async_trait::async_trait]
+        impl crate::endpoint::EndpointTransport for Inner {
+            async fn connect(
+                &self,
+                host: &str,
+                _port: u16,
+            ) -> Result<crate::endpoint::EndpointStream, TunnelError> {
+                assert_eq!(host, "inner.invalid");
+                let tcp = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
+                    .await
+                    .unwrap();
+                let source = tcp.local_addr().ok();
+                let (client, mut relay) = tokio::io::duplex(4096);
+                tokio::spawn(async move {
+                    let mut tcp = tcp;
+                    let _ = tokio::io::copy_bidirectional(&mut relay, &mut tcp).await;
+                });
+                Ok(crate::endpoint::EndpointStream {
+                    stream: Box::new(client),
+                    source,
+                })
+            }
+        }
+        let server = SshServerDouble::start(SshServerOptions::default()).await;
+        let origin = TunnelledOrigin::start("inner-stream").await;
+        let provider = SshTunnelProvider::new(
+            crate::test_support::spec_for("bound-ssh", "inner.invalid", 22),
+            Arc::new(RecordingObserver::default()),
+        )
+        .with_transport(Arc::new(Inner {
+            host: server.host(),
+            port: server.port(),
+        }));
+        let mut stream = provider
+            .dial(&origin.addr().ip().to_string(), origin.addr().port())
+            .await
+            .unwrap();
+        assert!(
+            http_get_through(&mut stream, &origin.addr().to_string())
+                .await
+                .ends_with("inner-stream")
+        );
+        assert!(provider.source_address().unwrap().ip().is_loopback());
+        provider.shutdown().await;
     }
 
     #[tokio::test]

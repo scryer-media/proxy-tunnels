@@ -194,6 +194,8 @@ pub struct WireGuardTunnelProvider {
     observer: Arc<dyn TunnelObserver>,
     tunnel: tokio::sync::Mutex<Option<Arc<WgTunnel>>>,
     download_tuning: bool,
+    udp_factory: Option<Arc<dyn crate::endpoint::UdpSocketFactory>>,
+    source: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -212,6 +214,8 @@ impl WireGuardTunnelProvider {
             observer,
             tunnel: tokio::sync::Mutex::new(None),
             download_tuning: false,
+            udp_factory: None,
+            source: Arc::new(std::sync::Mutex::new(None)),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -222,6 +226,11 @@ impl WireGuardTunnelProvider {
     /// buffers and the operating system's UDP defaults.
     pub fn with_download_tuning(mut self) -> Self {
         self.download_tuning = true;
+        self
+    }
+
+    pub fn with_udp_factory(mut self, factory: Arc<dyn crate::endpoint::UdpSocketFactory>) -> Self {
+        self.udp_factory = Some(factory);
         self
     }
 
@@ -342,7 +351,11 @@ impl WireGuardTunnelProvider {
         let device = DeviceBuilder::new()
             // An ephemeral local port on an ordinary UDP socket. No listen
             // port is configured: nothing dials *us*.
-            .with_udp(transport::TunnelUdpFactory(self.download_tuning))
+            .with_udp(transport::TunnelUdpFactory {
+                tuning: self.download_tuning,
+                bound: self.udp_factory.clone().map(|factory| (factory, endpoint)),
+                source: self.source.clone(),
+            })
             .with_ip_pair(to_stack, to_device)
             .with_private_key(StaticSecret::from(self.spec.private_key))
             .with_peer(peer)
@@ -560,9 +573,20 @@ fn relabel(error: TunnelError, host: &str, port: u16) -> TunnelError {
 
 #[async_trait::async_trait]
 impl TunnelProvider for WireGuardTunnelProvider {
+    async fn prepare(&self) -> Result<(), TunnelError> {
+        self.tunnel().await.map(|_| ())
+    }
+
+    fn source_address(&self) -> Option<std::net::SocketAddr> {
+        *self.source.lock().expect("WireGuard source")
+    }
+
     async fn shutdown(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
+        self.retire().await;
+    }
+    async fn retire(&self) {
         if let Some(tunnel) = self.tunnel.lock().await.take() {
             tunnel.shutdown.notify_waiters();
             tunnel.pump.abort();

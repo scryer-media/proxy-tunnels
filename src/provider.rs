@@ -31,6 +31,19 @@ impl<T> TunnelStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 /// consumer without another line changing.
 #[async_trait::async_trait]
 pub trait TunnelProvider: Send + Sync {
+    /// Establish shared session state without opening a destination stream.
+    async fn prepare(&self) -> Result<(), TunnelError> {
+        Ok(())
+    }
+
+    /// Release an idle session; a later prepare or dial may open it again.
+    async fn retire(&self) {}
+
+    /// The transport source reported by the most recent session, when known.
+    fn source_address(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+
     /// Stop the provider's owned session permanently. Callers revoke their
     /// streams and cancel pending dials before awaiting this method.
     async fn shutdown(&self) {}

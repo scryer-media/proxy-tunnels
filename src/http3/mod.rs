@@ -101,6 +101,8 @@ struct Sessions {
 pub struct Http3TunnelProvider {
     spec: Http3TunnelSpec,
     config: quinn::ClientConfig,
+    udp_factory: Arc<dyn crate::endpoint::UdpSocketFactory>,
+    source: Mutex<Option<SocketAddr>>,
     sessions: Mutex<Sessions>,
     connect_lock: tokio::sync::Mutex<()>,
     permits: Arc<Semaphore>,
@@ -150,11 +152,18 @@ impl Http3TunnelProvider {
         Ok(Self {
             spec,
             config,
+            udp_factory: Arc::new(crate::endpoint::SystemUdpSocketFactory),
+            source: Mutex::new(None),
             sessions: Mutex::new(Sessions::default()),
             connect_lock: tokio::sync::Mutex::new(()),
             permits: Arc::new(Semaphore::new(MAX_STREAMS)),
             stop: watch::channel(false).0,
         })
+    }
+
+    pub fn with_udp_factory(mut self, factory: Arc<dyn crate::endpoint::UdpSocketFactory>) -> Self {
+        self.udp_factory = factory;
+        self
     }
 
     fn connect_error(&self, detail: &str) -> TunnelError {
@@ -211,13 +220,21 @@ impl Http3TunnelProvider {
                 return Err(self.connect_error("HTTP/3 dial deadline exceeded"));
             }
             let attempt_deadline = now + remaining / (addresses.len() - index) as u32;
-            let bind = if address.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            };
-            let endpoint = quinn::Endpoint::client(bind.parse().expect("constant address"))
+            let socket = self
+                .udp_factory
+                .bind(address)
                 .map_err(|_| self.connect_error("could not bind QUIC UDP socket"))?;
+            let source = socket
+                .local_addr()
+                .ok()
+                .filter(|addr| !addr.ip().is_unspecified());
+            let endpoint = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                socket,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|_| self.connect_error("could not create QUIC endpoint"))?;
             let connecting = endpoint
                 .connect_with(self.config.clone(), address, host)
                 .map_err(|_| self.connect_error("invalid QUIC endpoint configuration"))?;
@@ -243,6 +260,7 @@ impl Http3TunnelProvider {
                     continue;
                 }
             };
+            *self.source.lock().expect("HTTP/3 source") = source;
             let mut builder = h3::client::builder();
             let initializing = builder
                 .max_field_section_size(MAX_RESPONSE_HEADERS)
@@ -295,6 +313,16 @@ impl Http3TunnelProvider {
 
 #[async_trait::async_trait]
 impl TunnelProvider for Http3TunnelProvider {
+    async fn prepare(&self) -> Result<(), TunnelError> {
+        self.session(tokio::time::Instant::now() + self.spec.request_timeout)
+            .await
+            .map(|_| ())
+    }
+
+    fn source_address(&self) -> Option<SocketAddr> {
+        *self.source.lock().expect("HTTP/3 source")
+    }
+
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let authority = spec::authority(host, port)?;
         let mut stop = self.stop.subscribe();
@@ -359,6 +387,25 @@ impl TunnelProvider for Http3TunnelProvider {
             biased;
             _ = stop.changed() => Err(self.connect_error("provider stopped")),
             result = tokio::time::timeout_at(deadline, dial) => result.unwrap_or_else(|_| Err(self.connect_error("HTTP/3 dial deadline exceeded"))),
+        }
+    }
+
+    async fn retire(&self) {
+        let _connecting = self.connect_lock.lock().await;
+        let sessions: Vec<_> = {
+            let mut state = self.sessions.lock().expect("HTTP/3 sessions lock");
+            let sessions = state.all.drain(..).filter_map(|s| s.upgrade()).collect();
+            state.current = None;
+            sessions
+        };
+        for session in sessions {
+            let (endpoint, tasks) = session.stop();
+            for task in tasks {
+                let _ = task.await;
+            }
+            if let Some(endpoint) = endpoint {
+                endpoint.wait_idle().await;
+            }
         }
     }
 

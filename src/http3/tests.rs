@@ -245,6 +245,25 @@ async fn echo(provider: &Http3TunnelProvider, host: &str) {
 }
 
 #[tokio::test]
+async fn caller_bound_udp_carries_http3_traffic() {
+    let fixture = Fixture::start(Mode::Echo).await;
+    let factory = Arc::new(crate::endpoint::RecordingUdpFactory::default());
+    let provider = fixture.provider().with_udp_factory(factory.clone());
+    let mut stream = provider.dial("bound.invalid", 563).await.unwrap();
+    stream.write_all(b"bound payload").await.unwrap();
+    stream.flush().await.unwrap();
+    let mut bytes = [0; 13];
+    stream.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"bound payload");
+    {
+        let addresses = factory.0.lock().unwrap();
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(provider.source_address(), Some(addresses[0]));
+    }
+    provider.shutdown().await;
+}
+
+#[tokio::test]
 async fn informational_responses_wait_for_final_connect_status() {
     let fixture = Fixture::start(Mode::Informational(Some(200))).await;
     let provider = fixture.provider();

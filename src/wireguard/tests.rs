@@ -163,6 +163,29 @@ async fn dropping_a_tunnel_from_a_plain_thread_still_stops_the_device() {
 }
 
 #[tokio::test]
+async fn caller_bound_udp_carries_wireguard_traffic() {
+    let peer = WireGuardTestPeer::start().await;
+    let factory = Arc::new(crate::endpoint::RecordingUdpFactory::default());
+    let provider = WireGuardTunnelProvider::new(
+        peer.client_spec("bound-wireguard"),
+        Arc::new(NoopTunnelObserver),
+    )
+    .with_udp_factory(factory.clone());
+    let mut stream = provider
+        .dial(&TEST_PEER_ADDRESS.to_string(), peer.http_port())
+        .await
+        .unwrap();
+    let response = http_get_through(&mut stream, "origin.tunnel.test").await;
+    assert!(response.ends_with("through the tunnel"));
+    {
+        let addresses = factory.0.lock().unwrap();
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(provider.source_address(), Some(addresses[0]));
+    }
+    provider.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_dial_by_address_carries_bytes_end_to_end() {
     let peer = WireGuardTestPeer::start().await;
     let observer = Arc::new(RecordingObserver::default());

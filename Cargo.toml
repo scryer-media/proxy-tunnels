@@ -58,6 +58,7 @@ tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "proce
 async-trait = "0.1"
 thiserror = "2.0"
 tracing = "0.1"
+socket2 = { version = "0.6", features = ["all"] }
 
 # Optional HTTP/3 CONNECT transport. Keep the existing AWS-LC backend;
 # Quinn's default features would otherwise introduce ring.
