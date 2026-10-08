@@ -437,17 +437,17 @@ impl WireGuardTunnelProvider {
         let endpoint = self.resolve_endpoint().await?;
 
         // A carried tunnel binds its socket first: the link it lands on
-        // decides how large this tunnel's packets may be.
+        // decides how large this tunnel's packets may be. Binding may bring
+        // the carrier up from cold, which the carrier bounds by its own
+        // timeouts; this tunnel's request timeout covers only its own
+        // handshake.
         let (datagram, carrier, mtu) = match &self.datagram {
             None => (None, None, self.spec.mtu),
             Some(transport) => {
-                let carrier =
-                    tokio::time::timeout(self.spec.request_timeout, transport.bind(endpoint))
-                        .await
-                        .map_err(|_| {
-                            self.carrier_failure("it did not open a socket in time".into())
-                        })?
-                        .map_err(|error| self.carrier_failure(error.to_string()))?;
+                let carrier = transport
+                    .bind(endpoint)
+                    .await
+                    .map_err(|error| self.carrier_failure(error.to_string()))?;
                 let mtu = match carrier.link_mtu() {
                     Some(link) => carried_mtu(self.spec.mtu, link, endpoint.ip())?,
                     None => self.spec.mtu,
@@ -631,23 +631,17 @@ impl WireGuardTunnelProvider {
 
         let port = self.spec.endpoint_port;
         if let Some(transport) = &self.datagram {
-            let addresses = tokio::time::timeout(
-                self.spec.request_timeout,
-                transport.resolve(&host),
-            )
-            .await
-            .map_err(|_| TunnelError::WireGuardConnect {
-                host: host.clone(),
-                port,
-                detail: "the endpoint name did not resolve in time through the tunnel beneath"
-                    .to_string(),
-            })?
-            .map_err(|error| TunnelError::WireGuardConnect {
-                host: host.clone(),
-                port,
-                detail: format!(
+            // Asked of the carrier, which may have to come up first and
+            // bounds that and the lookup by its own timeouts.
+            let addresses = transport.resolve(&host).await.map_err(|error| {
+                let detail = format!(
                     "the endpoint name could not be resolved through the tunnel beneath: {error}"
-                ),
+                );
+                TunnelError::WireGuardConnect {
+                    host: host.clone(),
+                    port,
+                    detail,
+                }
             })?;
             return addresses
                 .into_iter()

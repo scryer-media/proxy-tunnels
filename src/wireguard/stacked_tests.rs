@@ -284,3 +284,45 @@ fn the_relay_evidence_tells_wireguard_from_plaintext() {
     assert!(!is_wireguard_message(&ip));
     assert!(!is_wireguard_message(b"GET / HTTP/1.1"));
 }
+
+/// A carrier still coming up: on the paused test clock its bind takes
+/// `.0` of virtual time, then fails with its own reason.
+struct SlowCarrier(std::time::Duration);
+
+#[async_trait::async_trait]
+impl crate::endpoint::DatagramTransport for SlowCarrier {
+    async fn resolve(&self, _host: &str) -> Result<Vec<IpAddr>, TunnelError> {
+        unreachable!("an endpoint address needs no resolver")
+    }
+    async fn bind(
+        &self,
+        _peer: std::net::SocketAddr,
+    ) -> Result<Arc<dyn crate::endpoint::DatagramSocket>, TunnelError> {
+        tokio::time::sleep(self.0).await;
+        Err(TunnelError::Engine(
+            "the carrier's own handshake failed".into(),
+        ))
+    }
+}
+
+/// The paused clock jumps straight to the earliest pending timer, so a
+/// request timeout wrapped around the carrier would always fire first.
+#[tokio::test(start_paused = true)]
+async fn bringing_the_carrier_up_is_not_charged_to_the_carried_tunnels_timeout() {
+    let peer = WireGuardTestPeer::start().await;
+    let spec = peer.client_spec("carried");
+    let carrier = Arc::new(SlowCarrier(spec.request_timeout * 3));
+    let carried = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver))
+        .with_datagram_transport(carrier);
+
+    let message = match carried.prepare().await {
+        Ok(()) => panic!("a failed carrier fails the carried tunnel"),
+        Err(error) => error.to_string(),
+    };
+    // The carrier's own outcome, not this tunnel's timeout cutting it short.
+    assert!(message.contains("tunnel beneath"), "{message}");
+    assert!(
+        message.contains("the carrier's own handshake failed"),
+        "{message}"
+    );
+}
