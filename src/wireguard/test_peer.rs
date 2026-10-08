@@ -77,6 +77,32 @@ pub struct WireGuardTestPeerOptions {
     pub http_port: u16,
     /// Body the HTTP service answers with.
     pub body: String,
+    /// Relay UDP arriving on this port inside the tunnel to a loopback
+    /// target, and the target's answers back. This is how a second
+    /// WireGuard peer becomes reachable *through* this one: its endpoint is
+    /// this peer's tunnel address and this port, and the relay records every
+    /// datagram it carried in [`WireGuardTestPeer::udp_forwarded`].
+    pub udp_forward: Option<(u16, SocketAddr)>,
+}
+
+/// What a peer's UDP relay saw from one source inside the tunnel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ForwardedUdp {
+    /// Datagrams relayed from this source.
+    pub datagrams: u64,
+    /// How many of them were shaped like WireGuard messages: a known message
+    /// type, zeroed reserved bytes and that type's length. A tunnel carried
+    /// inside this one sends nothing else; its plaintext never appears here.
+    pub wireguard_datagrams: u64,
+}
+
+/// Recent datagrams kept for inspection, beyond the per-source counters.
+const FORWARD_SAMPLE: usize = 64;
+
+#[derive(Default)]
+struct ForwardLog {
+    sources: HashMap<SocketAddr, ForwardedUdp>,
+    recent: std::collections::VecDeque<Vec<u8>>,
 }
 
 impl Default for WireGuardTestPeerOptions {
@@ -94,6 +120,7 @@ impl Default for WireGuardTestPeerOptions {
             names,
             http_port: TEST_PEER_HTTP_PORT,
             body: "through the tunnel".to_string(),
+            udp_forward: None,
         }
     }
 }
@@ -108,6 +135,7 @@ pub struct WireGuardTestPeer {
     http_port: u16,
     dns_queries: Arc<Mutex<Vec<String>>>,
     requests: Arc<Mutex<Vec<String>>>,
+    forwarded: Arc<Mutex<ForwardLog>>,
     shutdown: Arc<Notify>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     _device: Device<TestPeerTransports>,
@@ -205,6 +233,7 @@ impl WireGuardTestPeer {
                     tuning: download_tuning,
                     bound: None,
                     source: Arc::new(Mutex::new(None)),
+                    datagram: None,
                 },
                 bound_port: Arc::clone(&bound_port),
             })
@@ -236,6 +265,17 @@ impl WireGuardTestPeer {
             )),
         ];
 
+        let forwarded = Arc::new(Mutex::new(ForwardLog::default()));
+        if let Some((port, target)) = options.udp_forward {
+            assert!(target.ip().is_loopback());
+            tasks.push(tokio::spawn(forward_udp(
+                stack.clone(),
+                port,
+                target,
+                Arc::clone(&forwarded),
+            )));
+        }
+
         tasks.extend(delay_task);
         Self {
             endpoint,
@@ -245,6 +285,7 @@ impl WireGuardTestPeer {
             http_port: options.http_port,
             dns_queries,
             requests,
+            forwarded,
             shutdown,
             tasks,
             _device: device,
@@ -290,6 +331,22 @@ impl WireGuardTestPeer {
             .find(|entry| entry.peer.public_key.as_bytes() == &self.client_public_key)
             .map(|entry| entry.stats.rx_bytes)
             .unwrap_or_default()
+    }
+
+    /// What the UDP relay carried, by source address inside the tunnel.
+    pub fn udp_forwarded(&self) -> HashMap<SocketAddr, ForwardedUdp> {
+        self.forwarded.lock().expect("forward log").sources.clone()
+    }
+
+    /// The most recent datagrams the UDP relay carried, oldest first.
+    pub fn udp_forwarded_recent(&self) -> Vec<Vec<u8>> {
+        self.forwarded
+            .lock()
+            .expect("forward log")
+            .recent
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Request lines the peer's TCP service received.
@@ -409,6 +466,80 @@ async fn serve_http(
             // Give the FIN a chance to leave before the socket is retired.
             tokio::time::sleep(Duration::from_millis(50)).await;
         });
+    }
+}
+
+/// Relay UDP from `port` inside the tunnel to `target` on loopback, with one
+/// loopback socket per inside source so answers find their way back.
+async fn forward_udp(stack: WgStack, port: u16, target: SocketAddr, log: Arc<Mutex<ForwardLog>>) {
+    let Ok(inside) = stack.bind_transport_udp(port) else {
+        return;
+    };
+    let inside = Arc::new(inside);
+    let mut sessions: HashMap<SocketAddr, Arc<tokio::net::UdpSocket>> = HashMap::new();
+    // Dropped with this task, which ends every answer relay with it.
+    let mut answers = tokio::task::JoinSet::new();
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let Ok((read, source)) = inside.recv_from(&mut buffer).await else {
+            return;
+        };
+        let datagram = &buffer[..read];
+        {
+            let mut log = log.lock().expect("forward log");
+            let entry = log.sources.entry(source).or_default();
+            entry.datagrams += 1;
+            if is_wireguard_message(datagram) {
+                entry.wireguard_datagrams += 1;
+            }
+            if log.recent.len() >= FORWARD_SAMPLE {
+                log.recent.pop_front();
+            }
+            log.recent.push_back(datagram.to_vec());
+        }
+        let session = match sessions.get(&source) {
+            Some(session) => Arc::clone(session),
+            None => {
+                let Ok(session) = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await
+                else {
+                    continue;
+                };
+                if session.connect(target).await.is_err() {
+                    continue;
+                }
+                let session = Arc::new(session);
+                let replies = Arc::clone(&session);
+                let inside = Arc::clone(&inside);
+                answers.spawn(async move {
+                    let mut buffer = vec![0u8; 4096];
+                    while let Ok(read) = replies.recv(&mut buffer).await {
+                        if inside.send_to(&buffer[..read], source).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                sessions.insert(source, Arc::clone(&session));
+                session
+            }
+        };
+        let _ = session.send(datagram).await;
+    }
+}
+
+/// Whether `datagram` has the shape of a WireGuard message: type 1 to 4,
+/// three zero reserved bytes, and the length that type always has. A data
+/// message is at least its 16-byte header and 16-byte tag; its padded payload
+/// has no fixed multiple, because padding stops at the tunnel's MTU.
+pub fn is_wireguard_message(datagram: &[u8]) -> bool {
+    if datagram.len() < 4 || datagram[1..4] != [0, 0, 0] {
+        return false;
+    }
+    match datagram[0] {
+        1 => datagram.len() == 148,
+        2 => datagram.len() == 92,
+        3 => datagram.len() == 64,
+        4 => datagram.len() >= 32,
+        _ => false,
     }
 }
 

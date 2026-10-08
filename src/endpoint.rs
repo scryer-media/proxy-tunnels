@@ -43,6 +43,52 @@ pub trait UdpSocketFactory: Send + Sync {
     fn bind(&self, peer: SocketAddr) -> io::Result<UdpSocket>;
 }
 
+/// One datagram socket somewhere other than the operating system, such as a
+/// UDP socket bound inside another WireGuard tunnel.
+///
+/// The UDP counterpart of [`EndpointStream`]: a WireGuard tunnel built over a
+/// [`DatagramTransport`] sends its encrypted packets through this socket
+/// instead of an OS socket. Implementations must fail every pending and
+/// future call once the socket can no longer carry traffic, rather than leave
+/// a caller waiting forever.
+#[async_trait::async_trait]
+pub trait DatagramSocket: Send + Sync {
+    /// Send one datagram to `target`, waiting for room rather than dropping.
+    async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<()>;
+
+    /// Receive one datagram into `buffer`, returning its length and sender.
+    async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+
+    /// The address this socket sends from, when it has one.
+    fn local_addr(&self) -> Option<SocketAddr>;
+
+    /// The MTU of the link this socket's datagrams travel over, IP header
+    /// included. A tunnel carried by this socket must fit its own packets,
+    /// plus its own IP, UDP and WireGuard headers, inside this.
+    fn link_mtu(&self) -> Option<u16>;
+
+    /// Whether the socket has stopped for good.
+    fn is_closed(&self) -> bool;
+
+    /// Resolves once the socket has stopped for good.
+    async fn closed(&self);
+}
+
+/// Something that can bind datagram sockets and resolve names on its far
+/// side: the UDP counterpart of [`EndpointTransport`].
+#[async_trait::async_trait]
+pub trait DatagramTransport: Send + Sync {
+    /// Resolve `host` on the far side of this transport.
+    async fn resolve(&self, host: &str) -> Result<Vec<std::net::IpAddr>, TunnelError>;
+
+    /// Bind one socket for a session with `peer`. Called again whenever a
+    /// session is rebuilt.
+    async fn bind(
+        &self,
+        peer: SocketAddr,
+    ) -> Result<std::sync::Arc<dyn DatagramSocket>, TunnelError>;
+}
+
 pub struct SystemUdpSocketFactory;
 
 impl UdpSocketFactory for SystemUdpSocketFactory {

@@ -1,4 +1,9 @@
-//! Optional socket tuning for bursts of encrypted download traffic.
+//! The UDP side of a WireGuard device: an OS socket, an OS socket the
+//! consumer bound on a chosen egress, or a datagram socket inside another
+//! tunnel. Also the optional socket tuning for bursts of download traffic.
+use std::sync::Arc;
+
+use crate::endpoint::{DatagramSocket, DatagramTransport};
 use gotatun::udp::{
     UdpTransportFactory, UdpTransportFactoryParams,
     socket::{UdpSocket, UdpSocketFactory},
@@ -11,12 +16,25 @@ pub(crate) struct TunnelUdpFactory {
         std::net::SocketAddr,
     )>,
     pub source: std::sync::Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
+    /// Carry the device over another transport instead of an OS socket.
+    pub datagram: Option<DatagramBinding>,
+}
+
+/// How a device carried by a [`DatagramTransport`] gets its socket.
+pub(crate) struct DatagramBinding {
+    pub transport: Arc<dyn DatagramTransport>,
+    pub peer: std::net::SocketAddr,
+    /// A socket bound before the device was built, so the tunnel's MTU could
+    /// be derived from the link it rides. The first bind takes it; a rebind
+    /// asks the transport for a fresh one.
+    pub prebound: Option<Arc<dyn DatagramSocket>>,
 }
 
 #[derive(Clone)]
 pub(crate) enum TunnelSocket {
     System(UdpSocket),
     Bound(std::sync::Arc<tokio::net::UdpSocket>),
+    Datagram(Arc<dyn DatagramSocket>),
 }
 
 impl gotatun::udp::UdpSend for TunnelSocket {
@@ -33,12 +51,13 @@ impl gotatun::udp::UdpSend for TunnelSocket {
                 socket.send_to(&packet, target).await?;
                 Ok(())
             }
+            Self::Datagram(socket) => socket.send_to(&packet, target).await,
         }
     }
     fn max_number_of_packets_to_send(&self) -> usize {
         match self {
             Self::System(socket) => socket.max_number_of_packets_to_send(),
-            Self::Bound(_) => 1,
+            Self::Bound(_) | Self::Datagram(_) => 1,
         }
     }
     async fn send_many_to(
@@ -48,7 +67,7 @@ impl gotatun::udp::UdpSend for TunnelSocket {
     ) -> std::io::Result<()> {
         match self {
             Self::System(socket) => socket.send_many_to(buffer, packets).await,
-            Self::Bound(_) => {
+            Self::Bound(_) | Self::Datagram(_) => {
                 for (packet, target) in packets.drain(..) {
                     self.send_to(packet, target).await?;
                 }
@@ -60,6 +79,7 @@ impl gotatun::udp::UdpSend for TunnelSocket {
         match self {
             Self::System(socket) => socket.local_addr().map(Some),
             Self::Bound(socket) => socket.local_addr().map(Some),
+            Self::Datagram(socket) => Ok(socket.local_addr()),
         }
     }
     #[cfg(target_os = "linux")]
@@ -67,6 +87,8 @@ impl gotatun::udp::UdpSend for TunnelSocket {
         match self {
             Self::System(socket) => socket.set_fwmark(mark),
             Self::Bound(socket) => socket2::SockRef::from(socket.as_ref()).set_mark(mark),
+            // A mark routes an OS socket; this one never reaches the OS.
+            Self::Datagram(_) => Ok(()),
         }
     }
 }
@@ -86,6 +108,21 @@ impl gotatun::udp::UdpRecv for TunnelSocket {
                 packet.truncate(size);
                 Ok((packet, source))
             }
+            Self::Datagram(socket) => loop {
+                let mut packet = pool.get();
+                match socket.recv_from(&mut packet).await {
+                    Ok((size, source)) => {
+                        packet.truncate(size);
+                        return Ok((packet, source));
+                    }
+                    // A datagram too large for a packet buffer is not a
+                    // WireGuard packet of ours; skip it, exactly as an OS
+                    // socket's truncated read is dropped by gotatun. Returning
+                    // the error would end the device's receive task for good.
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+                    Err(error) => return Err(error),
+                }
+            },
         }
     }
     async fn recv_many_from(
@@ -96,7 +133,7 @@ impl gotatun::udp::UdpRecv for TunnelSocket {
     ) -> std::io::Result<()> {
         match self {
             Self::System(socket) => socket.recv_many_from(buffer, pool, packets).await,
-            Self::Bound(_) => {
+            Self::Bound(_) | Self::Datagram(_) => {
                 packets.push(self.recv_from(pool).await?);
                 Ok(())
             }
@@ -105,7 +142,7 @@ impl gotatun::udp::UdpRecv for TunnelSocket {
     fn enable_udp_gro(&self) -> std::io::Result<()> {
         match self {
             Self::System(socket) => socket.enable_udp_gro(),
-            Self::Bound(_) => Ok(()),
+            Self::Bound(_) | Self::Datagram(_) => Ok(()),
         }
     }
 }
@@ -118,6 +155,19 @@ impl UdpTransportFactory for TunnelUdpFactory {
         &mut self,
         params: &UdpTransportFactoryParams,
     ) -> std::io::Result<(TunnelSocket, TunnelSocket)> {
+        if let Some(binding) = &mut self.datagram {
+            let socket = match binding.prebound.take() {
+                Some(socket) => socket,
+                None => binding
+                    .transport
+                    .bind(binding.peer)
+                    .await
+                    .map_err(std::io::Error::other)?,
+            };
+            *self.source.lock().expect("WireGuard source") = socket.local_addr();
+            let socket = TunnelSocket::Datagram(socket);
+            return Ok((socket.clone(), socket));
+        }
         if let Some((factory, peer)) = &self.bound {
             let socket = factory.bind(*peer)?;
             #[cfg(target_os = "linux")]

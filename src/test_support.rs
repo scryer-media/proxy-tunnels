@@ -410,7 +410,7 @@ fn assert_private_key_type(pem: &str) -> PrivateKey {
 /// simpler way to exercise a handshake, and a mock could not prove that a name
 /// was resolved through the tunnel rather than by this machine.
 pub use crate::wireguard::{
-    TEST_CLIENT_ADDRESS, TEST_PEER_ADDRESS, TEST_PEER_HTTP_PORT, WireGuardTestPeer,
-    WireGuardTestPeerOptions, test_client_private_key, test_key, test_peer_private_key,
-    test_preshared_key,
+    ForwardedUdp, TEST_CLIENT_ADDRESS, TEST_PEER_ADDRESS, TEST_PEER_HTTP_PORT, WireGuardTestPeer,
+    WireGuardTestPeerOptions, is_wireguard_message, test_client_private_key, test_key,
+    test_peer_private_key, test_preshared_key,
 };

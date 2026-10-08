@@ -19,6 +19,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::udp;
 use smoltcp::wire::IpEndpoint;
 
+use crate::endpoint::DatagramSocket;
 use crate::error::TunnelError;
 use crate::wireguard::stack::StackShared;
 
@@ -27,13 +28,26 @@ pub struct WgUdpSocket {
     shared: Arc<StackShared>,
     handle: SocketHandle,
     local_port: u16,
+    /// smoltcp keeps one waker per direction per socket, and registering a
+    /// second replaces the first. Two tasks waiting on the same direction
+    /// would therefore strand one of them forever, so each direction admits
+    /// one waiter at a time. A tunnel carried by this socket sends from
+    /// several tasks at once (packets, handshakes, keepalives), which is
+    /// exactly that case.
+    send_lock: tokio::sync::Mutex<()>,
+    recv_lock: tokio::sync::Mutex<()>,
 }
 
 impl WgUdpSocket {
     /// Bind `port`, or an ephemeral port when it is `0`.
-    pub(crate) fn bind(shared: Arc<StackShared>, port: u16) -> Result<Self, TunnelError> {
+    pub(crate) fn bind(
+        shared: Arc<StackShared>,
+        port: u16,
+        packets: usize,
+        bytes: usize,
+    ) -> Result<Self, TunnelError> {
         let (handle, local_port, bound) = shared.with_stack(|stack| {
-            let handle = stack.add_udp_socket();
+            let handle = stack.add_udp_socket_sized(packets, bytes);
             let local_port = if port == 0 {
                 stack.next_ephemeral_port()
             } else {
@@ -57,6 +71,8 @@ impl WgUdpSocket {
             shared,
             handle,
             local_port,
+            send_lock: tokio::sync::Mutex::new(()),
+            recv_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -72,8 +88,12 @@ impl WgUdpSocket {
     pub async fn send_to(&self, data: &[u8], remote: SocketAddr) -> io::Result<()> {
         let endpoint = IpEndpoint::from(remote);
         let handle = self.handle;
+        let _sending = self.send_lock.lock().await;
         let queued = std::future::poll_fn(|context| {
             self.shared.peek_stack(|stack| {
+                if self.shared.is_stopped() {
+                    return Poll::Ready(Err(stopped()));
+                }
                 let socket = stack.sockets_mut().get_mut::<udp::Socket>(handle);
                 match socket.send_slice(data, endpoint) {
                     Ok(()) => Poll::Ready(Ok(())),
@@ -101,8 +121,12 @@ impl WgUdpSocket {
     /// truncates it.
     pub async fn recv_from(&self, data: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let handle = self.handle;
+        let _receiving = self.recv_lock.lock().await;
         std::future::poll_fn(|context| {
             self.shared.peek_stack(|stack| {
+                if self.shared.is_stopped() {
+                    return Poll::Ready(Err(stopped()));
+                }
                 let socket = stack.sockets_mut().get_mut::<udp::Socket>(handle);
                 match socket.recv_slice(data) {
                     Ok((read, metadata)) => Poll::Ready(Ok((
@@ -121,6 +145,42 @@ impl WgUdpSocket {
             })
         })
         .await
+    }
+}
+
+/// The error every operation on a socket of a stopped tunnel returns.
+fn stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "the tunnel has stopped")
+}
+
+#[async_trait::async_trait]
+impl DatagramSocket for WgUdpSocket {
+    async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<()> {
+        WgUdpSocket::send_to(self, data, target).await
+    }
+
+    async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        WgUdpSocket::recv_from(self, buffer).await
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.shared
+            .config()
+            .addresses
+            .first()
+            .map(|cidr| SocketAddr::new(cidr.address, self.local_port))
+    }
+
+    fn link_mtu(&self) -> Option<u16> {
+        Some(self.shared.config().mtu)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.shared.is_stopped()
+    }
+
+    async fn closed(&self) {
+        self.shared.wait_stopped().await;
     }
 }
 

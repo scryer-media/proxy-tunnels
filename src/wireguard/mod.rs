@@ -35,6 +35,25 @@
 //! answers — which is also why a wrong key and an unreachable endpoint are
 //! indistinguishable from here, and why [`TunnelError::WireGuardConnect`]
 //! does not pretend otherwise.
+//!
+//! ## One tunnel inside another
+//!
+//! A tunnel's encrypted packets normally leave through an OS UDP socket. Built
+//! with [`WireGuardTunnelProvider::with_datagram_transport`] they leave through
+//! a [`DatagramSocket`] instead, and every [`WireGuardTunnelProvider`] is
+//! itself a [`DatagramTransport`] that binds such sockets on its own stack. So
+//! a tunnel can ride inside another:
+//!
+//! ```text
+//!   inner smoltcp ─▶ inner gotatun ─▶ UDP socket on the outer stack
+//!                                        ─▶ outer gotatun ─▶ OS UDP socket
+//! ```
+//!
+//! The outer peer only ever sees the inner tunnel's WireGuard datagrams. The
+//! inner tunnel's MTU shrinks by the outer IP, UDP and WireGuard headers it
+//! now has to fit inside ([`carried_mtu`]), the inner endpoint name resolves
+//! through the outer tunnel's resolver, and an inner tunnel whose carrier
+//! stopped is treated as dead rather than waited on.
 
 mod adapter;
 mod phy;
@@ -44,6 +63,8 @@ mod tcp;
 mod transport;
 mod udp;
 
+#[cfg(test)]
+mod stacked_tests;
 #[cfg(any(test, feature = "test-support"))]
 mod test_peer;
 #[cfg(test)]
@@ -59,6 +80,7 @@ use gotatun::x25519::{PublicKey, StaticSecret};
 use ipnetwork::IpNetwork;
 use tokio::sync::Notify;
 
+use crate::endpoint::{DatagramSocket, DatagramTransport};
 use crate::error::TunnelError;
 use crate::provider::{TunnelObserver, TunnelProvider, TunnelStream};
 
@@ -73,9 +95,9 @@ pub use udp::WgUdpSocket;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use test_peer::{
-    TEST_CLIENT_ADDRESS, TEST_PEER_ADDRESS, TEST_PEER_HTTP_PORT, WireGuardTestPeer,
-    WireGuardTestPeerOptions, test_client_private_key, test_key, test_peer_private_key,
-    test_preshared_key,
+    ForwardedUdp, TEST_CLIENT_ADDRESS, TEST_PEER_ADDRESS, TEST_PEER_HTTP_PORT, WireGuardTestPeer,
+    WireGuardTestPeerOptions, is_wireguard_message, test_client_private_key, test_key,
+    test_peer_private_key, test_preshared_key,
 };
 
 pub(crate) use adapter::ip_channels;
@@ -96,6 +118,47 @@ const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// tunnel. Rebuilding the session for every such dial would churn a healthy
 /// tunnel on every unreachable host behind it.
 const RECENT_HANDSHAKE: Duration = Duration::from_secs(120);
+
+/// What WireGuard adds to every packet it carries: a 16-byte data-message
+/// header (type, receiver index, counter) and a 16-byte authentication tag.
+pub const WIREGUARD_DATA_OVERHEAD: u16 = 32;
+
+/// The UDP header every WireGuard packet travels in.
+const UDP_HEADER: u16 = 8;
+
+/// The smallest MTU a tunnel carried inside another may be left with: the
+/// minimum datagram every IPv4 host must accept. A link too narrow for this
+/// is too narrow to carry a tunnel usefully.
+pub const MIN_CARRIED_MTU: u16 = 576;
+
+/// The MTU of a tunnel carried over a link of `link_mtu` to `endpoint`.
+///
+/// Every packet of the carried tunnel becomes one UDP datagram on the link,
+/// grown by WireGuard's own overhead, a UDP header and the link's IP header
+/// (20 bytes to an IPv4 endpoint, 40 to an IPv6 one). The carried tunnel must
+/// leave room for all of that, so its MTU is the smaller of what the operator
+/// configured and what the link leaves over. Without this, every full-sized
+/// packet would be too large for the link and silently lost.
+///
+/// What the link leaves over is rounded down to a multiple of 16. WireGuard
+/// pads every packet up to a multiple of 16, bounded only by the *sender's*
+/// MTU, and the peer at the far end of the carried tunnel has its own,
+/// usually larger, MTU. A packet that fits exactly could still grow by up to
+/// 15 bytes of padding on its way back and no longer fit the link; one sized
+/// to a multiple of 16 never grows.
+pub fn carried_mtu(configured: u16, link_mtu: u16, endpoint: IpAddr) -> Result<u16, TunnelError> {
+    let ip_header: u16 = if endpoint.is_ipv4() { 20 } else { 40 };
+    let overhead = ip_header + UDP_HEADER + WIREGUARD_DATA_OVERHEAD;
+    let available = link_mtu.saturating_sub(overhead) & !15;
+    if available < MIN_CARRIED_MTU {
+        return Err(TunnelError::Configuration(format!(
+            "the tunnel beneath has an MTU of {link_mtu}, which leaves {available} bytes per \
+             packet once this tunnel's {overhead} bytes of headers are added; at least \
+             {MIN_CARRIED_MTU} are needed. Raise the MTU of the tunnel beneath."
+        )));
+    }
+    Ok(configured.min(available))
+}
 
 /// The transports one of our devices is built from.
 pub(crate) type WgTransports = (
@@ -131,6 +194,13 @@ struct WgTunnel {
     shutdown: Arc<Notify>,
     peer_public_key: PublicKey,
     handshake_at: Duration,
+    /// The socket this tunnel rides on when it is carried by another
+    /// transport. Once it closes, the tunnel can never move a packet again.
+    carrier: Option<Arc<dyn DatagramSocket>>,
+    /// Stops the pump once the carrier closes, so a carried tunnel whose
+    /// carrier is gone ends its connections instead of leaving them waiting
+    /// for packets that can never arrive.
+    carrier_watch: Option<tokio::task::JoinHandle<()>>,
     /// The runtime the device's tasks live on. gotatun stops a device on drop
     /// by spawning onto `Handle::try_current()`, and silently leaks it — UDP
     /// socket, keepalives and all — when there is no current runtime. The
@@ -149,6 +219,13 @@ impl WgTunnel {
     /// its keys away and no amount of waiting brings the session back.
     async fn is_alive(&self) -> bool {
         if self.pump.is_finished() {
+            return false;
+        }
+        if self
+            .carrier
+            .as_ref()
+            .is_some_and(|carrier| carrier.is_closed())
+        {
             return false;
         }
         match self.last_handshake_age().await {
@@ -181,6 +258,9 @@ impl Drop for WgTunnel {
         // the device's own tasks learn to stop.
         self.shutdown.notify_waiters();
         self.pump.abort();
+        if let Some(watch) = &self.carrier_watch {
+            watch.abort();
+        }
         // Then the device, from inside its runtime's context whatever thread
         // this drop runs on — see the field's comment for why that matters.
         let _entered = self.runtime.enter();
@@ -195,6 +275,7 @@ pub struct WireGuardTunnelProvider {
     tunnel: tokio::sync::Mutex<Option<Arc<WgTunnel>>>,
     download_tuning: bool,
     udp_factory: Option<Arc<dyn crate::endpoint::UdpSocketFactory>>,
+    datagram: Option<Arc<dyn DatagramTransport>>,
     source: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
     closed: std::sync::atomic::AtomicBool,
 }
@@ -215,6 +296,7 @@ impl WireGuardTunnelProvider {
             tunnel: tokio::sync::Mutex::new(None),
             download_tuning: false,
             udp_factory: None,
+            datagram: None,
             source: Arc::new(std::sync::Mutex::new(None)),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -229,9 +311,29 @@ impl WireGuardTunnelProvider {
         self
     }
 
+    /// Bind the tunnel's OS UDP socket through `factory`, for example on a
+    /// chosen egress interface.
     pub fn with_udp_factory(mut self, factory: Arc<dyn crate::endpoint::UdpSocketFactory>) -> Self {
         self.udp_factory = Some(factory);
+        self.datagram = None;
         self
+    }
+
+    /// Carry the tunnel over `transport` instead of an OS UDP socket.
+    ///
+    /// The endpoint name then resolves on the transport's far side, and the
+    /// tunnel's MTU is reduced to fit inside the transport's link
+    /// ([`carried_mtu`]). Replaces any [`Self::with_udp_factory`].
+    pub fn with_datagram_transport(mut self, transport: Arc<dyn DatagramTransport>) -> Self {
+        self.datagram = Some(transport);
+        self.udp_factory = None;
+        self
+    }
+
+    /// Carry the tunnel inside `outer`: its peer is reached through the outer
+    /// tunnel, which only ever sees this tunnel's encrypted datagrams.
+    pub fn with_inner_wireguard(self, outer: Arc<WireGuardTunnelProvider>) -> Self {
+        self.with_datagram_transport(outer)
     }
 
     /// Resolve a destination using only this tunnel's configured DNS servers.
@@ -252,11 +354,21 @@ impl WireGuardTunnelProvider {
         spec: WireGuardSpec,
         observer: Arc<dyn TunnelObserver>,
     ) -> Result<WireGuardHandshake, TunnelError> {
+        WireGuardTunnelProvider::new(spec, observer)
+            .probe_handshake()
+            .await
+    }
+
+    /// Bring this provider's tunnel up once, as configured (including any
+    /// carrier set with [`Self::with_datagram_transport`]), report what the
+    /// handshake established and tear it down. The provider's own session is
+    /// neither used nor kept.
+    pub async fn probe_handshake(&self) -> Result<WireGuardHandshake, TunnelError> {
+        let spec = &self.spec;
         let endpoint = spec.endpoint_description();
         let peer_public_key = base64_of(&spec.peer_public_key);
         let our_public_key = spec.public_key();
-        let provider = WireGuardTunnelProvider::new(spec, observer);
-        let tunnel = provider.bring_up().await?;
+        let tunnel = self.bring_up().await?;
         let handshake = WireGuardHandshake {
             endpoint,
             peer_public_key,
@@ -324,14 +436,39 @@ impl WireGuardTunnelProvider {
 
         let endpoint = self.resolve_endpoint().await?;
 
-        let (to_stack, to_device, inbound, outbound) = ip_channels(self.spec.mtu);
+        // A carried tunnel binds its socket first: the link it lands on
+        // decides how large this tunnel's packets may be.
+        let (datagram, carrier, mtu) = match &self.datagram {
+            None => (None, None, self.spec.mtu),
+            Some(transport) => {
+                let carrier =
+                    tokio::time::timeout(self.spec.request_timeout, transport.bind(endpoint))
+                        .await
+                        .map_err(|_| {
+                            self.carrier_failure("it did not open a socket in time".into())
+                        })?
+                        .map_err(|error| self.carrier_failure(error.to_string()))?;
+                let mtu = match carrier.link_mtu() {
+                    Some(link) => carried_mtu(self.spec.mtu, link, endpoint.ip())?,
+                    None => self.spec.mtu,
+                };
+                let binding = transport::DatagramBinding {
+                    transport: Arc::clone(transport),
+                    peer: endpoint,
+                    prebound: Some(Arc::clone(&carrier)),
+                };
+                (Some(binding), Some(carrier), mtu)
+            }
+        };
+
+        let (to_stack, to_device, inbound, outbound) = ip_channels(mtu);
         let shutdown = Arc::new(Notify::new());
         let probe_channel = outbound.clone();
         let (stack, pump) = WgStack::start(
             StackConfig {
                 addresses: self.spec.addresses.clone(),
                 dns_servers: self.spec.dns_servers.clone(),
-                mtu: self.spec.mtu,
+                mtu,
                 proxy_config_id: self.spec.proxy_config_id.clone(),
                 download_tuning: self.download_tuning,
             },
@@ -355,6 +492,7 @@ impl WireGuardTunnelProvider {
                 tuning: self.download_tuning,
                 bound: self.udp_factory.clone().map(|factory| (factory, endpoint)),
                 source: self.source.clone(),
+                datagram,
             })
             .with_ip_pair(to_stack, to_device)
             .with_private_key(StaticSecret::from(self.spec.private_key))
@@ -392,10 +530,20 @@ impl WireGuardTunnelProvider {
             }
         };
         let handshake_at = started.elapsed().saturating_sub(age);
+        let carrier_watch = carrier.as_ref().map(|carrier| {
+            let carrier = Arc::clone(carrier);
+            let pump = pump.abort_handle();
+            runtime.spawn(async move {
+                carrier.closed().await;
+                pump.abort();
+            })
+        });
         tracing::info!(
             proxy_config_id = self.spec.proxy_config_id.as_str(),
             tunnel = self.spec.describe().as_str(),
             handshake_ms = handshake_at.as_millis() as u64,
+            mtu,
+            carried = carrier.is_some(),
             "brought up a WireGuard tunnel"
         );
 
@@ -406,8 +554,19 @@ impl WireGuardTunnelProvider {
             shutdown,
             peer_public_key,
             handshake_at,
+            carrier,
+            carrier_watch,
             runtime,
         })
+    }
+
+    /// The tunnel beneath this one could not give it a socket.
+    fn carrier_failure(&self, detail: String) -> TunnelError {
+        TunnelError::WireGuardConnect {
+            host: self.spec.endpoint_host.clone(),
+            port: self.spec.endpoint_port,
+            detail: format!("the tunnel beneath could not carry this one: {detail}"),
+        }
     }
 
     /// Wait for the peer to answer, or say that it did not.
@@ -456,17 +615,50 @@ impl WireGuardTunnelProvider {
         }
     }
 
-    /// Resolve the peer's endpoint with the **operating system's** resolver.
+    /// Resolve the peer's endpoint with the **operating system's** resolver,
+    /// or, for a carried tunnel, with its carrier's.
     ///
     /// This one name is outside the tunnel by definition: it is the hop that
-    /// carries the tunnel, so there is nothing to resolve it through yet.
+    /// carries the tunnel, so there is nothing to resolve it through yet. When
+    /// another tunnel carries this one, the name means something on *that*
+    /// tunnel's far side, so that is where it is asked.
     async fn resolve_endpoint(&self) -> Result<SocketAddr, TunnelError> {
         let host = self.spec.endpoint_host.trim().to_string();
-        if let Ok(address) = host.parse::<IpAddr>() {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(address) = bare.parse::<IpAddr>() {
             return Ok(SocketAddr::new(address, self.spec.endpoint_port));
         }
 
         let port = self.spec.endpoint_port;
+        if let Some(transport) = &self.datagram {
+            let addresses = tokio::time::timeout(
+                self.spec.request_timeout,
+                transport.resolve(&host),
+            )
+            .await
+            .map_err(|_| TunnelError::WireGuardConnect {
+                host: host.clone(),
+                port,
+                detail: "the endpoint name did not resolve in time through the tunnel beneath"
+                    .to_string(),
+            })?
+            .map_err(|error| TunnelError::WireGuardConnect {
+                host: host.clone(),
+                port,
+                detail: format!(
+                    "the endpoint name could not be resolved through the tunnel beneath: {error}"
+                ),
+            })?;
+            return addresses
+                .into_iter()
+                .next()
+                .map(|address| SocketAddr::new(address, port))
+                .ok_or_else(|| TunnelError::WireGuardConnect {
+                    host: host.clone(),
+                    port,
+                    detail: "the endpoint name resolved to no addresses".to_string(),
+                });
+        }
         let resolved = tokio::time::timeout(
             self.spec.request_timeout,
             tokio::net::lookup_host((host.as_str(), port)),
@@ -590,6 +782,9 @@ impl TunnelProvider for WireGuardTunnelProvider {
         if let Some(tunnel) = self.tunnel.lock().await.take() {
             tunnel.shutdown.notify_waiters();
             tunnel.pump.abort();
+            if let Some(watch) = &tunnel.carrier_watch {
+                watch.abort();
+            }
             if let Some(device) = tunnel.device.lock().await.take() {
                 device.stop().await;
             }
@@ -646,6 +841,34 @@ impl TunnelProvider for WireGuardTunnelProvider {
 
     fn describe(&self) -> String {
         self.spec.describe()
+    }
+}
+
+/// A tunnel is a datagram transport for tunnels inside it: each bind opens a
+/// UDP socket on this tunnel's stack, bringing the tunnel up if needed.
+#[async_trait::async_trait]
+impl DatagramTransport for WireGuardTunnelProvider {
+    async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, TunnelError> {
+        self.resolve_host(host).await
+    }
+
+    async fn bind(&self, _peer: SocketAddr) -> Result<Arc<dyn DatagramSocket>, TunnelError> {
+        let bound = match self.tunnel().await {
+            Ok(tunnel) => tunnel.stack.bind_transport_udp(0),
+            Err(error) => Err(error),
+        };
+        match bound {
+            Ok(socket) => {
+                self.observer
+                    .tunnel_dial_succeeded(&self.spec.proxy_config_id);
+                Ok(Arc::new(socket))
+            }
+            Err(error) => {
+                self.observer
+                    .tunnel_dial_failed(&self.spec.proxy_config_id, &error.to_string());
+                Err(error)
+            }
+        }
     }
 }
 

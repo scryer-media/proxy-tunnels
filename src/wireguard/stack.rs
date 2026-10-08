@@ -132,6 +132,10 @@ pub(crate) struct StackShared {
     open_sockets: Arc<AtomicUsize>,
     dns_slots: tokio::sync::Semaphore,
     config: StackConfig,
+    /// Set, for good, once the pump has stopped. Nothing moves packets after
+    /// that, so every socket wrapper must fail rather than wait.
+    stopped: std::sync::atomic::AtomicBool,
+    stopped_notify: Notify,
 }
 
 impl StackShared {
@@ -187,6 +191,62 @@ impl StackShared {
 
     pub(crate) fn release_socket(&self) {
         self.open_sockets.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Whether the pump has stopped, so no packet will ever move again.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Mark the stack stopped and close every socket on it.
+    ///
+    /// Closing is what releases waiters: smoltcp wakes a socket's registered
+    /// readers and writers when a TCP socket is aborted or a UDP socket is
+    /// closed, and each wrapper then sees the stack is gone. Without this a
+    /// task blocked on a stopped stack would wait forever, because only the
+    /// pump ever wakes it. The flag is set before the lock is taken, so a
+    /// wrapper that checks it under the lock either sees it set or registers
+    /// its waker before the close wakes it.
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (_, socket) in inner.sockets.iter_mut() {
+                match socket {
+                    smoltcp::socket::Socket::Tcp(socket) => socket.abort(),
+                    smoltcp::socket::Socket::Udp(socket) => socket.close(),
+                    _ => {}
+                }
+            }
+        }
+        self.stopped_notify.notify_waiters();
+    }
+
+    /// Resolves once the stack has stopped.
+    pub(crate) async fn wait_stopped(&self) {
+        loop {
+            let notified = self.stopped_notify.notified();
+            tokio::pin!(notified);
+            // Registered before the flag is read, so a stop between the two
+            // still wakes this waiter.
+            notified.as_mut().enable();
+            if self.is_stopped() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Marks the stack stopped however the pump ends, including by abort.
+struct StopOnExit(Arc<StackShared>);
+
+impl Drop for StopOnExit {
+    fn drop(&mut self) {
+        self.0.stop();
     }
 }
 
@@ -255,16 +315,12 @@ impl StackInner {
         self.sockets.add(socket)
     }
 
-    pub(crate) fn add_udp_socket(&mut self) -> SocketHandle {
+    /// A UDP socket with room for `packets` datagrams and `bytes` of payload
+    /// in each direction.
+    pub(crate) fn add_udp_socket_sized(&mut self, packets: usize, bytes: usize) -> SocketHandle {
         let socket = udp::Socket::new(
-            udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
-                vec![0u8; UDP_BUFFER_BYTES],
-            ),
-            udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
-                vec![0u8; UDP_BUFFER_BYTES],
-            ),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; packets], vec![0u8; bytes]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; packets], vec![0u8; bytes]),
         );
         self.sockets.add(socket)
     }
@@ -473,6 +529,8 @@ impl WgStack {
             open_sockets,
             dns_slots: tokio::sync::Semaphore::new(DNS_QUERY_SLOTS),
             config,
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            stopped_notify: Notify::new(),
         });
 
         let pump = runtime.spawn(pump(Arc::clone(&shared), inbound, shutdown));
@@ -502,10 +560,47 @@ impl WgStack {
 
     /// Bind a UDP socket inside the tunnel. `0` picks an ephemeral port.
     pub fn bind_udp(&self, port: u16) -> Result<WgUdpSocket, TunnelError> {
+        self.bind_udp_sized(port, UDP_PACKETS, UDP_BUFFER_BYTES)
+    }
+
+    /// Bind a UDP socket that carries another tunnel's encrypted packets.
+    ///
+    /// Sized like the link itself rather than like a DNS socket: it queues as
+    /// many datagrams as the adapter channels hold, each up to this link's
+    /// MTU, so a burst on the carried tunnel is absorbed here instead of being
+    /// dropped by a buffer meant for a handful of queries.
+    pub fn bind_transport_udp(&self, port: u16) -> Result<WgUdpSocket, TunnelError> {
+        let mtu = usize::from(self.shared.config().mtu);
+        self.bind_udp_sized(
+            port,
+            crate::wireguard::adapter::PACKET_QUEUE_DEPTH,
+            crate::wireguard::adapter::PACKET_QUEUE_DEPTH * mtu,
+        )
+    }
+
+    fn bind_udp_sized(
+        &self,
+        port: u16,
+        packets: usize,
+        bytes: usize,
+    ) -> Result<WgUdpSocket, TunnelError> {
+        if self.shared.is_stopped() {
+            return Err(TunnelError::Engine("the tunnel has stopped".to_string()));
+        }
         let slot = self.shared.claim_socket()?;
-        let socket = WgUdpSocket::bind(Arc::clone(&self.shared), port)?;
+        let socket = WgUdpSocket::bind(Arc::clone(&self.shared), port, packets, bytes)?;
         slot.keep();
         Ok(socket)
+    }
+
+    /// The link MTU this stack was built with.
+    pub fn mtu(&self) -> u16 {
+        self.shared.config().mtu
+    }
+
+    /// Whether the stack has stopped, so nothing on it will move again.
+    pub fn is_stopped(&self) -> bool {
+        self.shared.is_stopped()
     }
 
     /// Resolve `host` **through the tunnel**, using the configured resolvers.
@@ -704,6 +799,7 @@ impl Drop for QueryGuard<'_> {
 /// It never busy-loops: after each poll it parks on whichever of the four
 /// things can possibly need it next.
 async fn pump(shared: Arc<StackShared>, mut inbound: InboundRx, shutdown: Arc<Notify>) {
+    let _stop = StopOnExit(Arc::clone(&shared));
     let proxy_config_id = shared.config().proxy_config_id.clone();
     let mut batch: Vec<Packet<Ip>> = Vec::with_capacity(64);
 

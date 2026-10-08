@@ -12,6 +12,7 @@ are not accepted.
 
 - SSH TCP forwarding with Ed25519 key authentication and host-key pinning.
 - Userspace WireGuard with an in-memory IP stack; no TUN device or routing-table changes.
+  A WireGuard tunnel can ride inside another WireGuard tunnel.
 - Optional HTTP/3 CONNECT over QUIC, with verified proxy TLS and HTTP Basic
   authentication. See [HTTP/3 configuration and interoperability](docs/http3.md).
 - Authenticated, loopback-only SOCKS5 CONNECT fronts, tunnel lifecycle management,
@@ -56,6 +57,24 @@ shutdown then stops the owned session and prevents further dials. WireGuard's
 `resolve_host` resolves through its configured tunnel DNS only. Direct TLS I/O
 adapters belong in the host application; `TunnelStream` already implements
 the asynchronous read/write interface required by s2n's Tokio integration.
+
+## WireGuard inside WireGuard
+
+`WireGuardTunnelProvider::with_inner_wireguard(outer)` carries a tunnel over a
+UDP socket bound inside `outer` instead of an OS socket; the general seam is
+`with_datagram_transport` with the `endpoint::DatagramTransport` and
+`DatagramSocket` traits, which every `WireGuardTunnelProvider` implements. The
+inner endpoint name resolves through the outer tunnel's DNS, and the outer peer
+only ever sees the inner tunnel's WireGuard datagrams.
+
+The inner tunnel's MTU is `carried_mtu`: the smaller of its configured MTU and
+the outer MTU minus the outer IP (20 or 40 bytes), UDP (8) and WireGuard (32)
+headers, rounded down to a multiple of 16 so the far peer's padding can never
+overflow the outer link. With the default 1280-byte MTU and an IPv4 inner
+endpoint that leaves 1216 bytes. Every packet is encrypted twice and copied
+through both userspace stacks, so expect lower throughput and higher CPU per
+byte than a single tunnel. When the outer tunnel stops, the inner tunnel stops
+with it: open streams end and new dials fail instead of waiting.
 
 ## Development
 
