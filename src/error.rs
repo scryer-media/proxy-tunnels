@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use tokio::sync::Notify;
+
 /// Every way a tunnel can refuse to carry traffic.
 ///
 /// The variants exist so the caller can write a *distinct* operator-facing
@@ -90,10 +94,46 @@ pub enum TunnelError {
     #[error("HTTP/3 proxy refused CONNECT with HTTP {status}")]
     Http3ProxyStatus { status: u16 },
 
+    /// Every socket slot of the tunnel is taken. The tunnel itself is fine;
+    /// a dial succeeds again once one of the `open` sockets closes.
+    #[error("the tunnel already has {open} sockets open")]
+    AtCapacity { open: usize, freed: SlotFreed },
+
     /// The engine itself could not start (no runtime, no loopback socket).
     #[error("tunnel engine unavailable: {0}")]
     Engine(String),
 }
+
+/// Signalled each time the full tunnel frees a socket slot.
+///
+/// Waiters register with [`tokio::sync::Notify::notified`] (enabled before
+/// they dial again) and are woken by every freed slot, so a dial retried
+/// after the wake may still find the tunnel full and wait again.
+#[derive(Clone, Default)]
+pub struct SlotFreed(Arc<Notify>);
+
+impl SlotFreed {
+    pub fn notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.0)
+    }
+    pub(crate) fn signal(&self) {
+        self.0.notify_waiters();
+    }
+}
+
+impl std::fmt::Debug for SlotFreed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SlotFreed")
+    }
+}
+
+// One tunnel's signal equals only itself.
+impl PartialEq for SlotFreed {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for SlotFreed {}
 
 impl From<russh::Error> for TunnelError {
     /// Required by `russh::client::Handler`, whose associated error type must

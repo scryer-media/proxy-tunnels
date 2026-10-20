@@ -52,7 +52,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr as SmolCidr};
 use tokio::sync::Notify;
 
-use crate::error::TunnelError;
+use crate::error::{SlotFreed, TunnelError};
 use crate::wireguard::adapter::{InboundRx, OutboundTx};
 use crate::wireguard::phy::WgPhy;
 use crate::wireguard::spec::IpCidr;
@@ -63,10 +63,10 @@ use crate::wireguard::udp::WgUdpSocket;
 
 /// How many sockets one tunnel may have open at once.
 ///
-/// A tunnel serves one proxy configuration, whose consumers are our own
-/// connection-pooled HTTP clients; 256 is far above anything they open and low
-/// enough that a leak announces itself as a clear error rather than as memory
-/// growth (each TCP socket costs 128 KiB of buffers).
+/// Each TCP socket costs 128 KiB of buffers, so the cap bounds a tunnel's
+/// memory. A dial past it fails with [`TunnelError::AtCapacity`], which says
+/// the tunnel is full rather than broken, so a caller can wait or go
+/// elsewhere.
 pub const MAX_SOCKETS: usize = 256;
 
 /// Send and receive buffer per TCP socket, each way.
@@ -129,7 +129,7 @@ pub(crate) struct StackShared {
     /// Rung by anything that gave smoltcp work to do, so the pump runs a poll
     /// without waiting for its timer.
     wake: Notify,
-    open_sockets: Arc<AtomicUsize>,
+    open_sockets: Arc<SocketSlots>,
     dns_slots: tokio::sync::Semaphore,
     config: StackConfig,
     /// Set, for good, once the pump has stopped. Nothing moves packets after
@@ -172,25 +172,26 @@ impl StackShared {
 
     /// Claim one of the [`MAX_SOCKETS`] slots.
     fn claim_socket(&self) -> Result<SocketSlot<'_>, TunnelError> {
-        if self.open_sockets.load(Ordering::SeqCst) >= MAX_SOCKETS {
+        if self.open_sockets.open.load(Ordering::SeqCst) >= MAX_SOCKETS {
             self.with_stack(|inner| inner.reclaim_finished(inner.now(), true));
         }
         let claimed = self
             .open_sockets
+            .open
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
                 (open < MAX_SOCKETS).then_some(open + 1)
             });
         if claimed.is_err() {
-            return Err(TunnelError::Engine(format!(
-                "the tunnel already has {MAX_SOCKETS} sockets open; \
-                 something is not closing its connections"
-            )));
+            return Err(TunnelError::AtCapacity {
+                open: MAX_SOCKETS,
+                freed: self.open_sockets.freed.clone(),
+            });
         }
         Ok(SocketSlot { shared: self })
     }
 
     pub(crate) fn release_socket(&self) {
-        self.open_sockets.fetch_sub(1, Ordering::SeqCst);
+        self.open_sockets.release();
     }
 
     /// Whether the pump has stopped, so no packet will ever move again.
@@ -275,6 +276,20 @@ struct Closing {
     counted: bool,
 }
 
+/// The tunnel's claimed socket slots, and the signal each freed one rings.
+#[derive(Default)]
+pub(crate) struct SocketSlots {
+    open: AtomicUsize,
+    freed: SlotFreed,
+}
+
+impl SocketSlots {
+    fn release(&self) {
+        self.open.fetch_sub(1, Ordering::SeqCst);
+        self.freed.signal();
+    }
+}
+
 /// The smoltcp state itself. Only ever touched under [`StackShared`]'s lock.
 pub(crate) struct StackInner {
     iface: Interface,
@@ -284,7 +299,7 @@ pub(crate) struct StackInner {
     started: std::time::Instant,
     next_port: u16,
     closing: Vec<Closing>,
-    open_sockets: Arc<AtomicUsize>,
+    open_sockets: Arc<SocketSlots>,
     tcp_buffer_bytes: usize,
 }
 
@@ -410,7 +425,7 @@ impl StackInner {
             }
             self.sockets.remove(handle);
             if counted {
-                self.open_sockets.fetch_sub(1, Ordering::SeqCst);
+                self.open_sockets.release();
             }
             self.closing.swap_remove(index);
         }
@@ -507,7 +522,7 @@ impl WgStack {
             sockets.add(dns::Socket::new(&servers, slots))
         });
 
-        let open_sockets = Arc::new(AtomicUsize::new(0));
+        let open_sockets = Arc::new(SocketSlots::default());
         let shared = Arc::new(StackShared {
             inner: Mutex::new(StackInner {
                 tcp_buffer_bytes: if config.download_tuning {
@@ -905,7 +920,13 @@ mod resource_tests {
             });
             slot.keep();
         }
-        assert!(shared.claim_socket().is_err());
+        assert!(matches!(
+            shared.claim_socket(),
+            Err(TunnelError::AtCapacity {
+                open: MAX_SOCKETS,
+                ..
+            })
+        ));
         shared.peek_stack(|inner| {
             assert_eq!(
                 inner.sockets.iter().count(),
@@ -918,7 +939,30 @@ mod resource_tests {
             assert!(inner.closing.is_empty());
             assert_eq!(inner.sockets.iter().count(), 1);
         });
-        assert_eq!(shared.open_sockets.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.open_sockets.open.load(Ordering::SeqCst), 0);
+        assert!(shared.claim_socket().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_full_tunnel_wakes_its_waiters_when_a_slot_frees() {
+        let stack = isolated_stack();
+        let shared = &stack.shared;
+        let mut slots: Vec<_> = (0..MAX_SOCKETS)
+            .map(|_| shared.claim_socket().unwrap())
+            .collect();
+        let Err(TunnelError::AtCapacity { freed, .. }) = shared.claim_socket() else {
+            panic!("a full tunnel reports AtCapacity");
+        };
+        let notify = freed.notify();
+        let mut woken = std::pin::pin!(notify.notified());
+        woken.as_mut().enable();
+        poll_fn(|cx| {
+            assert!(woken.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(slots.pop());
+        woken.await;
         assert!(shared.claim_socket().is_ok());
     }
 
@@ -929,9 +973,9 @@ mod resource_tests {
             let mut dial =
                 Box::pin(stack.connect("10.0.0.2:80".parse().unwrap(), Duration::from_secs(30)));
             poll_pending(dial.as_mut()).await;
-            assert_eq!(stack.shared.open_sockets.load(Ordering::SeqCst), 1);
+            assert_eq!(stack.shared.open_sockets.open.load(Ordering::SeqCst), 1);
             drop(dial);
-            assert_eq!(stack.shared.open_sockets.load(Ordering::SeqCst), 0);
+            assert_eq!(stack.shared.open_sockets.open.load(Ordering::SeqCst), 0);
             assert_eq!(
                 stack
                     .shared

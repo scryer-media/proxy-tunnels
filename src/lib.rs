@@ -53,7 +53,7 @@ pub mod wireguard;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use error::TunnelError;
+pub use error::{SlotFreed, TunnelError};
 #[cfg(feature = "http3")]
 pub use http3::{Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec};
 pub use provider::{
