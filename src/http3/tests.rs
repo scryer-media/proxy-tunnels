@@ -635,6 +635,36 @@ async fn goaway_keeps_existing_streams_and_reconnects_for_later_dials() {
 }
 
 #[tokio::test]
+async fn a_full_provider_wakes_its_waiters_when_a_draining_session_closes() {
+    let fixture = Fixture::start(Mode::Goaway).await;
+    let provider = fixture.provider();
+    // Each GOAWAY session keeps its one stream and drains, so held streams
+    // fill the session limit.
+    let mut held = Vec::new();
+    while held.len() < MAX_SESSIONS {
+        held.push(provider.dial("held.invalid", 563).await.unwrap());
+        while provider.dial("draining.invalid", 563).await.is_ok() {}
+    }
+    let Err(TunnelError::AtCapacity { open, freed }) = provider.dial("full.invalid", 563).await
+    else {
+        panic!("a full provider reports AtCapacity");
+    };
+    assert_eq!(open, MAX_SESSIONS);
+    let notify = freed.notify();
+    let mut woken = std::pin::pin!(notify.notified());
+    woken.as_mut().enable();
+    poll_fn(|cx| {
+        assert!(woken.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(held.remove(0));
+    woken.await;
+    echo(&provider, "room.invalid").await;
+    provider.shutdown().await;
+}
+
+#[tokio::test]
 async fn dropping_a_pending_read_does_not_interrupt_another_stream() {
     let fixture = Fixture::start(Mode::Echo).await;
     let provider = fixture.provider();

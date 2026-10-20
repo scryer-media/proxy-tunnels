@@ -20,7 +20,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{TunnelError, TunnelProvider, TunnelStream};
+use crate::{SlotFreed, TunnelError, TunnelProvider, TunnelStream};
 
 const MAX_STREAMS: usize = 128;
 const MAX_SESSIONS: usize = 4; // Includes connections draining after GOAWAY.
@@ -49,6 +49,7 @@ struct Session {
     stopped: AtomicBool,
     driver: Mutex<Option<JoinHandle<()>>>,
     writers: Mutex<Vec<JoinHandle<()>>>,
+    freed: SlotFreed,
 }
 
 impl Session {
@@ -84,6 +85,8 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop();
+        // The session leaves the provider's limit once it is gone.
+        self.freed.signal();
     }
 }
 
@@ -107,6 +110,7 @@ pub struct Http3TunnelProvider {
     connect_lock: tokio::sync::Mutex<()>,
     permits: Arc<Semaphore>,
     stop: watch::Sender<bool>,
+    freed: SlotFreed,
 }
 
 impl Http3TunnelProvider {
@@ -158,6 +162,7 @@ impl Http3TunnelProvider {
             connect_lock: tokio::sync::Mutex::new(()),
             permits: Arc::new(Semaphore::new(MAX_STREAMS)),
             stop: watch::channel(false).0,
+            freed: SlotFreed::default(),
         })
     }
 
@@ -186,7 +191,10 @@ impl Http3TunnelProvider {
             sessions.current = None;
             sessions.all.retain(|session| session.strong_count() != 0);
             if sessions.all.len() >= MAX_SESSIONS {
-                return Err(self.connect_error("HTTP/3 draining connection limit reached"));
+                return Err(TunnelError::AtCapacity {
+                    open: MAX_SESSIONS,
+                    freed: self.freed.clone(),
+                });
             }
         }
         let host = self.spec.host.trim_start_matches('[').trim_end_matches(']');
@@ -285,6 +293,7 @@ impl Http3TunnelProvider {
                 stopped: AtomicBool::new(false),
                 driver: Mutex::new(Some(task)),
                 writers: Mutex::new(Vec::new()),
+                freed: self.freed.clone(),
             });
             let mut sessions = self.sessions.lock().expect("HTTP/3 sessions lock");
             if *self.stop.borrow() {

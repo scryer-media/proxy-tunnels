@@ -175,12 +175,12 @@ impl StackShared {
         if self.open_sockets.open.load(Ordering::SeqCst) >= MAX_SOCKETS {
             self.with_stack(|inner| inner.reclaim_finished(inner.now(), true));
         }
-        let claimed = self
-            .open_sockets
-            .open
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
-                (open < MAX_SOCKETS).then_some(open + 1)
-            });
+        let claimed =
+            self.open_sockets
+                .open
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
+                    (open < MAX_SOCKETS).then_some(open + 1)
+                });
         if claimed.is_err() {
             return Err(TunnelError::AtCapacity {
                 open: MAX_SOCKETS,

@@ -94,9 +94,10 @@ pub enum TunnelError {
     #[error("HTTP/3 proxy refused CONNECT with HTTP {status}")]
     Http3ProxyStatus { status: u16 },
 
-    /// Every socket slot of the tunnel is taken. The tunnel itself is fine;
-    /// a dial succeeds again once one of the `open` sockets closes.
-    #[error("the tunnel already has {open} sockets open")]
+    /// The tunnel is full: a WireGuard tunnel's sockets, or an HTTP/3
+    /// tunnel's connections. The tunnel itself is fine; a dial succeeds again
+    /// once `freed` rings.
+    #[error("the tunnel is full, with {open} open")]
     AtCapacity { open: usize, freed: SlotFreed },
 
     /// The engine itself could not start (no runtime, no loopback socket).
