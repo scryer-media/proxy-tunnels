@@ -921,3 +921,122 @@ fn a_failed_handshake_makes_gotatun_log_no_error() {
         assert_eq!(errors.seen(), Vec::<String>::new());
     });
 }
+
+/// A loopback hop between a client and a peer that holds the peer's
+/// handshake responses for a fixed time, and records when it first saw an
+/// initiation and when it first let a response go.
+struct HandshakeRelay {
+    address: SocketAddr,
+    initiation_seen: Arc<Mutex<Option<std::time::Instant>>>,
+    response_released: Arc<Mutex<Option<std::time::Instant>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HandshakeRelay {
+    async fn start(peer: SocketAddr, hold: Duration) -> Self {
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("the relay binds");
+        let address = socket.local_addr().expect("the relay's address");
+        let initiation_seen = Arc::new(Mutex::new(None));
+        let response_released = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&initiation_seen);
+        let released = Arc::clone(&response_released);
+        let task = tokio::spawn(async move {
+            let mut client = None;
+            let mut buffer = vec![0u8; 65_536];
+            loop {
+                let Ok((read, from)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
+                let datagram = &buffer[..read];
+                if from != peer {
+                    client = Some(from);
+                    if datagram.first() == Some(&1) {
+                        seen.lock()
+                            .expect("initiation seen")
+                            .get_or_insert_with(std::time::Instant::now);
+                    }
+                    let _ = socket.send_to(datagram, peer).await;
+                    continue;
+                }
+                let Some(client) = client else {
+                    continue;
+                };
+                if datagram.first() == Some(&2) {
+                    tokio::time::sleep(hold).await;
+                    released
+                        .lock()
+                        .expect("response released")
+                        .get_or_insert_with(std::time::Instant::now);
+                }
+                let _ = socket.send_to(datagram, client).await;
+            }
+        });
+        Self {
+            address,
+            initiation_seen,
+            response_released,
+            task,
+        }
+    }
+
+    /// From the first initiation reaching the relay to the first response
+    /// leaving it: a span the handshake itself cannot be shorter than.
+    fn held_span(&self) -> Duration {
+        let seen = self
+            .initiation_seen
+            .lock()
+            .expect("initiation seen")
+            .expect("an initiation crossed the relay");
+        let released = self
+            .response_released
+            .lock()
+            .expect("response released")
+            .expect("a response crossed the relay");
+        released.duration_since(seen)
+    }
+}
+
+impl Drop for HandshakeRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The reported handshake time is measured, not read off gotatun's coarse
+/// timers: a peer that answers a fixed time after it is asked, shorter than
+/// those timers' tick, still reports at least the time the answer was held.
+#[tokio::test]
+async fn the_handshake_time_is_the_measured_round_trip() {
+    let peer = WireGuardTestPeer::start().await;
+    let hold = Duration::from_millis(100);
+    let relay = HandshakeRelay::start(peer.endpoint(), hold).await;
+    let mut spec = peer.client_spec("proxy-handshake-time");
+    spec.endpoint_host = relay.address.ip().to_string();
+    spec.endpoint_port = relay.address.port();
+    // Nothing but the bring-up probe may make the device initiate, so the
+    // first initiation the relay sees is the probe's.
+    spec.persistent_keepalive = None;
+    let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver));
+
+    let called = std::time::Instant::now();
+    let handshake = provider
+        .probe_handshake()
+        .await
+        .expect("the handshake completes through the relay");
+    let returned = called.elapsed();
+
+    let held = relay.held_span();
+    assert!(held >= hold, "the relay held the response for {held:?}");
+    assert!(
+        handshake.handshake_at >= held,
+        "reported {:?}, but the response alone was held for {held:?}",
+        handshake.handshake_at
+    );
+    assert!(
+        handshake.handshake_at <= returned,
+        "reported {:?}, longer than the whole call's {returned:?}",
+        handshake.handshake_at
+    );
+}
