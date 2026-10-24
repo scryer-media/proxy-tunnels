@@ -772,3 +772,152 @@ async fn large_download_drains_after_receive_backpressure() {
             .is_err()
     );
 }
+
+/// Every ERROR event a `gotatun` target emits while it is the subscriber.
+#[derive(Clone, Default)]
+struct GotatunErrors(Arc<Mutex<Vec<String>>>);
+
+impl GotatunErrors {
+    fn seen(&self) -> Vec<String> {
+        self.0.lock().expect("gotatun errors").clone()
+    }
+}
+
+/// The `message` field of one event.
+struct EventMessage(String);
+
+impl tracing::field::Visit for EventMessage {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for GotatunErrors {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::ERROR && metadata.target().starts_with("gotatun")
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = EventMessage(String::new());
+        event.record(&mut message);
+        self.0.lock().expect("gotatun errors").push(format!(
+            "{}: {}",
+            event.metadata().target(),
+            message.0
+        ));
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Run `test` on a current-thread runtime that reports gotatun's errors to the
+/// [`GotatunErrors`] it is handed. Every task of the tunnel and of the peer
+/// runs on this one thread, so every error reaches it, and the scheduling
+/// order is the same on every run.
+fn with_gotatun_errors<F>(test: impl FnOnce(GotatunErrors) -> F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let errors = GotatunErrors::default();
+    let dispatch = tracing::Dispatch::new(errors.clone());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    tracing::dispatcher::with_default(&dispatch, || runtime.block_on(test(errors)));
+}
+
+/// Wait until every task spawned since `baseline` was counted has finished,
+/// so nothing of a torn-down tunnel is left that could still log.
+async fn until_tasks_return_to(baseline: usize) {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    while metrics.num_alive_tasks() > baseline {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+
+/// Retiring a tunnel stops its device before its stack, so gotatun's tasks
+/// end on their own cancellation and never see the stack's channels close.
+#[test]
+fn retiring_a_tunnel_makes_gotatun_log_no_error() {
+    with_gotatun_errors(|errors| async move {
+        let peer = WireGuardTestPeer::start().await;
+        let baseline = alive_tasks();
+        let provider = WireGuardTunnelProvider::new(
+            peer.client_spec("proxy-retire-quiet"),
+            Arc::new(NoopTunnelObserver),
+        );
+        provider.prepare().await.expect("the tunnel comes up");
+
+        provider.retire().await;
+        until_tasks_return_to(baseline).await;
+
+        assert_eq!(errors.seen(), Vec::<String>::new());
+    });
+}
+
+/// Dropping a tunnel, from a thread with no runtime as the registry does,
+/// stops its device before its stack.
+#[test]
+fn dropping_a_tunnel_makes_gotatun_log_no_error() {
+    with_gotatun_errors(|errors| async move {
+        let peer = WireGuardTestPeer::start().await;
+        let baseline = alive_tasks();
+        let provider = WireGuardTunnelProvider::new(
+            peer.client_spec("proxy-drop-quiet"),
+            Arc::new(NoopTunnelObserver),
+        );
+        provider.prepare().await.expect("the tunnel comes up");
+
+        std::thread::spawn(move || drop(provider))
+            .join()
+            .expect("dropping off-runtime must not panic");
+        until_tasks_return_to(baseline).await;
+
+        assert_eq!(errors.seen(), Vec::<String>::new());
+    });
+}
+
+/// A bring-up whose handshake never completes stops the device it built
+/// before its stack.
+#[test]
+fn a_failed_handshake_makes_gotatun_log_no_error() {
+    with_gotatun_errors(|errors| async move {
+        let peer = WireGuardTestPeer::start().await;
+        let baseline = alive_tasks();
+        let mut spec = peer.client_spec("proxy-failed-quiet");
+        spec.peer_public_key = public_key_bytes(&public_key_of(&test_key(200)));
+        spec.request_timeout = Duration::from_secs(1);
+        let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver));
+
+        let error = provider
+            .prepare()
+            .await
+            .expect_err("a peer that cannot answer must not connect");
+        assert!(
+            error.to_string().contains("did not complete a handshake"),
+            "{error}"
+        );
+        until_tasks_return_to(baseline).await;
+
+        assert_eq!(errors.seen(), Vec::<String>::new());
+    });
+}

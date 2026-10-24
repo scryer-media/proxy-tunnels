@@ -254,17 +254,28 @@ async fn last_handshake_age(device: &Device<WgTransports>, peer: &PublicKey) -> 
 
 impl Drop for WgTunnel {
     fn drop(&mut self) {
-        // Stop the pump first: that closes the adapter channels, which is how
-        // the device's own tasks learn to stop.
-        self.shutdown.notify_waiters();
-        self.pump.abort();
-        if let Some(watch) = &self.carrier_watch {
-            watch.abort();
-        }
-        // Then the device, from inside its runtime's context whatever thread
-        // this drop runs on — see the field's comment for why that matters.
-        let _entered = self.runtime.enter();
-        drop(self.device.get_mut().take());
+        // The device stops first, on its runtime whatever thread this drop
+        // runs on (see the field's comment for why that matters). Its tasks
+        // then end on their own cancellation; only after that does the pump
+        // stop and close the adapter channels, which those tasks would
+        // otherwise read as the tunnel device disappearing under them.
+        let device = self.device.get_mut().take();
+        let shutdown = Arc::clone(&self.shutdown);
+        let pump = self.pump.abort_handle();
+        let watch = self
+            .carrier_watch
+            .as_ref()
+            .map(tokio::task::JoinHandle::abort_handle);
+        self.runtime.spawn(async move {
+            if let Some(device) = device {
+                device.stop().await;
+            }
+            shutdown.notify_waiters();
+            pump.abort();
+            if let Some(watch) = watch {
+                watch.abort();
+            }
+        });
     }
 }
 
@@ -523,9 +534,9 @@ impl WireGuardTunnelProvider {
         let age = match self.await_handshake(&device, &peer_public_key, &pump).await {
             Ok(age) => age,
             Err(error) => {
+                device.stop().await;
                 shutdown.notify_waiters();
                 pump.abort();
-                device.stop().await;
                 return Err(error);
             }
         };
@@ -774,13 +785,16 @@ impl TunnelProvider for WireGuardTunnelProvider {
     }
     async fn retire(&self) {
         if let Some(tunnel) = self.tunnel.lock().await.take() {
+            // The device before the pump: stopping the pump closes the
+            // channels the device's tasks read, and a task that sees them
+            // close before it is cancelled reports the tunnel device deleted.
+            if let Some(device) = tunnel.device.lock().await.take() {
+                device.stop().await;
+            }
             tunnel.shutdown.notify_waiters();
             tunnel.pump.abort();
             if let Some(watch) = &tunnel.carrier_watch {
                 watch.abort();
-            }
-            if let Some(device) = tunnel.device.lock().await.take() {
-                device.stop().await;
             }
             if let Ok(mut tunnel) = Arc::try_unwrap(tunnel) {
                 let _ = (&mut tunnel.pump).await;
