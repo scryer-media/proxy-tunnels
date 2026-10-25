@@ -178,8 +178,9 @@ pub struct WireGuardHandshake {
     /// server's `[Peer]` section. Reporting it is what turns "it does not
     /// connect" into "you configured the wrong key over there".
     pub our_public_key: String,
-    /// How long the handshake took, measured from the moment the tunnel began
-    /// coming up.
+    /// How long the handshake took: from queuing the packet that makes the
+    /// device initiate to the first check that finds the session established,
+    /// so it reads high by at most one poll interval and never low.
     pub handshake_at: Duration,
 }
 
@@ -254,17 +255,28 @@ async fn last_handshake_age(device: &Device<WgTransports>, peer: &PublicKey) -> 
 
 impl Drop for WgTunnel {
     fn drop(&mut self) {
-        // Stop the pump first: that closes the adapter channels, which is how
-        // the device's own tasks learn to stop.
-        self.shutdown.notify_waiters();
-        self.pump.abort();
-        if let Some(watch) = &self.carrier_watch {
-            watch.abort();
-        }
-        // Then the device, from inside its runtime's context whatever thread
-        // this drop runs on — see the field's comment for why that matters.
-        let _entered = self.runtime.enter();
-        drop(self.device.get_mut().take());
+        // The device stops first, on its runtime whatever thread this drop
+        // runs on (see the field's comment for why that matters). Its tasks
+        // then end on their own cancellation; only after that does the pump
+        // stop and close the adapter channels, which those tasks would
+        // otherwise read as the tunnel device disappearing under them.
+        let device = self.device.get_mut().take();
+        let shutdown = Arc::clone(&self.shutdown);
+        let pump = self.pump.abort_handle();
+        let watch = self
+            .carrier_watch
+            .as_ref()
+            .map(tokio::task::JoinHandle::abort_handle);
+        self.runtime.spawn(async move {
+            if let Some(device) = device {
+                device.stop().await;
+            }
+            shutdown.notify_waiters();
+            pump.abort();
+            if let Some(watch) = watch {
+                watch.abort();
+            }
+        });
     }
 }
 
@@ -428,7 +440,6 @@ impl WireGuardTunnelProvider {
     /// the peer answers.
     async fn bring_up(&self) -> Result<WgTunnel, TunnelError> {
         self.spec.validate()?;
-        let started = std::time::Instant::now();
 
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             TunnelError::Engine("a WireGuard tunnel needs a tokio runtime".to_string())
@@ -518,18 +529,21 @@ impl WireGuardTunnelProvider {
         // would otherwise sit idle until the first dial — and the point of
         // waiting here is that a wrong key or an unreachable endpoint surfaces
         // as a connect error rather than as a mysteriously slow first request.
+        let probed = std::time::Instant::now();
         let _ = probe_channel.try_send(handshake_probe(&self.spec));
 
-        let age = match self.await_handshake(&device, &peer_public_key, &pump).await {
-            Ok(age) => age,
+        let handshake_at = match self
+            .await_handshake(&device, &peer_public_key, &pump, probed)
+            .await
+        {
+            Ok(handshake_at) => handshake_at,
             Err(error) => {
+                device.stop().await;
                 shutdown.notify_waiters();
                 pump.abort();
-                device.stop().await;
                 return Err(error);
             }
         };
-        let handshake_at = started.elapsed().saturating_sub(age);
         let carrier_watch = carrier.as_ref().map(|carrier| {
             let carrier = Arc::clone(carrier);
             let pump = pump.abort_handle();
@@ -569,22 +583,28 @@ impl WireGuardTunnelProvider {
         }
     }
 
-    /// Wait for the peer to answer, or say that it did not.
+    /// Wait for the peer to answer, and say how long after `probed` it had,
+    /// or say that it did not.
+    ///
+    /// The time is this function's own measurement. gotatun's handshake age
+    /// advances only on its timer tick, a quarter of a second, so it cannot
+    /// tell a fast handshake from an instant one.
     async fn await_handshake(
         &self,
         device: &Device<WgTransports>,
         peer_public_key: &PublicKey,
         pump: &tokio::task::JoinHandle<()>,
+        probed: std::time::Instant,
     ) -> Result<Duration, TunnelError> {
         let waited = tokio::time::timeout(self.spec.request_timeout, async {
             loop {
-                if let Some(age) = last_handshake_age(device, peer_public_key).await {
-                    return age;
+                if last_handshake_age(device, peer_public_key).await.is_some() {
+                    return Some(probed.elapsed());
                 }
                 if pump.is_finished() {
                     // The stack died under us; there will never be a
                     // handshake, so do not sit out the whole budget.
-                    return Duration::MAX;
+                    return None;
                 }
                 tokio::time::sleep(HANDSHAKE_POLL_INTERVAL).await;
             }
@@ -592,8 +612,8 @@ impl WireGuardTunnelProvider {
         .await;
 
         match waited {
-            Ok(age) if age != Duration::MAX => Ok(age),
-            Ok(_) => Err(TunnelError::WireGuardConnect {
+            Ok(Some(handshake_at)) => Ok(handshake_at),
+            Ok(None) => Err(TunnelError::WireGuardConnect {
                 host: self.spec.endpoint_host.clone(),
                 port: self.spec.endpoint_port,
                 detail: "the tunnel's network stack stopped before the handshake completed"
@@ -774,13 +794,16 @@ impl TunnelProvider for WireGuardTunnelProvider {
     }
     async fn retire(&self) {
         if let Some(tunnel) = self.tunnel.lock().await.take() {
+            // The device before the pump: stopping the pump closes the
+            // channels the device's tasks read, and a task that sees them
+            // close before it is cancelled reports the tunnel device deleted.
+            if let Some(device) = tunnel.device.lock().await.take() {
+                device.stop().await;
+            }
             tunnel.shutdown.notify_waiters();
             tunnel.pump.abort();
             if let Some(watch) = &tunnel.carrier_watch {
                 watch.abort();
-            }
-            if let Some(device) = tunnel.device.lock().await.take() {
-                device.stop().await;
             }
             if let Ok(mut tunnel) = Arc::try_unwrap(tunnel) {
                 let _ = (&mut tunnel.pump).await;
