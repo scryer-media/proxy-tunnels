@@ -594,7 +594,7 @@ impl WgStack {
     }
 
     /// Whether a listener on this stack already holds `port`.
-    fn listening_on(&self, port: u16) -> bool {
+    pub(crate) fn listening_on(&self, port: u16) -> bool {
         self.shared.peek_stack(|stack| {
             stack.sockets.iter().any(|(_, socket)| match socket {
                 smoltcp::socket::Socket::Tcp(socket) => {

@@ -360,6 +360,17 @@ impl WireGuardTunnelProvider {
         self.tunnel().await?.stack.listen(port, backlog)
     }
 
+    /// Whether the tunnel that is current now is alive and a listener inside
+    /// it holds `port`. Never brings a tunnel up: with no live tunnel, nothing
+    /// listens.
+    pub async fn listens_on(&self, port: u16) -> bool {
+        let guard = self.tunnel.lock().await;
+        match guard.as_ref() {
+            Some(tunnel) => tunnel.is_alive().await && tunnel.stack.listening_on(port),
+            None => false,
+        }
+    }
+
     /// Resolve a destination using only this tunnel's configured DNS servers.
     pub async fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, TunnelError> {
         self.tunnel()

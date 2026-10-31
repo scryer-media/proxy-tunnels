@@ -582,6 +582,33 @@ async fn a_listener_takes_the_port_it_is_asked_for_and_refuses_a_second_one_ther
 }
 
 #[tokio::test]
+async fn the_provider_says_whether_its_current_tunnel_listens_on_a_port() {
+    let peer = WireGuardTestPeer::start().await;
+    let provider = WireGuardTunnelProvider::new(
+        peer.client_spec("proxy-listens-on"),
+        Arc::new(NoopTunnelObserver),
+    );
+
+    assert!(!provider.listens_on(6882).await, "no tunnel, no listener");
+    let listener = provider.listen(6882, 2).await.expect("listen");
+    assert!(provider.listens_on(6882).await);
+    assert!(!provider.listens_on(6883).await);
+    drop(listener);
+    assert!(
+        !provider.listens_on(6882).await,
+        "a dropped listener frees its port"
+    );
+
+    let _listener = provider.listen(6882, 2).await.expect("listen");
+    provider.retire().await;
+    assert!(
+        !provider.listens_on(6882).await,
+        "a retired tunnel's listener is not the current tunnel's"
+    );
+    provider.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_listener_whose_tunnel_stopped_fails_its_accept() {
     let peer = WireGuardTestPeer::start().await;
     let provider = WireGuardTunnelProvider::new(
