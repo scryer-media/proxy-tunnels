@@ -56,9 +56,7 @@ use crate::error::{SlotFreed, TunnelError};
 use crate::wireguard::adapter::{InboundRx, OutboundTx};
 use crate::wireguard::phy::WgPhy;
 use crate::wireguard::spec::IpCidr;
-#[cfg(any(test, feature = "test-support"))]
-use crate::wireguard::tcp::WgTcpListener;
-use crate::wireguard::tcp::WgTcpStream;
+use crate::wireguard::tcp::{WgTcpListener, WgTcpStream};
 use crate::wireguard::udp::WgUdpSocket;
 
 /// How many sockets one tunnel may have open at once.
@@ -171,7 +169,7 @@ impl StackShared {
     }
 
     /// Claim one of the [`MAX_SOCKETS`] slots.
-    fn claim_socket(&self) -> Result<SocketSlot<'_>, TunnelError> {
+    pub(crate) fn claim_socket(&self) -> Result<SocketSlot<'_>, TunnelError> {
         if self.open_sockets.open.load(Ordering::SeqCst) >= MAX_SOCKETS {
             self.with_stack(|inner| inner.reclaim_finished(inner.now(), true));
         }
@@ -252,13 +250,13 @@ impl Drop for StopOnExit {
 }
 
 /// One claimed socket slot, released if the socket is never created.
-struct SocketSlot<'a> {
+pub(crate) struct SocketSlot<'a> {
     shared: &'a StackShared,
 }
 
 impl SocketSlot<'_> {
     /// The socket now exists and owns the slot until the stack reclaims it.
-    fn keep(self) {
+    pub(crate) fn keep(self) {
         std::mem::forget(self);
     }
 }
@@ -564,13 +562,63 @@ impl WgStack {
         Ok(stream)
     }
 
-    /// Accept TCP connections on `port` inside the tunnel.
+    /// Accept TCP connections on `port` inside the tunnel, on every tunnel
+    /// address.
     ///
-    /// The engine never listens in production — a tunnel is dialled *out* of —
-    /// but the test peer is a WireGuard server, and a server listens.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn listen(&self, port: u16, backlog: usize) -> Result<WgTcpListener, TunnelError> {
-        WgTcpListener::bind(Arc::clone(&self.shared), port, backlog)
+    /// `0` picks a free port in the ephemeral range. smoltcp lets any number
+    /// of sockets listen on one port (that is how the backlog works), so a
+    /// port another listener on this stack already holds is refused here
+    /// rather than silently shared.
+    pub fn listen(&self, port: u16, backlog: usize) -> Result<WgTcpListener, TunnelError> {
+        let port = if port == 0 {
+            self.free_listen_port()?
+        } else if self.listening_on(port) {
+            return Err(TunnelError::Engine(format!(
+                "the tunnel already listens on port {port}"
+            )));
+        } else {
+            port
+        };
+        let address = self
+            .shared
+            .config()
+            .addresses
+            .first()
+            .map(|cidr| cidr.address)
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        WgTcpListener::bind(
+            Arc::clone(&self.shared),
+            SocketAddr::new(address, port),
+            backlog,
+        )
+    }
+
+    /// Whether a listener on this stack already holds `port`.
+    fn listening_on(&self, port: u16) -> bool {
+        self.shared.peek_stack(|stack| {
+            stack.sockets.iter().any(|(_, socket)| match socket {
+                smoltcp::socket::Socket::Tcp(socket) => {
+                    socket.is_listening() && socket.listen_endpoint().port == port
+                }
+                _ => false,
+            })
+        })
+    }
+
+    /// A port in the ephemeral range no listener on this stack holds, starting
+    /// from a random one.
+    fn free_listen_port(&self) -> Result<u16, TunnelError> {
+        let span = u64::from(EPHEMERAL_LAST - EPHEMERAL_FIRST) + 1;
+        let start = std::hash::BuildHasher::hash_one(
+            &std::collections::hash_map::RandomState::new(),
+            std::time::Instant::now(),
+        ) % span;
+        (0..span)
+            .map(|step| EPHEMERAL_FIRST + ((start + step) % span) as u16)
+            .find(|port| !self.listening_on(*port))
+            .ok_or_else(|| {
+                TunnelError::Engine("the tunnel has no free port left to listen on".to_string())
+            })
     }
 
     /// Bind a UDP socket inside the tunnel. `0` picks an ephemeral port.

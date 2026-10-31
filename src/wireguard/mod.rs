@@ -90,7 +90,7 @@ pub use spec::{
     validate_wireguard_keys,
 };
 pub use stack::{MAX_SOCKETS, WgStack};
-pub use tcp::WgTcpStream;
+pub use tcp::{WgTcpListener, WgTcpStream};
 pub use udp::WgUdpSocket;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -346,6 +346,18 @@ impl WireGuardTunnelProvider {
     /// tunnel, which only ever sees this tunnel's encrypted datagrams.
     pub fn with_inner_wireguard(self, outer: Arc<WireGuardTunnelProvider>) -> Self {
         self.with_datagram_transport(outer)
+    }
+
+    /// Accept TCP connections on `port` inside the tunnel, bringing the tunnel
+    /// up if it is not. `0` picks a free ephemeral port; the listener's
+    /// [`WgTcpListener::local_addr`] says which.
+    ///
+    /// The listener belongs to the tunnel that is current now. When that
+    /// tunnel is replaced (a silent peer, a retire) its stack stops and
+    /// [`WgTcpListener::accept`] fails, so a caller that wants to keep
+    /// listening listens again, on the new tunnel.
+    pub async fn listen(&self, port: u16, backlog: usize) -> Result<WgTcpListener, TunnelError> {
+        self.tunnel().await?.stack.listen(port, backlog)
     }
 
     /// Resolve a destination using only this tunnel's configured DNS servers.

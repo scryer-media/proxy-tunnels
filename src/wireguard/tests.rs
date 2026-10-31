@@ -521,6 +521,84 @@ async fn a_dropped_stream_does_not_leak_its_socket_slot() {
     }
 }
 
+#[tokio::test]
+async fn a_listener_inside_the_tunnel_accepts_a_peer_and_carries_bytes_both_ways() {
+    let peer = WireGuardTestPeer::start().await;
+    let provider = WireGuardTunnelProvider::new(
+        peer.client_spec("proxy-listen"),
+        Arc::new(NoopTunnelObserver),
+    );
+
+    let mut listener = provider.listen(0, 4).await.expect("listen");
+    let local = listener.local_addr();
+    assert_eq!(
+        local.ip(),
+        IpAddr::V4(crate::wireguard::TEST_CLIENT_ADDRESS),
+        "the listener reports the tunnel's own address"
+    );
+    assert!(
+        local.port() >= 49152,
+        "port 0 picks an ephemeral port: {local}"
+    );
+
+    let (accepted, dialed) = tokio::join!(listener.accept(), peer.dial_client(local.port()));
+    let mut accepted = accepted.expect("accept");
+    let mut dialed = dialed.expect("the peer dials the client inside the tunnel");
+    assert_eq!(accepted.peer_addr().ip(), peer.tunnel_address());
+
+    dialed.write_all(b"from the far side").await.expect("write");
+    let mut inbound = [0u8; 17];
+    accepted.read_exact(&mut inbound).await.expect("read");
+    assert_eq!(&inbound, b"from the far side");
+
+    accepted.write_all(b"answered").await.expect("write back");
+    let mut answer = [0u8; 8];
+    dialed.read_exact(&mut answer).await.expect("read back");
+    assert_eq!(&answer, b"answered");
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_listener_takes_the_port_it_is_asked_for_and_refuses_a_second_one_there() {
+    let peer = WireGuardTestPeer::start().await;
+    let provider = WireGuardTunnelProvider::new(
+        peer.client_spec("proxy-listen-port"),
+        Arc::new(NoopTunnelObserver),
+    );
+
+    let listener = provider.listen(6881, 2).await.expect("listen");
+    assert_eq!(listener.local_addr().port(), 6881);
+    assert!(
+        provider.listen(6881, 2).await.is_err(),
+        "a port one listener holds is not shared with another"
+    );
+    drop(listener);
+    let again = provider
+        .listen(6881, 2)
+        .await
+        .expect("a dropped listener frees its port");
+    assert_eq!(again.local_addr().port(), 6881);
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_listener_whose_tunnel_stopped_fails_its_accept() {
+    let peer = WireGuardTestPeer::start().await;
+    let provider = WireGuardTunnelProvider::new(
+        peer.client_spec("proxy-listen-stop"),
+        Arc::new(NoopTunnelObserver),
+    );
+
+    let mut listener = provider.listen(0, 2).await.expect("listen");
+    let pending = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+    provider.retire().await;
+    let accepted = pending.await.expect("the accept task ends");
+    assert!(
+        accepted.is_err(),
+        "an accept on a stopped tunnel fails instead of waiting forever"
+    );
+}
+
 fn public_key_bytes(base64: &str) -> [u8; 32] {
     parse_key(base64).expect("a valid key")
 }

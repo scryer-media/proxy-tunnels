@@ -24,10 +24,12 @@ use ipnetwork::IpNetwork;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
+use crate::error::TunnelError;
 use crate::wireguard::WireGuardSpec;
 use crate::wireguard::adapter::{DeviceToStack, StackToDevice, ip_channels};
 use crate::wireguard::spec::{DEFAULT_WIREGUARD_KEEPALIVE, DEFAULT_WIREGUARD_MTU, IpCidr};
 use crate::wireguard::stack::{StackConfig, WgStack};
+use crate::wireguard::tcp::WgTcpStream;
 use crate::wireguard::transport::{TunnelSocket, TunnelUdpFactory};
 
 /// The peer's tunnel address — the "server" side of the point-to-point link.
@@ -347,6 +349,19 @@ impl WireGuardTestPeer {
             .iter()
             .cloned()
             .collect()
+    }
+
+    /// Dial the client's tunnel address on `port` from the peer's side, the
+    /// way a peer on the far side's network reaches a port the client listens
+    /// on inside the tunnel. The client must have shaken hands first: until
+    /// then the peer does not know where to send.
+    pub async fn dial_client(&self, port: u16) -> Result<WgTcpStream, TunnelError> {
+        self._stack
+            .connect(
+                SocketAddr::new(IpAddr::V4(TEST_CLIENT_ADDRESS), port),
+                Duration::from_secs(10),
+            )
+            .await
     }
 
     /// Request lines the peer's TCP service received.
