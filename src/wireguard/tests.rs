@@ -214,6 +214,10 @@ async fn a_dial_by_address_carries_bytes_end_to_end() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "proves the host resolver cannot answer the tunnel's name"
+)]
 async fn a_dial_by_name_resolves_through_the_tunnel() {
     let peer = WireGuardTestPeer::start().await;
     let provider =

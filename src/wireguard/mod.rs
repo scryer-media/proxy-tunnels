@@ -697,6 +697,10 @@ impl WireGuardTunnelProvider {
                     detail: "the endpoint name resolved to no addresses".to_string(),
                 });
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the WireGuard endpoint name, looked up on the host until the embedder injects a resolver"
+        )]
         let resolved = tokio::time::timeout(
             self.spec.request_timeout,
             tokio::net::lookup_host((host.as_str(), port)),

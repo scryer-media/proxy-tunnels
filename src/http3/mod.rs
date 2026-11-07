@@ -199,6 +199,10 @@ impl Http3TunnelProvider {
         }
         let host = self.spec.host.trim_start_matches('[').trim_end_matches(']');
         // This is the only host resolver call. CONNECT destinations never enter it.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the HTTP/3 proxy endpoint name, looked up on the host until the embedder injects a resolver"
+        )]
         let addresses: Vec<SocketAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
             vec![SocketAddr::new(ip, self.spec.port)]
         } else {
