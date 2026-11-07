@@ -174,6 +174,14 @@ pub struct WireGuardSpec {
     pub persistent_keepalive: Option<u16>,
     /// Budget for bringing the tunnel up, and for a single dial through it.
     pub request_timeout: Duration,
+    /// How many sockets the tunnel may have open at once: every TCP
+    /// connection, dialled or accepted, and every UDP socket. Each TCP socket
+    /// holds 128 KiB of buffers, so 1024 sockets is 128 MiB at worst for one
+    /// tunnel. [`crate::wireguard::DEFAULT_MAX_SOCKETS`] unless the caller
+    /// sizes it; the tunnel holds it between
+    /// [`crate::wireguard::MIN_MAX_SOCKETS`] and
+    /// [`crate::wireguard::MAX_MAX_SOCKETS`] when it comes up.
+    pub max_sockets: usize,
 }
 
 impl fmt::Debug for WireGuardSpec {
@@ -200,6 +208,7 @@ impl fmt::Debug for WireGuardSpec {
             .field("mtu", &self.mtu)
             .field("persistent_keepalive", &self.persistent_keepalive)
             .field("request_timeout", &self.request_timeout)
+            .field("max_sockets", &self.max_sockets)
             .finish()
     }
 }
@@ -417,6 +426,7 @@ mod tests {
             mtu: DEFAULT_WIREGUARD_MTU,
             persistent_keepalive: Some(DEFAULT_WIREGUARD_KEEPALIVE),
             request_timeout: Duration::from_secs(30),
+            max_sockets: crate::wireguard::DEFAULT_MAX_SOCKETS,
         }
     }
 

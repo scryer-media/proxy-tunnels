@@ -212,6 +212,7 @@ impl WireGuardTestPeer {
                 mtu: DEFAULT_WIREGUARD_MTU,
                 proxy_config_id: "wireguard-test-peer".to_string(),
                 download_tuning,
+                max_sockets: super::DEFAULT_MAX_SOCKETS,
             },
             inbound,
             outbound,
@@ -385,6 +386,7 @@ impl WireGuardTestPeer {
             mtu: DEFAULT_WIREGUARD_MTU,
             persistent_keepalive: Some(DEFAULT_WIREGUARD_KEEPALIVE),
             request_timeout: Duration::from_secs(10),
+            max_sockets: super::DEFAULT_MAX_SOCKETS,
         }
     }
 }
@@ -444,7 +446,7 @@ async fn serve_http(
     let mut connections = tokio::task::JoinSet::new();
     loop {
         while connections.try_join_next().is_some() {}
-        if connections.len() >= super::MAX_SOCKETS {
+        if connections.len() >= stack.max_sockets() {
             connections.join_next().await;
             continue;
         }

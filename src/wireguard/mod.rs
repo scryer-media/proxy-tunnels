@@ -89,7 +89,7 @@ pub use spec::{
     MIN_WIREGUARD_MTU, WIREGUARD_KEY_MESSAGE, WireGuardSpec, parse_key, public_key_of,
     validate_wireguard_keys,
 };
-pub use stack::{MAX_SOCKETS, WgStack};
+pub use stack::{DEFAULT_MAX_SOCKETS, MAX_MAX_SOCKETS, MIN_MAX_SOCKETS, WgStack, socket_cap};
 pub use tcp::{WgTcpListener, WgTcpStream};
 pub use udp::WgUdpSocket;
 
@@ -505,6 +505,7 @@ impl WireGuardTunnelProvider {
                 mtu,
                 proxy_config_id: self.spec.proxy_config_id.clone(),
                 download_tuning: self.download_tuning,
+                max_sockets: stack::socket_cap(self.spec.max_sockets),
             },
             inbound,
             outbound,
@@ -1010,6 +1011,7 @@ mod probe_tests {
             mtu: DEFAULT_WIREGUARD_MTU,
             persistent_keepalive: None,
             request_timeout: Duration::from_secs(5),
+            max_sockets: DEFAULT_MAX_SOCKETS,
         }
     }
 

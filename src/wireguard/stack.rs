@@ -33,7 +33,7 @@
 //! every stack began at the same port its first connection would reuse the
 //! exact four-tuple the previous stack's first connection left in TIME-WAIT
 //! or LAST-ACK on the far side, which answers a fresh SYN on that tuple with
-//! silence or a reset. With a cap of [`MAX_SOCKETS`] concurrent sockets
+//! silence or a reset. With a cap of at most [`MAX_MAX_SOCKETS`] concurrent sockets
 //! against a range of 16384, a port is otherwise reused only after every
 //! other one has been, which is longer than any TIME-WAIT this stack can
 //! produce.
@@ -59,13 +59,27 @@ use crate::wireguard::spec::IpCidr;
 use crate::wireguard::tcp::{WgTcpListener, WgTcpStream};
 use crate::wireguard::udp::WgUdpSocket;
 
-/// How many sockets one tunnel may have open at once.
+/// How many sockets one tunnel may have open at once when its spec asks for
+/// no other number.
 ///
 /// Each TCP socket costs 128 KiB of buffers, so the cap bounds a tunnel's
-/// memory. A dial past it fails with [`TunnelError::AtCapacity`], which says
-/// the tunnel is full rather than broken, so a caller can wait or go
-/// elsewhere.
-pub const MAX_SOCKETS: usize = 256;
+/// memory: 256 sockets is 32 MiB at worst, 1024 is 128 MiB. A dial past it
+/// fails with [`TunnelError::AtCapacity`], which says the tunnel is full
+/// rather than broken, so a caller can wait or go elsewhere.
+pub const DEFAULT_MAX_SOCKETS: usize = 256;
+
+/// The fewest sockets a tunnel may be capped at.
+pub const MIN_MAX_SOCKETS: usize = 16;
+
+/// The most sockets a tunnel may be capped at: 512 MiB of TCP buffers at
+/// worst.
+pub const MAX_MAX_SOCKETS: usize = 4096;
+
+/// The cap a tunnel asking for `asked` sockets runs with: `asked`, held
+/// between [`MIN_MAX_SOCKETS`] and [`MAX_MAX_SOCKETS`].
+pub fn socket_cap(asked: usize) -> usize {
+    asked.clamp(MIN_MAX_SOCKETS, MAX_MAX_SOCKETS)
+}
 
 /// Send and receive buffer per TCP socket, each way.
 ///
@@ -109,6 +123,8 @@ pub(crate) struct StackConfig {
     /// For log lines only.
     pub(crate) proxy_config_id: String,
     pub(crate) download_tuning: bool,
+    /// How many sockets may be open at once, already held to its bounds.
+    pub(crate) max_sockets: usize,
 }
 
 impl StackConfig {
@@ -168,20 +184,21 @@ impl StackShared {
         &self.config
     }
 
-    /// Claim one of the [`MAX_SOCKETS`] slots.
+    /// Claim one of the stack's socket slots.
     pub(crate) fn claim_socket(&self) -> Result<SocketSlot<'_>, TunnelError> {
-        if self.open_sockets.open.load(Ordering::SeqCst) >= MAX_SOCKETS {
+        let cap = self.config.max_sockets;
+        if self.open_sockets.open.load(Ordering::SeqCst) >= cap {
             self.with_stack(|inner| inner.reclaim_finished(inner.now(), true));
         }
         let claimed =
             self.open_sockets
                 .open
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
-                    (open < MAX_SOCKETS).then_some(open + 1)
+                    (open < cap).then_some(open + 1)
                 });
         if claimed.is_err() {
             return Err(TunnelError::AtCapacity {
-                open: MAX_SOCKETS,
+                open: cap,
                 freed: self.open_sockets.freed.clone(),
             });
         }
@@ -661,6 +678,11 @@ impl WgStack {
         self.shared.config().mtu
     }
 
+    /// How many sockets this stack lets be open at once.
+    pub fn max_sockets(&self) -> usize {
+        self.shared.config().max_sockets
+    }
+
     /// Whether the stack has stopped, so nothing on it will move again.
     pub fn is_stopped(&self) -> bool {
         self.shared.is_stopped()
@@ -927,6 +949,7 @@ mod resource_tests {
                 mtu: 1280,
                 proxy_config_id: "resource-test".into(),
                 download_tuning: false,
+                max_sockets: DEFAULT_MAX_SOCKETS,
             },
             inbound,
             outbound,
@@ -950,7 +973,7 @@ mod resource_tests {
     async fn closing_sockets_retain_capacity_until_reclaimed() {
         let stack = isolated_stack();
         let shared = &stack.shared;
-        for _ in 0..MAX_SOCKETS {
+        for _ in 0..DEFAULT_MAX_SOCKETS {
             let slot = shared.claim_socket().unwrap();
             shared.with_stack(|inner| {
                 let handle = inner.add_tcp_socket();
@@ -971,18 +994,18 @@ mod resource_tests {
         assert!(matches!(
             shared.claim_socket(),
             Err(TunnelError::AtCapacity {
-                open: MAX_SOCKETS,
+                open: DEFAULT_MAX_SOCKETS,
                 ..
             })
         ));
         shared.peek_stack(|inner| {
             assert_eq!(
                 inner.sockets.iter().count(),
-                MAX_SOCKETS + 1,
+                DEFAULT_MAX_SOCKETS + 1,
                 "plus the fixed resolver"
             );
             inner.reclaim(inner.now());
-            assert_eq!(inner.closing.len(), MAX_SOCKETS);
+            assert_eq!(inner.closing.len(), DEFAULT_MAX_SOCKETS);
             inner.reclaim(inner.now() + smoltcp::time::Duration::from_secs(11));
             assert!(inner.closing.is_empty());
             assert_eq!(inner.sockets.iter().count(), 1);
@@ -995,7 +1018,7 @@ mod resource_tests {
     async fn a_full_tunnel_wakes_its_waiters_when_a_slot_frees() {
         let stack = isolated_stack();
         let shared = &stack.shared;
-        let mut slots: Vec<_> = (0..MAX_SOCKETS)
+        let mut slots: Vec<_> = (0..DEFAULT_MAX_SOCKETS)
             .map(|_| shared.claim_socket().unwrap())
             .collect();
         let Err(TunnelError::AtCapacity { freed, .. }) = shared.claim_socket() else {
@@ -1017,7 +1040,7 @@ mod resource_tests {
     #[tokio::test]
     async fn cancelling_pending_tcp_connects_removes_handles_and_slots() {
         let stack = isolated_stack();
-        for _ in 0..(MAX_SOCKETS + 8) {
+        for _ in 0..(DEFAULT_MAX_SOCKETS + 8) {
             let mut dial =
                 Box::pin(stack.connect("10.0.0.2:80".parse().unwrap(), Duration::from_secs(30)));
             poll_pending(dial.as_mut()).await;
@@ -1075,5 +1098,105 @@ mod resource_tests {
         assert!(error.to_string().contains("timed out waiting"));
         drop(_held);
         assert_eq!(stack.shared.dns_slots.available_permits(), DNS_QUERY_SLOTS);
+    }
+
+    fn stack_with(
+        address: &str,
+        max_sockets: usize,
+        inbound: InboundRx,
+        outbound: OutboundTx,
+    ) -> (WgStack, tokio::task::JoinHandle<()>) {
+        WgStack::start(
+            StackConfig {
+                addresses: vec![address.parse().unwrap()],
+                dns_servers: Vec::new(),
+                mtu: 1280,
+                proxy_config_id: format!("cap-{address}"),
+                download_tuning: false,
+                max_sockets,
+            },
+            inbound,
+            outbound,
+            Arc::new(Notify::new()),
+            &tokio::runtime::Handle::current(),
+        )
+    }
+
+    #[test]
+    fn a_tunnels_cap_is_held_to_its_bounds() {
+        assert_eq!(socket_cap(0), MIN_MAX_SOCKETS);
+        assert_eq!(socket_cap(512), 512);
+        assert_eq!(socket_cap(usize::MAX), MAX_MAX_SOCKETS);
+    }
+
+    #[tokio::test]
+    async fn a_stack_is_full_at_its_own_cap() {
+        let (_inbound_tx, inbound) = tokio::sync::mpsc::channel(1);
+        let (outbound, _outbound_rx) = tokio::sync::mpsc::channel(1);
+        let (stack, pump) = stack_with("10.0.0.1/24", MIN_MAX_SOCKETS, inbound, outbound);
+        pump.abort();
+        let slots: Vec<_> = (0..MIN_MAX_SOCKETS)
+            .map(|_| stack.shared.claim_socket().unwrap())
+            .collect();
+        assert!(matches!(
+            stack.shared.claim_socket(),
+            Err(TunnelError::AtCapacity {
+                open: MIN_MAX_SOCKETS,
+                ..
+            })
+        ));
+        drop(slots);
+        assert!(stack.shared.claim_socket().is_ok());
+    }
+
+    /// What one poll of a stack holding `count` idle established TCP
+    /// connections costs, on this machine. Two stacks are wired back to back,
+    /// one dials the other `count` times, and once every connection is up the
+    /// dialling stack is polled under its lock, the pump held off.
+    async fn poll_cost(count: usize) -> Duration {
+        const PASSES: u32 = 2000;
+        let (a_to_b, b_inbound) = tokio::sync::mpsc::channel(PACKET_QUEUE);
+        let (b_to_a, a_inbound) = tokio::sync::mpsc::channel(PACKET_QUEUE);
+        let (dialler, _a_pump) = stack_with("10.9.0.1/24", MAX_MAX_SOCKETS, a_inbound, a_to_b);
+        let (answerer, _b_pump) = stack_with("10.9.0.2/24", MAX_MAX_SOCKETS, b_inbound, b_to_a);
+        let mut listener = answerer.listen(80, count.max(1)).unwrap();
+        let accepted = tokio::spawn(async move {
+            let mut streams = Vec::with_capacity(count);
+            while streams.len() < count {
+                streams.push(listener.accept().await.unwrap());
+            }
+            (listener, streams)
+        });
+        let remote: SocketAddr = "10.9.0.2:80".parse().unwrap();
+        let mut dials = tokio::task::JoinSet::new();
+        for _ in 0..count {
+            let dialler = dialler.clone();
+            dials.spawn(async move { dialler.connect(remote, Duration::from_secs(600)).await });
+        }
+        let mut streams = Vec::with_capacity(count);
+        while let Some(dialled) = dials.join_next().await {
+            streams.push(dialled.unwrap().unwrap());
+        }
+        let _answered = accepted.await.unwrap();
+        dialler.shared.peek_stack(|inner| {
+            inner.poll();
+            let started = std::time::Instant::now();
+            for _ in 0..PASSES {
+                inner.poll();
+            }
+            started.elapsed() / PASSES
+        })
+    }
+
+    const PACKET_QUEUE: usize = 8192;
+
+    // Measures, asserts nothing: run it by name with `--ignored`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "a measurement, not a check"]
+    async fn poll_cost_per_pass_with_idle_sockets() {
+        for count in [0, 256, 1024] {
+            let cost = poll_cost(count).await;
+            println!("{count} idle sockets: {} ns per poll", cost.as_nanos());
+        }
     }
 }

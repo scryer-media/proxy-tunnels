@@ -511,7 +511,7 @@ async fn a_dropped_stream_does_not_leak_its_socket_slot() {
 
     // More dials than the stack has socket slots, one at a time. If a closed
     // socket did not give its slot back this would fail well before the end.
-    for _ in 0..(crate::wireguard::MAX_SOCKETS + 8) {
+    for _ in 0..(crate::wireguard::DEFAULT_MAX_SOCKETS + 8) {
         let mut stream = provider
             .dial(&TEST_PEER_ADDRESS.to_string(), peer.http_port())
             .await
