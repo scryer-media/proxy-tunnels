@@ -38,6 +38,17 @@ impl EndpointTransport for SystemEndpointTransport {
     }
 }
 
+/// Resolves the name of a tunnel's own endpoint: the hop that carries the
+/// tunnel, so nothing inside the tunnel can answer it.
+///
+/// The embedding application decides who is asked. A provider given no
+/// resolver dials only an endpoint written as an address, and an endpoint
+/// written as an address is never handed to a resolver.
+#[async_trait::async_trait]
+pub trait EndpointResolver: Send + Sync {
+    async fn resolve(&self, host: &str) -> io::Result<Vec<std::net::IpAddr>>;
+}
+
 /// Called for each new UDP session, including reconnects. Construction performs no I/O.
 pub trait UdpSocketFactory: Send + Sync {
     fn bind(&self, peer: SocketAddr) -> io::Result<UdpSocket>;
@@ -116,5 +127,36 @@ impl UdpSocketFactory for RecordingUdpFactory {
         socket.set_nonblocking(true)?;
         self.0.lock().unwrap().push(socket.local_addr()?);
         Ok(socket)
+    }
+}
+
+/// Answers every endpoint name with fixed addresses and keeps each name it
+/// was asked.
+#[cfg(test)]
+pub(crate) struct RecordingResolver {
+    pub answer: Vec<std::net::IpAddr>,
+    pub asked: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl RecordingResolver {
+    pub fn answering(answer: std::net::IpAddr) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            answer: vec![answer],
+            asked: Default::default(),
+        })
+    }
+
+    pub fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl EndpointResolver for RecordingResolver {
+    async fn resolve(&self, host: &str) -> io::Result<Vec<std::net::IpAddr>> {
+        self.asked.lock().unwrap().push(host.to_string());
+        Ok(self.answer.clone())
     }
 }

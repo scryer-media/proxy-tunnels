@@ -214,6 +214,63 @@ async fn a_dial_by_address_carries_bytes_end_to_end() {
 }
 
 #[tokio::test]
+async fn an_endpoint_name_is_resolved_by_the_injected_resolver() {
+    let peer = WireGuardTestPeer::start().await;
+    let mut spec = peer.client_spec("proxy-endpoint-name");
+    let address = spec.endpoint_host.parse::<IpAddr>().expect("peer address");
+    spec.endpoint_host = "vpn.endpoint.test".to_string();
+    let resolver = crate::endpoint::RecordingResolver::answering(address);
+    let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver))
+        .with_endpoint_resolver(resolver.clone());
+
+    let mut stream = provider
+        .dial(&TEST_PEER_ADDRESS.to_string(), peer.http_port())
+        .await
+        .expect("dial");
+    let response = http_get_through(&mut stream, "origin.tunnel.test").await;
+
+    assert!(response.contains("200 OK"), "{response}");
+    assert_eq!(resolver.asked(), vec!["vpn.endpoint.test".to_string()]);
+}
+
+#[tokio::test]
+async fn an_endpoint_written_as_an_address_is_never_resolved() {
+    let peer = WireGuardTestPeer::start().await;
+    let resolver = crate::endpoint::RecordingResolver::answering(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let provider = WireGuardTunnelProvider::new(
+        peer.client_spec("proxy-endpoint-address"),
+        Arc::new(NoopTunnelObserver),
+    )
+    .with_endpoint_resolver(resolver.clone());
+
+    provider
+        .dial(&TEST_PEER_ADDRESS.to_string(), peer.http_port())
+        .await
+        .expect("dial");
+
+    assert!(resolver.asked().is_empty());
+}
+
+#[tokio::test]
+async fn an_endpoint_name_with_no_resolver_is_not_dialled() {
+    let peer = WireGuardTestPeer::start().await;
+    let mut spec = peer.client_spec("proxy-endpoint-unresolved");
+    spec.endpoint_host = "vpn.endpoint.test".to_string();
+    let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver));
+
+    let error = provider
+        .dial(&TEST_PEER_ADDRESS.to_string(), peer.http_port())
+        .await
+        .err()
+        .expect("a name with no resolver must not dial");
+
+    assert!(
+        matches!(error, TunnelError::WireGuardConnect { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 #[expect(
     clippy::disallowed_methods,
     reason = "proves the host resolver cannot answer the tunnel's name"

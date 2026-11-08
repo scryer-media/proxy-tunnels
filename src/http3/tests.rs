@@ -802,3 +802,41 @@ async fn unreachable_udp_proxy_never_uses_tcp_or_direct_destination() {
     );
     provider.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_proxy_named_by_host_is_resolved_by_the_injected_resolver() {
+    let fixture = Fixture::start(Mode::Echo).await;
+    let mut spec = fixture.spec();
+    spec.host = "localhost".into();
+    let resolver = crate::endpoint::RecordingResolver::answering(IpAddr::from([127, 0, 0, 1]));
+    let provider = Http3TunnelProvider::with_root_certificates(spec, roots())
+        .unwrap()
+        .with_endpoint_resolver(resolver.clone());
+    echo(&provider, "destination.invalid").await;
+    assert_eq!(resolver.asked(), vec!["localhost".to_string()]);
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_proxy_written_as_an_address_is_never_resolved() {
+    let fixture = Fixture::start(Mode::Echo).await;
+    let resolver = crate::endpoint::RecordingResolver::answering(IpAddr::from([127, 0, 0, 1]));
+    let provider = fixture.provider().with_endpoint_resolver(resolver.clone());
+    echo(&provider, "destination.invalid").await;
+    assert!(resolver.asked().is_empty());
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_proxy_named_by_host_with_no_resolver_is_not_dialled() {
+    let fixture = Fixture::start(Mode::Echo).await;
+    let mut spec = fixture.spec();
+    spec.host = "localhost".into();
+    let provider = Http3TunnelProvider::with_root_certificates(spec, roots()).unwrap();
+    assert!(matches!(
+        provider.dial("destination.invalid", 563).await,
+        Err(TunnelError::Http3Connect { .. })
+    ));
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), 0);
+    provider.shutdown().await;
+}

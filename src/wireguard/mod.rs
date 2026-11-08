@@ -288,6 +288,7 @@ pub struct WireGuardTunnelProvider {
     download_tuning: bool,
     udp_factory: Option<Arc<dyn crate::endpoint::UdpSocketFactory>>,
     datagram: Option<Arc<dyn DatagramTransport>>,
+    endpoint_resolver: Option<Arc<dyn crate::endpoint::EndpointResolver>>,
     source: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
     closed: std::sync::atomic::AtomicBool,
 }
@@ -309,6 +310,7 @@ impl WireGuardTunnelProvider {
             download_tuning: false,
             udp_factory: None,
             datagram: None,
+            endpoint_resolver: None,
             source: Arc::new(std::sync::Mutex::new(None)),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -328,6 +330,17 @@ impl WireGuardTunnelProvider {
     pub fn with_udp_factory(mut self, factory: Arc<dyn crate::endpoint::UdpSocketFactory>) -> Self {
         self.udp_factory = Some(factory);
         self.datagram = None;
+        self
+    }
+
+    /// Resolve an endpoint name with `resolver`. A tunnel carried by a
+    /// [`DatagramTransport`] asks that transport instead, and an endpoint
+    /// written as an address is never resolved.
+    pub fn with_endpoint_resolver(
+        mut self,
+        resolver: Arc<dyn crate::endpoint::EndpointResolver>,
+    ) -> Self {
+        self.endpoint_resolver = Some(resolver);
         self
     }
 
@@ -659,8 +672,8 @@ impl WireGuardTunnelProvider {
         }
     }
 
-    /// Resolve the peer's endpoint with the **operating system's** resolver,
-    /// or, for a carried tunnel, with its carrier's.
+    /// Resolve the peer's endpoint with the injected resolver, or, for a
+    /// carried tunnel, with its carrier's.
     ///
     /// This one name is outside the tunnel by definition: it is the hop that
     /// carries the tunnel, so there is nothing to resolve it through yet. When
@@ -697,29 +710,31 @@ impl WireGuardTunnelProvider {
                     detail: "the endpoint name resolved to no addresses".to_string(),
                 });
         }
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the WireGuard endpoint name, looked up on the host until the embedder injects a resolver"
-        )]
-        let resolved = tokio::time::timeout(
-            self.spec.request_timeout,
-            tokio::net::lookup_host((host.as_str(), port)),
-        )
-        .await
-        .map_err(|_| TunnelError::WireGuardConnect {
-            host: host.clone(),
-            port,
-            detail: "the endpoint name did not resolve in time".to_string(),
-        })?;
+        let Some(resolver) = &self.endpoint_resolver else {
+            return Err(TunnelError::WireGuardConnect {
+                host,
+                port,
+                detail: "the endpoint is a name and no resolver was given for it".to_string(),
+            });
+        };
+        let resolved = tokio::time::timeout(self.spec.request_timeout, resolver.resolve(&host))
+            .await
+            .map_err(|_| TunnelError::WireGuardConnect {
+                host: host.clone(),
+                port,
+                detail: "the endpoint name did not resolve in time".to_string(),
+            })?;
 
-        let mut addresses = resolved.map_err(|error| TunnelError::WireGuardConnect {
+        let addresses = resolved.map_err(|error| TunnelError::WireGuardConnect {
             host: host.clone(),
             port,
             detail: format!("the endpoint name could not be resolved: {error}"),
         })?;
 
         addresses
+            .into_iter()
             .next()
+            .map(|address| SocketAddr::new(address, port))
             .ok_or_else(|| TunnelError::WireGuardConnect {
                 host: host.clone(),
                 port,

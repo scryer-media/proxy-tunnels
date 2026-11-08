@@ -105,6 +105,7 @@ pub struct Http3TunnelProvider {
     spec: Http3TunnelSpec,
     config: quinn::ClientConfig,
     udp_factory: Arc<dyn crate::endpoint::UdpSocketFactory>,
+    endpoint_resolver: Option<Arc<dyn crate::endpoint::EndpointResolver>>,
     source: Mutex<Option<SocketAddr>>,
     sessions: Mutex<Sessions>,
     connect_lock: tokio::sync::Mutex<()>,
@@ -157,6 +158,7 @@ impl Http3TunnelProvider {
             spec,
             config,
             udp_factory: Arc::new(crate::endpoint::SystemUdpSocketFactory),
+            endpoint_resolver: None,
             source: Mutex::new(None),
             sessions: Mutex::new(Sessions::default()),
             connect_lock: tokio::sync::Mutex::new(()),
@@ -164,6 +166,17 @@ impl Http3TunnelProvider {
             stop: watch::channel(false).0,
             freed: SlotFreed::default(),
         })
+    }
+
+    /// Resolve the proxy's name with `resolver`. A proxy written as an
+    /// address is never resolved, and with no resolver only an address is
+    /// dialled.
+    pub fn with_endpoint_resolver(
+        mut self,
+        resolver: Arc<dyn crate::endpoint::EndpointResolver>,
+    ) -> Self {
+        self.endpoint_resolver = Some(resolver);
+        self
     }
 
     pub fn with_udp_factory(mut self, factory: Arc<dyn crate::endpoint::UdpSocketFactory>) -> Self {
@@ -198,18 +211,22 @@ impl Http3TunnelProvider {
             }
         }
         let host = self.spec.host.trim_start_matches('[').trim_end_matches(']');
-        // This is the only host resolver call. CONNECT destinations never enter it.
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the HTTP/3 proxy endpoint name, looked up on the host until the embedder injects a resolver"
-        )]
+        // Only the proxy's own name is resolved here. CONNECT destinations never are.
         let addresses: Vec<SocketAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
             vec![SocketAddr::new(ip, self.spec.port)]
         } else {
-            tokio::net::lookup_host((host, self.spec.port))
+            let Some(resolver) = &self.endpoint_resolver else {
+                return Err(
+                    self.connect_error("proxy endpoint is a name and no resolver was given for it")
+                );
+            };
+            resolver
+                .resolve(host)
                 .await
                 .map_err(|_| self.connect_error("proxy endpoint DNS lookup failed"))?
+                .into_iter()
                 .take(8)
+                .map(|ip| SocketAddr::new(ip, self.spec.port))
                 .collect()
         };
         self.connect_addresses(host, &addresses, deadline).await

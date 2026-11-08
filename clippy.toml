@@ -1,6 +1,5 @@
-# Only the embedding application decides who resolves a name. The two endpoint
-# lookups that still use the host resolver carry
-# `#[expect(clippy::disallowed_methods, reason = ...)]`.
+# Only the embedding application decides who resolves a name: tunnel endpoint
+# names go to the resolver it injects.
 disallowed-methods = [
     { path = "tokio::net::lookup_host", reason = "resolve the endpoint with the resolver the embedding application injects" },
     { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "resolve the endpoint with the resolver the embedding application injects" },
