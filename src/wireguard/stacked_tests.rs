@@ -114,6 +114,32 @@ fn large_body() -> String {
     "inner-tunnel-payload;".repeat(8_000)
 }
 
+/// The outer tunnel on a caller-bound socket (connected to its peer and
+/// moving datagrams in batches) still carries the inner one.
+#[tokio::test]
+async fn a_tunnel_inside_a_caller_bound_tunnel_carries_bytes() {
+    let body = large_body();
+    let peers = Stacked::start(body.clone()).await;
+    let factory = Arc::new(crate::endpoint::RecordingUdpFactory::default());
+    let outer = Arc::new(
+        WireGuardTunnelProvider::new(
+            peers.outer.client_spec("outer-bound"),
+            Arc::new(NoopTunnelObserver),
+        )
+        .with_udp_factory(factory.clone()),
+    );
+    let inner = peers.inner_provider(&outer);
+
+    let response = get(&inner, "origin.tunnel.test").await;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:.80}");
+    assert!(response.ends_with(&body), "the whole body must arrive");
+    assert_eq!(peers.inner.requests(), vec!["GET /stacked HTTP/1.1"]);
+    assert_eq!(factory.0.lock().expect("bound sockets").len(), 1);
+    inner.shutdown().await;
+    outer.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_tunnel_inside_a_tunnel_carries_bytes_both_ways() {
     let body = large_body();
