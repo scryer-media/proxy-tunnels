@@ -76,3 +76,7 @@ tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "proce
 [[example]]
 name = "http3_interop"
 required-features = ["http3"]
+
+[[example]]
+name = "wireguard_loopback_bulk"
+required-features = ["test-support"]
