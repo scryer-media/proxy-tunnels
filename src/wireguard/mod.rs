@@ -62,6 +62,7 @@ mod stack;
 mod tcp;
 mod transport;
 mod udp;
+mod worker;
 
 #[cfg(test)]
 mod stacked_tests;
@@ -209,6 +210,10 @@ struct WgTunnel {
     /// blocking plugin worker, `stop_all` at shutdown), so the drop has to
     /// enter this handle first.
     runtime: tokio::runtime::Handle,
+    /// The thread `runtime` belongs to, for a tunnel built with download
+    /// tuning (see [`worker`]); `None` when the tasks run on the caller's
+    /// runtime.
+    worker: Option<worker::TunnelWorker>,
 }
 
 impl WgTunnel {
@@ -267,6 +272,8 @@ impl Drop for WgTunnel {
             .carrier_watch
             .as_ref()
             .map(tokio::task::JoinHandle::abort_handle);
+        // A tunnel thread ends once this teardown has run on it.
+        let thread = self.worker.as_mut().and_then(worker::TunnelWorker::release);
         self.runtime.spawn(async move {
             if let Some(device) = device {
                 device.stop().await;
@@ -276,6 +283,7 @@ impl Drop for WgTunnel {
             if let Some(watch) = watch {
                 watch.abort();
             }
+            drop(thread);
         });
     }
 }
@@ -320,6 +328,10 @@ impl WireGuardTunnelProvider {
     /// buffer for concurrent bulk downloads. At the 256-socket limit, TCP
     /// buffers alone can consume 512 MiB. Ordinary providers retain 64 KiB
     /// buffers and the operating system's UDP defaults.
+    ///
+    /// A tuned tunnel also runs its device and stack on a thread of its own,
+    /// so its packets pass between its tasks without waking the caller's
+    /// runtime workers. Each tunnel then uses at most one core.
     pub fn with_download_tuning(mut self) -> Self {
         self.download_tuning = true;
         self
@@ -477,9 +489,18 @@ impl WireGuardTunnelProvider {
     async fn bring_up(&self) -> Result<WgTunnel, TunnelError> {
         self.spec.validate()?;
 
-        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+        let caller = tokio::runtime::Handle::try_current().map_err(|_| {
             TunnelError::Engine("a WireGuard tunnel needs a tokio runtime".to_string())
         })?;
+        // A tuned tunnel's device and pump run on a thread of their own.
+        let worker = if self.download_tuning {
+            Some(worker::TunnelWorker::start(&self.spec.proxy_config_id)?)
+        } else {
+            None
+        };
+        let runtime = worker
+            .as_ref()
+            .map_or(caller, |worker| worker.handle().clone());
 
         let endpoint = self.resolve_endpoint().await?;
 
@@ -533,7 +554,7 @@ impl WireGuardTunnelProvider {
         peer.preshared_key = self.spec.preshared_key;
         peer.keepalive = self.spec.persistent_keepalive;
 
-        let device = DeviceBuilder::new()
+        let builder = DeviceBuilder::new()
             // An ephemeral local port on an ordinary UDP socket. No listen
             // port is configured: nothing dials *us*.
             .with_udp(transport::TunnelUdpFactory {
@@ -544,9 +565,15 @@ impl WireGuardTunnelProvider {
             })
             .with_ip_pair(to_stack, to_device)
             .with_private_key(StaticSecret::from(self.spec.private_key))
-            .with_peer(peer)
-            .build()
-            .await;
+            .with_peer(peer);
+        // The device spawns its tasks onto the runtime it is built on.
+        let device = match &worker {
+            None => builder.build().await.map_err(|error| error.to_string()),
+            Some(_) => match runtime.spawn(builder.build()).await {
+                Ok(built) => built.map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            },
+        };
 
         let device = match device {
             Ok(device) => device,
@@ -608,6 +635,7 @@ impl WireGuardTunnelProvider {
             carrier,
             carrier_watch,
             runtime,
+            worker,
         })
     }
 

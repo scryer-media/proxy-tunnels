@@ -35,6 +35,15 @@ pub struct WgTcpStream {
 }
 
 impl WgTcpStream {
+    /// The bytes waiting in the receive buffer, and the buffer's capacity.
+    #[cfg(test)]
+    pub(crate) fn receive_buffer(&self) -> (usize, usize) {
+        self.shared.peek_stack(|stack| {
+            let socket = stack.sockets_mut().get_mut::<tcp::Socket>(self.handle);
+            (socket.recv_queue(), socket.recv_capacity())
+        })
+    }
+
     /// Dial `remote` and wait for the connection to establish.
     ///
     /// The caller has already claimed a socket slot; on any failure the socket
@@ -189,6 +198,22 @@ impl Drop for PendingConnect {
     }
 }
 
+/// Whether a read must ask the stack to tell the peer the receive window
+/// opened, given the buffer's capacity and the bytes queued before the read.
+///
+/// The read wakes the pump only while less than half the buffer was free.
+/// Every byte that arrives is acknowledged by a poll anyway, and smoltcp
+/// sends a window update on its own only once the window doubled, so a
+/// wake after a read from a mostly empty buffer moves no segment. While at
+/// least half the buffer is free the window the peer holds is at least a
+/// quarter of the buffer: the last waking read left at least half free, and
+/// the poll it caused advertised that or kept a window no less than half of
+/// it. So the sender is never held below a quarter of the buffer by a read
+/// that did not wake.
+pub(crate) fn window_was_narrow(capacity: usize, queued: usize) -> bool {
+    capacity.saturating_sub(queued) < capacity / 2
+}
+
 impl AsyncRead for WgTcpStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -203,27 +228,33 @@ impl AsyncRead for WgTcpStream {
                 // Either the far side sent its FIN or the connection is gone.
                 // Both are end-of-stream to a reader; a reset that lost data
                 // is reported by the writer, which is where it matters.
-                return Poll::Ready(Ok(0));
+                return Poll::Ready(Ok((0, false)));
             }
+            let narrow = window_was_narrow(socket.recv_capacity(), socket.recv_queue());
             match socket.recv_slice(buffer.initialize_unfilled()) {
                 Ok(0) => {
                     socket.register_recv_waker(context.waker());
                     Poll::Pending
                 }
-                Ok(read) => Poll::Ready(Ok(read)),
+                Ok(read) => Poll::Ready(Ok((read, narrow))),
                 // `Finished` is a clean end of stream; `InvalidState` means the
                 // socket is not connected, which is the same to a reader.
-                Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => Poll::Ready(Ok(0)),
+                Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => {
+                    Poll::Ready(Ok((0, false)))
+                }
             }
         });
 
         match read {
-            Poll::Ready(Ok(read)) => {
+            Poll::Ready(Ok((read, narrow))) => {
                 if read > 0 {
                     buffer.advance(read);
                     // Consuming bytes opened the receive window; the peer only
-                    // learns that when the stack next polls.
-                    this.shared.wake();
+                    // learns that when the stack next polls. That matters only
+                    // while the window is narrow: see `window_was_narrow`.
+                    if narrow {
+                        this.shared.wake();
+                    }
                 }
                 Poll::Ready(Ok(()))
             }

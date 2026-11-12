@@ -53,7 +53,7 @@ use smoltcp::wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr as SmolCidr
 use tokio::sync::Notify;
 
 use crate::error::{SlotFreed, TunnelError};
-use crate::wireguard::adapter::{InboundRx, OutboundTx};
+use crate::wireguard::adapter::{InboundRx, OutboundTx, PACKET_QUEUE_DEPTH};
 use crate::wireguard::phy::WgPhy;
 use crate::wireguard::spec::IpCidr;
 use crate::wireguard::tcp::{WgTcpListener, WgTcpStream};
@@ -882,11 +882,15 @@ impl Drop for QueryGuard<'_> {
 /// The one task that drives smoltcp.
 ///
 /// It never busy-loops: after each poll it parks on whichever of the four
-/// things can possibly need it next.
+/// things can possibly need it next. Each pass first takes every packet the
+/// device has already handed over, so a burst costs one poll rather than one
+/// per packet, and the one timer is moved rather than rebuilt.
 async fn pump(shared: Arc<StackShared>, mut inbound: InboundRx, shutdown: Arc<Notify>) {
     let _stop = StopOnExit(Arc::clone(&shared));
     let proxy_config_id = shared.config().proxy_config_id.clone();
-    let mut batch: Vec<Packet<Ip>> = Vec::with_capacity(64);
+    let mut batch: Vec<Packet<Ip>> = Vec::with_capacity(PACKET_QUEUE_DEPTH);
+    let timer = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(timer);
 
     loop {
         let delay = shared.peek_stack(|stack| stack.poll());
@@ -898,22 +902,39 @@ async fn pump(shared: Arc<StackShared>, mut inbound: InboundRx, shutdown: Arc<No
         let stopped = shutdown.notified();
         tokio::pin!(woken, stopped);
 
+        let now = delay.is_some_and(|delay| delay.is_zero());
+        let sleeping = delay.is_some() && !now;
+        if let Some(delay) = delay.filter(|_| sleeping) {
+            timer.as_mut().reset(tokio::time::Instant::now() + delay);
+        }
+
         tokio::select! {
             biased;
             () = &mut stopped => break,
-            received = inbound.recv_many(&mut batch, 64) => {
+            received = inbound.recv_many(&mut batch, PACKET_QUEUE_DEPTH) => {
                 if received == 0 {
                     // The device is gone.
                     break;
                 }
-                shared.peek_stack(|stack| {
-                    for packet in batch.drain(..) {
-                        stack.phy.push_inbound(packet);
-                    }
-                });
             }
             () = &mut woken => {}
-            () = sleep_for(delay) => {}
+            () = &mut timer, if sleeping => {}
+            () = tokio::task::yield_now(), if now => {}
+        }
+        // Whatever else arrived while this task was waking is taken now too,
+        // up to what one pass hands the interface.
+        while batch.len() < PACKET_QUEUE_DEPTH {
+            match inbound.try_recv() {
+                Ok(packet) => batch.push(packet),
+                Err(_) => break,
+            }
+        }
+        if !batch.is_empty() {
+            shared.peek_stack(|stack| {
+                for packet in batch.drain(..) {
+                    stack.phy.push_inbound(packet);
+                }
+            });
         }
     }
 
@@ -924,15 +945,6 @@ async fn pump(shared: Arc<StackShared>, mut inbound: InboundRx, shutdown: Arc<No
         overrun,
         "tunnel stack stopped"
     );
-}
-
-/// Sleep for smoltcp's advisory delay, or forever when it has nothing pending.
-async fn sleep_for(delay: Option<Duration>) {
-    match delay {
-        Some(delay) if delay.is_zero() => tokio::task::yield_now().await,
-        Some(delay) => tokio::time::sleep(delay).await,
-        None => std::future::pending().await,
-    }
 }
 
 #[cfg(test)]
@@ -1198,5 +1210,183 @@ mod resource_tests {
             let cost = poll_cost(count).await;
             println!("{count} idle sockets: {} ns per poll", cost.as_nanos());
         }
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    //! Two stacks joined back to back by the adapter channels, with no
+    //! device between them: what one stack emits, the other receives.
+
+    use super::*;
+    use crate::wireguard::adapter::ip_channels;
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::{IpRecv, IpSend};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PORT: u16 = 8080;
+
+    struct Pair {
+        near: WgStack,
+        far: WgStack,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            for task in &self.tasks {
+                task.abort();
+            }
+        }
+    }
+
+    fn config(address: &str) -> StackConfig {
+        StackConfig {
+            addresses: vec![address.parse().unwrap()],
+            dns_servers: Vec::new(),
+            mtu: 1420,
+            proxy_config_id: "link-test".into(),
+            download_tuning: true,
+            max_sockets: DEFAULT_MAX_SOCKETS,
+        }
+    }
+
+    fn pair() -> Pair {
+        let runtime = tokio::runtime::Handle::current();
+        let (near_in, near_out, near_inbound, near_outbound) = ip_channels(1420);
+        let (far_in, far_out, far_inbound, far_outbound) = ip_channels(1420);
+        let (near, near_pump) = WgStack::start(
+            config("10.9.0.1/24"),
+            near_inbound,
+            near_outbound,
+            Arc::new(Notify::new()),
+            &runtime,
+        );
+        let (far, far_pump) = WgStack::start(
+            config("10.9.0.2/24"),
+            far_inbound,
+            far_outbound,
+            Arc::new(Notify::new()),
+            &runtime,
+        );
+        let wire = |mut from: crate::wireguard::adapter::StackToDevice,
+                    mut to: crate::wireguard::adapter::DeviceToStack| {
+            tokio::spawn(async move {
+                let mut pool = PacketBufPool::new(1);
+                while let Ok(packets) = from.recv(&mut pool).await {
+                    let packets: Vec<_> = packets.collect();
+                    for packet in packets {
+                        if to.send(packet).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+        };
+        Pair {
+            tasks: vec![
+                near_pump,
+                far_pump,
+                wire(near_out, far_in),
+                wire(far_out, near_in),
+            ],
+            near,
+            far,
+        }
+    }
+
+    fn pattern(length: usize) -> Vec<u8> {
+        (0..length).map(|index| (index % 251) as u8).collect()
+    }
+
+    /// A reader that stops reading holds the sender at its window; nothing
+    /// that arrived is lost, and once it reads again every byte comes, in
+    /// order. A full buffer's worth is in flight at once, so the window
+    /// offered the whole buffer.
+    #[tokio::test]
+    async fn a_stalled_reader_loses_nothing_and_its_full_window_is_used() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let body = pattern(5 * 1024 * 1024 + 17);
+        let sent = body.clone();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            stream.write_all(&sent).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let mut stream = pair
+            .near
+            .connect(
+                SocketAddr::from(([10, 9, 0, 2], PORT)),
+                // Far above any run; the test runner bounds the test.
+                Duration::from_secs(3600),
+            )
+            .await
+            .unwrap();
+
+        // Read nothing until the receive buffer is full to within one
+        // segment: the sender has filled the whole window and is waiting on
+        // it.
+        loop {
+            let (queued, capacity) = stream.receive_buffer();
+            assert_eq!(capacity, 1024 * 1024);
+            if capacity - queued < 1420 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let mut received = Vec::with_capacity(body.len());
+        stream.read_to_end(&mut received).await.unwrap();
+        assert!(received == body, "every byte, in order");
+        server.await.unwrap();
+        for stack in [&pair.near, &pair.far] {
+            let (_, overrun) = stack.shared.peek_stack(|stack| stack.phy.drop_counts());
+            assert_eq!(overrun, 0, "no packet the stack was handed was discarded");
+        }
+    }
+
+    /// Reads from a buffer that is mostly free do not wake the stack, and
+    /// the transfer still completes with every byte.
+    #[tokio::test]
+    async fn a_reader_keeping_up_moves_every_byte() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let body = pattern(3 * 1024 * 1024 + 5);
+        let sent = body.clone();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            stream.write_all(&sent).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let mut stream = pair
+            .near
+            .connect(
+                SocketAddr::from(([10, 9, 0, 2], PORT)),
+                // Far above any run; the test runner bounds the test.
+                Duration::from_secs(3600),
+            )
+            .await
+            .unwrap();
+        let mut received = Vec::with_capacity(body.len());
+        let mut chunk = vec![0u8; 1500];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk[..read]);
+        }
+        assert!(received == body, "every byte, in order");
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn only_a_narrow_window_needs_a_wake() {
+        use crate::wireguard::tcp::window_was_narrow;
+        assert!(!window_was_narrow(1024, 0));
+        assert!(!window_was_narrow(1024, 512));
+        assert!(window_was_narrow(1024, 513));
+        assert!(window_was_narrow(1024, 1024));
     }
 }

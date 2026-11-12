@@ -114,6 +114,72 @@ fn large_body() -> String {
     "inner-tunnel-payload;".repeat(8_000)
 }
 
+/// The outer tunnel on a caller-bound socket (connected to its peer and
+/// moving datagrams in batches) still carries the inner one.
+#[tokio::test]
+async fn a_tunnel_inside_a_caller_bound_tunnel_carries_bytes() {
+    let body = large_body();
+    let peers = Stacked::start(body.clone()).await;
+    let factory = Arc::new(crate::endpoint::RecordingUdpFactory::default());
+    let outer = Arc::new(
+        WireGuardTunnelProvider::new(
+            peers.outer.client_spec("outer-bound"),
+            Arc::new(NoopTunnelObserver),
+        )
+        .with_udp_factory(factory.clone()),
+    );
+    let inner = peers.inner_provider(&outer);
+
+    let response = get(&inner, "origin.tunnel.test").await;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:.80}");
+    assert!(response.ends_with(&body), "the whole body must arrive");
+    assert_eq!(peers.inner.requests(), vec!["GET /stacked HTTP/1.1"]);
+    assert_eq!(factory.0.lock().expect("bound sockets").len(), 1);
+    inner.shutdown().await;
+    outer.shutdown().await;
+}
+
+/// Tuned tunnels run on threads of their own, so the inner tunnel's device
+/// sends into, and reads from, a stack driven from another thread, and the
+/// reader here is on a third. Every byte still arrives, in order.
+#[tokio::test]
+async fn a_tuned_tunnel_inside_a_tuned_caller_bound_tunnel_carries_bytes() {
+    let body = large_body();
+    let peers = Stacked::start(body.clone()).await;
+    let factory = Arc::new(crate::endpoint::RecordingUdpFactory::default());
+    let outer = Arc::new(
+        WireGuardTunnelProvider::new(
+            peers.outer.client_spec("outer-tuned"),
+            Arc::new(NoopTunnelObserver),
+        )
+        .with_download_tuning()
+        .with_udp_factory(factory.clone()),
+    );
+    let inner = WireGuardTunnelProvider::new(peers.inner_spec(), Arc::new(NoopTunnelObserver))
+        .with_download_tuning()
+        .with_inner_wireguard(Arc::clone(&outer));
+
+    for _ in 0..2 {
+        let response = get(&inner, "origin.tunnel.test").await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:.80}");
+        assert!(response.ends_with(&body), "the whole body must arrive");
+    }
+    assert_eq!(
+        peers.inner.requests(),
+        vec!["GET /stacked HTTP/1.1", "GET /stacked HTTP/1.1"]
+    );
+    inner.shutdown().await;
+    outer.shutdown().await;
+    assert!(
+        inner
+            .dial("origin.tunnel.test", TEST_PEER_HTTP_PORT)
+            .await
+            .is_err(),
+        "a shut-down tunnel does not come back"
+    );
+}
+
 #[tokio::test]
 async fn a_tunnel_inside_a_tunnel_carries_bytes_both_ways() {
     let body = large_body();
