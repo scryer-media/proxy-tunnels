@@ -192,8 +192,13 @@ impl Http3TunnelProvider {
         }
     }
 
+    /// The current session, or a new one connected by `deadline`. Waiting
+    /// for the connect lock and resolving the proxy's name count against the
+    /// same deadline as the handshake.
     async fn session(&self, deadline: tokio::time::Instant) -> Result<Arc<Session>, TunnelError> {
-        let _connecting = self.connect_lock.lock().await;
+        let _connecting = tokio::time::timeout_at(deadline, self.connect_lock.lock())
+            .await
+            .map_err(|_| self.connect_error("HTTP/3 dial deadline exceeded"))?;
         {
             let mut sessions = self.sessions.lock().expect("HTTP/3 sessions lock");
             if let Some(session) = &sessions.current
@@ -220,9 +225,9 @@ impl Http3TunnelProvider {
                     self.connect_error("proxy endpoint is a name and no resolver was given for it")
                 );
             };
-            resolver
-                .resolve(host)
+            tokio::time::timeout_at(deadline, resolver.resolve(host))
                 .await
+                .map_err(|_| self.connect_error("HTTP/3 dial deadline exceeded"))?
                 .map_err(|_| self.connect_error("proxy endpoint DNS lookup failed"))?
                 .into_iter()
                 .take(8)
