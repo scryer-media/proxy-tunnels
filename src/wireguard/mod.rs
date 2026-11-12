@@ -412,7 +412,7 @@ impl WireGuardTunnelProvider {
         let endpoint = spec.endpoint_description();
         let peer_public_key = base64_of(&spec.peer_public_key);
         let our_public_key = spec.public_key();
-        let tunnel = self.bring_up().await?;
+        let tunnel = self.bring_up(self.request_deadline()).await?;
         let handshake = WireGuardHandshake {
             endpoint,
             peer_public_key,
@@ -444,13 +444,23 @@ impl WireGuardTunnelProvider {
             );
             *guard = None;
         }
-        let tunnel = Arc::new(self.bring_up().await?);
+        let tunnel = Arc::new(self.bring_up(self.request_deadline()).await?);
         *guard = Some(Arc::clone(&tunnel));
         Ok(tunnel)
     }
 
-    /// Drop `stale` if it is still the current tunnel, and build a new one.
-    async fn replace_tunnel(&self, stale: &Arc<WgTunnel>) -> Result<Arc<WgTunnel>, TunnelError> {
+    /// When a request that starts now must be done by.
+    fn request_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.spec.request_timeout
+    }
+
+    /// Drop `stale` if it is still the current tunnel, and build a new one
+    /// by `deadline`.
+    async fn replace_tunnel(
+        &self,
+        stale: &Arc<WgTunnel>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Arc<WgTunnel>, TunnelError> {
         let mut guard = self.tunnel.lock().await;
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(TunnelError::Engine("tunnel provider stopped".into()));
@@ -462,15 +472,15 @@ impl WireGuardTunnelProvider {
             return Ok(Arc::clone(current));
         }
         *guard = None;
-        let tunnel = Arc::new(self.bring_up().await?);
+        let tunnel = Arc::new(self.bring_up(deadline).await?);
         *guard = Some(Arc::clone(&tunnel));
         Ok(tunnel)
     }
 
     /// Everything between "a validated spec" and "a tunnel that has shaken
     /// hands": resolve the endpoint, start the stack, build the device, prove
-    /// the peer answers.
-    async fn bring_up(&self) -> Result<WgTunnel, TunnelError> {
+    /// the peer answers. Resolution and the handshake share one deadline.
+    async fn bring_up(&self, deadline: tokio::time::Instant) -> Result<WgTunnel, TunnelError> {
         self.spec.validate()?;
 
         let caller = tokio::runtime::Handle::try_current().map_err(|_| {
@@ -486,7 +496,7 @@ impl WireGuardTunnelProvider {
             .as_ref()
             .map_or(caller, |worker| worker.handle().clone());
 
-        let endpoint = self.resolve_endpoint().await?;
+        let endpoint = self.resolve_endpoint(deadline).await?;
 
         // A carried tunnel binds its socket first: the link it lands on
         // decides how large this tunnel's packets may be. Binding may bring
@@ -577,7 +587,10 @@ impl WireGuardTunnelProvider {
                 .run(Arc::clone(stack.shared()), Arc::clone(&shutdown)),
         );
 
-        let handshake_at = match self.await_handshake(&stack, &status, &pump, probed).await {
+        let handshake_at = match self
+            .await_handshake(&stack, &status, &pump, probed, deadline)
+            .await
+        {
             Ok(handshake_at) => handshake_at,
             Err(error) => {
                 shutdown.notify_waiters();
@@ -641,10 +654,11 @@ impl WireGuardTunnelProvider {
         status: &engine::EngineStatus,
         pump: &tokio::task::JoinHandle<()>,
         probed: std::time::Instant,
+        deadline: tokio::time::Instant,
     ) -> Result<Duration, TunnelError> {
         let resend_at = tokio::time::Instant::now() + BRING_UP_RESEND;
         let mut resent = false;
-        let waited = tokio::time::timeout(self.spec.request_timeout, async {
+        let waited = tokio::time::timeout_at(deadline, async {
             loop {
                 if status.last_handshake_age().is_some() {
                     return Some(probed.elapsed());
@@ -694,7 +708,10 @@ impl WireGuardTunnelProvider {
     /// carries the tunnel, so there is nothing to resolve it through yet. When
     /// another tunnel carries this one, the name means something on *that*
     /// tunnel's far side, so that is where it is asked.
-    async fn resolve_endpoint(&self) -> Result<SocketAddr, TunnelError> {
+    async fn resolve_endpoint(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<SocketAddr, TunnelError> {
         let host = self.spec.endpoint_host.trim().to_string();
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         if let Ok(address) = bare.parse::<IpAddr>() {
@@ -732,7 +749,7 @@ impl WireGuardTunnelProvider {
                 detail: "the endpoint is a name and no resolver was given for it".to_string(),
             });
         };
-        let resolved = tokio::time::timeout(self.spec.request_timeout, resolver.resolve(&host))
+        let resolved = tokio::time::timeout_at(deadline, resolver.resolve(&host))
             .await
             .map_err(|_| TunnelError::WireGuardConnect {
                 host: host.clone(),
@@ -757,25 +774,44 @@ impl WireGuardTunnelProvider {
             })
     }
 
-    /// One dial attempt on a tunnel that is already up.
+    /// One dial attempt on a tunnel that is already up, done by `deadline`.
+    ///
+    /// Resolution and every address share that deadline. Each address gets
+    /// an even share of what is left, so a silent address cannot spend the
+    /// time of the addresses after it.
     async fn dial_on(
         &self,
         tunnel: &WgTunnel,
         host: &str,
         port: u16,
+        deadline: tokio::time::Instant,
     ) -> Result<Box<dyn TunnelStream>, DialFailure> {
-        let timeout = self.spec.request_timeout;
+        let out_of_time = || TunnelError::Dial {
+            host: host.to_string(),
+            port,
+            detail: "the tunnel did not open a connection in time".to_string(),
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(DialFailure::Tunnel(out_of_time()));
+        }
         let addresses = tunnel
             .stack
-            .resolve(host, timeout)
+            .resolve(host, remaining)
             .await
             .map_err(|error| DialFailure::Destination(relabel(error, host, port)))?;
 
         let mut last = None;
-        for address in addresses {
+        let count = addresses.len();
+        for (index, address) in addresses.into_iter().enumerate() {
+            let share = share_of(deadline, count - index);
+            if share.is_zero() {
+                last = Some(out_of_time());
+                break;
+            }
             match tunnel
                 .stack
-                .connect(SocketAddr::new(address, port), timeout)
+                .connect(SocketAddr::new(address, port), share)
                 .await
             {
                 Ok(stream) => return Ok(Box::new(stream) as Box<dyn TunnelStream>),
@@ -812,6 +848,13 @@ impl DialFailure {
             DialFailure::Destination(error) | DialFailure::Tunnel(error) => error,
         }
     }
+}
+
+/// An even share of what is left before `deadline`, for one of `left`
+/// attempts still to make.
+fn share_of(deadline: tokio::time::Instant, left: usize) -> Duration {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    remaining / u32::try_from(left.max(1)).unwrap_or(u32::MAX)
 }
 
 /// A dial that produced no answer at all, as opposed to a refusal.
@@ -869,24 +912,32 @@ impl TunnelProvider for WireGuardTunnelProvider {
                 .tunnel_dial_failed(&self.spec.proxy_config_id, &error.to_string());
         })?;
 
-        let outcome = match self.dial_on(&tunnel, host, port).await {
+        // One deadline covers the whole dial: resolution, every address, and
+        // the rebuild and second attempt when there is one. A tunnel whose
+        // peer shook hands moments ago is provably up, so a silence on it is
+        // the destination's and is never retried; any other tunnel keeps
+        // half the budget back for a rebuild and a second attempt.
+        let deadline = self.request_deadline();
+        let recently_shaken =
+            matches!(tunnel.last_handshake_age(), Some(age) if age < RECENT_HANDSHAKE);
+        let first_deadline = if recently_shaken {
+            deadline
+        } else {
+            tokio::time::Instant::now() + self.spec.request_timeout / 2
+        };
+        let outcome = match self.dial_on(&tunnel, host, port, first_deadline).await {
             Ok(stream) => Ok(stream),
             Err(DialFailure::Destination(error)) => Err(error),
-            Err(DialFailure::Tunnel(first)) if matches!(tunnel.last_handshake_age(), Some(age) if age < RECENT_HANDSHAKE) =>
-            {
-                // The peer shook hands moments ago, so the tunnel is provably
-                // up and the silence is the destination's. No rebuild.
-                Err(first)
-            }
+            Err(DialFailure::Tunnel(first)) if recently_shaken => Err(first),
             Err(DialFailure::Tunnel(first)) => {
                 tracing::debug!(
                     proxy_config_id = self.spec.proxy_config_id.as_str(),
                     error = %first,
                     "the WireGuard tunnel answered nothing; bringing it up again once"
                 );
-                match self.replace_tunnel(&tunnel).await {
+                match self.replace_tunnel(&tunnel, deadline).await {
                     Ok(tunnel) => self
-                        .dial_on(&tunnel, host, port)
+                        .dial_on(&tunnel, host, port, deadline)
                         .await
                         .map_err(DialFailure::into_error),
                     Err(error) => Err(error),
