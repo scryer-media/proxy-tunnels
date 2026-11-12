@@ -92,7 +92,9 @@ pub use spec::{
     MIN_WIREGUARD_MTU, WIREGUARD_KEY_MESSAGE, WireGuardSpec, parse_key, public_key_of,
     validate_wireguard_keys,
 };
-pub use stack::{DEFAULT_MAX_SOCKETS, MAX_MAX_SOCKETS, MIN_MAX_SOCKETS, WgStack, socket_cap};
+pub use stack::{
+    DEFAULT_MAX_SOCKETS, MAX_LISTEN_BACKLOG, MAX_MAX_SOCKETS, MIN_MAX_SOCKETS, WgStack, socket_cap,
+};
 pub use tcp::{WgTcpListener, WgTcpStream};
 pub use udp::WgUdpSocket;
 
