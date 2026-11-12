@@ -58,7 +58,7 @@ use crate::wireguard::adapter::{InboundRx, OutboundTx};
 use crate::wireguard::phy::{Outbound, PACKET_QUEUE_DEPTH, WgPhy};
 use crate::wireguard::spec::IpCidr;
 use crate::wireguard::tcp::{WgTcpListener, WgTcpStream};
-use crate::wireguard::udp::WgUdpSocket;
+use crate::wireguard::udp::{UdpQueue, WgUdpSocket};
 
 /// How many sockets one tunnel may have open at once when its spec asks for
 /// no other number.
@@ -89,6 +89,17 @@ pub fn socket_cap(asked: usize) -> usize {
 /// round trip at 64 KiB per window is ~5 Mbit/s per connection, and our
 /// consumers open several.
 const TCP_BUFFER_BYTES: usize = 64 * 1024;
+
+/// How many engine passes' worth of datagrams a socket carrying another
+/// tunnel receives.
+///
+/// The carrier's engine hands this socket up to a whole pass at once, while
+/// the carried tunnel's engine, on its own thread, may still be taking in
+/// the passes before. One pass deep, a 3-hop download over four connections
+/// overflowed it on some runs and fell to half speed on the retransmissions.
+/// Eight passes absorbed every burst measured. The queue is allocated when
+/// the carried tunnel comes up: 8 x 512 datagrams of up to one MTU.
+const TRANSPORT_RECEIVE_PASSES: usize = 8;
 
 /// Datagrams and payload bytes buffered per UDP socket, each way.
 const UDP_PACKETS: usize = 32;
@@ -360,11 +371,18 @@ impl StackInner {
 
     /// A UDP socket with room for `packets` datagrams and `bytes` of payload
     /// in each direction.
-    pub(crate) fn add_udp_socket_sized(&mut self, packets: usize, bytes: usize) -> SocketHandle {
-        let socket = udp::Socket::new(
-            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; packets], vec![0u8; bytes]),
-            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; packets], vec![0u8; bytes]),
-        );
+    pub(crate) fn add_udp_socket_sized(
+        &mut self,
+        receive: UdpQueue,
+        send: UdpQueue,
+    ) -> SocketHandle {
+        let buffer = |queue: UdpQueue| {
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; queue.packets],
+                vec![0u8; queue.bytes],
+            )
+        };
+        let socket = udp::Socket::new(buffer(receive), buffer(send));
         self.sockets.add(socket)
     }
 
@@ -697,13 +715,22 @@ impl WgStack {
 
     /// Bind a UDP socket that carries another tunnel's encrypted packets.
     ///
-    /// Sized like the link itself rather than like a DNS socket: it queues as
-    /// many datagrams as the adapter channels hold, each up to this link's
-    /// MTU, so a burst on the carried tunnel is absorbed here instead of being
-    /// dropped by a buffer meant for a handful of queries.
+    /// Sized like the link itself rather than like a DNS socket: each
+    /// datagram may be up to this link's MTU, and it sends as many as one
+    /// engine pass takes. It receives [`TRANSPORT_RECEIVE_PASSES`] passes'
+    /// worth, so a burst on the carried tunnel is absorbed here instead of
+    /// being dropped.
     pub fn bind_transport_udp(&self, port: u16) -> Result<WgUdpSocket, TunnelError> {
         let mtu = usize::from(self.shared.config().mtu);
-        self.bind_udp_sized(port, PACKET_QUEUE_DEPTH, PACKET_QUEUE_DEPTH * mtu)
+        let send = UdpQueue {
+            packets: PACKET_QUEUE_DEPTH,
+            bytes: PACKET_QUEUE_DEPTH * mtu,
+        };
+        let receive = UdpQueue {
+            packets: TRANSPORT_RECEIVE_PASSES * send.packets,
+            bytes: TRANSPORT_RECEIVE_PASSES * send.bytes,
+        };
+        self.bind_udp_queues(port, receive, send)
     }
 
     pub(crate) fn bind_udp_sized(
@@ -712,11 +739,21 @@ impl WgStack {
         packets: usize,
         bytes: usize,
     ) -> Result<WgUdpSocket, TunnelError> {
+        let queue = UdpQueue { packets, bytes };
+        self.bind_udp_queues(port, queue, queue)
+    }
+
+    fn bind_udp_queues(
+        &self,
+        port: u16,
+        receive: UdpQueue,
+        send: UdpQueue,
+    ) -> Result<WgUdpSocket, TunnelError> {
         if self.shared.is_stopped() {
             return Err(TunnelError::Engine("the tunnel has stopped".to_string()));
         }
         let slot = self.shared.claim_socket()?;
-        let socket = WgUdpSocket::bind(Arc::clone(&self.shared), port, packets, bytes)?;
+        let socket = WgUdpSocket::bind(Arc::clone(&self.shared), port, receive, send)?;
         slot.keep();
         Ok(socket)
     }
@@ -1000,6 +1037,85 @@ async fn pump(shared: Arc<StackShared>, mut inbound: InboundRx, shutdown: Arc<No
 mod resource_tests {
     use super::*;
     use std::future::Future;
+
+    /// An IPv4 UDP datagram from `10.0.0.2:4000` to `10.0.0.1:port` whose
+    /// payload starts with `index`.
+    fn udp_datagram(port: u16, index: u32) -> Packet<Ip> {
+        use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr};
+        let mut payload = vec![index as u8; 1200];
+        payload[..4].copy_from_slice(&index.to_be_bytes());
+        let source = smoltcp::wire::Ipv4Address::new(10, 0, 0, 2);
+        let destination = smoltcp::wire::Ipv4Address::new(10, 0, 0, 1);
+        let udp = UdpRepr {
+            src_port: 4000,
+            dst_port: port,
+        };
+        let ip = Ipv4Repr {
+            src_addr: source,
+            dst_addr: destination,
+            next_header: IpProtocol::Udp,
+            payload_len: udp.header_len() + payload.len(),
+            hop_limit: 64,
+        };
+        let checksums = smoltcp::phy::ChecksumCapabilities::default();
+        let mut bytes = vec![0u8; ip.buffer_len() + ip.payload_len];
+        let mut packet = Ipv4Packet::new_unchecked(&mut bytes);
+        ip.emit(&mut packet, &checksums);
+        udp.emit(
+            &mut UdpPacket::new_unchecked(packet.payload_mut()),
+            &source.into(),
+            &destination.into(),
+            payload.len(),
+            |buffer| buffer.copy_from_slice(&payload),
+            &checksums,
+        );
+        Packet::copy_from(&bytes[..])
+            .try_into_ip()
+            .expect("an IPv4 datagram")
+    }
+
+    /// The carrier's engine can hand a carried tunnel's socket several whole
+    /// passes before that tunnel's engine reads any of them; none is lost.
+    // A plain test, outside any runtime, so that no task budget makes a
+    // ready read look like a waiting one.
+    #[test]
+    fn a_carried_tunnels_socket_holds_several_passes_before_it_is_read() {
+        const PORT: u16 = 51000;
+        const PASSES: usize = 3;
+        let stack = WgStack::build_for_engine(StackConfig {
+            addresses: vec!["10.0.0.1/24".parse().unwrap()],
+            dns_servers: vec!["10.0.0.2".parse().unwrap()],
+            mtu: 1280,
+            proxy_config_id: "carried-burst-test".into(),
+            download_tuning: false,
+            max_sockets: DEFAULT_MAX_SOCKETS,
+        });
+        let socket = stack.bind_transport_udp(PORT).unwrap();
+        let mut outbound = Vec::new();
+        for pass in 0..PASSES {
+            let mut inbound: Vec<Packet<Ip>> = (0..PACKET_QUEUE_DEPTH)
+                .map(|at| udp_datagram(PORT, (pass * PACKET_QUEUE_DEPTH + at) as u32))
+                .collect();
+            stack
+                .shared()
+                .peek_stack(|inner| inner.pass(&mut inbound, &mut outbound));
+            outbound.clear();
+        }
+        // Every datagram is already queued, so each read completes on its
+        // first poll; one that would wait was dropped.
+        let mut buffer = vec![0u8; 2048];
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        for index in 0..(PASSES * PACKET_QUEUE_DEPTH) as u32 {
+            let read = std::pin::pin!(socket.recv_from(&mut buffer)).poll(&mut context);
+            let Poll::Ready(read) = read else {
+                panic!("datagram {index} was dropped");
+            };
+            let (read, from) = read.unwrap();
+            assert_eq!(read, 1200);
+            assert_eq!(from, SocketAddr::from(([10, 0, 0, 2], 4000)));
+            assert_eq!(buffer[..4], index.to_be_bytes(), "datagram {index}");
+        }
+    }
 
     fn isolated_stack() -> WgStack {
         let (_, _, inbound, outbound) = crate::wireguard::adapter::ip_channels(1280);

@@ -38,16 +38,26 @@ pub struct WgUdpSocket {
     recv_lock: tokio::sync::Mutex<()>,
 }
 
+/// How much one direction of a UDP socket inside the tunnel queues.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UdpQueue {
+    /// Datagrams.
+    pub(crate) packets: usize,
+    /// Payload bytes, all datagrams together.
+    pub(crate) bytes: usize,
+}
+
 impl WgUdpSocket {
-    /// Bind `port`, or an ephemeral port when it is `0`.
+    /// Bind `port`, or an ephemeral port when it is `0`, queueing up to
+    /// `receive` arriving and `send` departing datagrams.
     pub(crate) fn bind(
         shared: Arc<StackShared>,
         port: u16,
-        packets: usize,
-        bytes: usize,
+        receive: UdpQueue,
+        send: UdpQueue,
     ) -> Result<Self, TunnelError> {
         let (handle, local_port, bound) = shared.with_stack(|stack| {
-            let handle = stack.add_udp_socket_sized(packets, bytes);
+            let handle = stack.add_udp_socket_sized(receive, send);
             let local_port = if port == 0 {
                 stack.next_ephemeral_port()
             } else {
