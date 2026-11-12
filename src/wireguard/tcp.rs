@@ -245,6 +245,11 @@ impl AsyncRead for WgTcpStream {
         context: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // A buffer with no room reads nothing, at once: there is nothing to
+        // wait for, and smoltcp would report the empty read as no data.
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let this = self.get_mut();
         let handle = this.handle;
         let fin_seen = &mut this.fin_seen;

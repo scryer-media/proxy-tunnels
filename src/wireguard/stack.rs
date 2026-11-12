@@ -2070,6 +2070,28 @@ mod link_tests {
         drop((accepted, dialled));
     }
 
+    /// A read into a buffer with no room left completes at once, reading
+    /// nothing, as `AsyncRead` requires; it does not wait for bytes it could
+    /// not take.
+    #[tokio::test]
+    async fn a_read_into_a_full_buffer_completes_at_once() {
+        use tokio::io::{AsyncRead, ReadBuf};
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, mut dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let _accepted = accepted.unwrap();
+
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut full: [u8; 0] = [];
+        let mut buffer = ReadBuf::new(&mut full);
+        let read = std::pin::Pin::new(&mut dialled).poll_read(&mut context, &mut buffer);
+        assert!(
+            matches!(read, Poll::Ready(Ok(()))),
+            "a full buffer is ready at once: {read:?}"
+        );
+        assert_eq!(buffer.filled().len(), 0);
+    }
+
     #[test]
     fn only_a_narrow_window_needs_a_wake() {
         use crate::wireguard::tcp::window_was_narrow;
