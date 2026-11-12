@@ -238,13 +238,15 @@ impl Engine {
             // A full queue means the stack had more to send than one pass
             // takes: go round again at once rather than wait.
             let more = outbound.len() >= PACKET_QUEUE_DEPTH;
-            // Each send's worth leaves as soon as it is encrypted, so the far
-            // end, or the carrier's engine on its own thread, starts on the
-            // first packets while the rest are still being encrypted.
-            let most = self.send.max_number_of_packets_to_send().max(1);
+            // Each batch leaves as soon as it is encrypted, so the far end, or
+            // the carrier's engine on its own thread, starts on the first
+            // packets while the rest are still being encrypted. How large a
+            // batch is: `TunnelSocket::stream_batch`.
+            let mut sent = 0;
             for packet in outbound.drain(..) {
                 self.encrypt(packet, &mut wire);
-                if wire.len() >= most {
+                if wire.len() >= self.send.stream_batch(sent) {
+                    sent += wire.len();
                     self.flush(&mut wire, &mut chunk).await;
                 }
             }

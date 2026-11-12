@@ -828,6 +828,74 @@ impl TunnelSocket {
             Self::System(_) | Self::Datagram(_) => None,
         }
     }
+
+    /// How many encrypted packets a pass gathers before it sends them, when
+    /// it has sent `sent` so far.
+    ///
+    /// An OS socket takes one send call's worth. A datagram socket inside
+    /// another tunnel takes as many as the pass already sent, starting from
+    /// one: 1, 1, 2, 4 and so on, up to [`BOUND_BATCH`]. The first packet
+    /// then leaves at once, so the carrier's engine on its own thread starts
+    /// on it while the rest are encrypted, and no packet waits behind more
+    /// packets than went before it. Each batch costs one hold of the
+    /// carrier's lock and one wake of its engine, so a pass of `n` packets
+    /// pays about log2(n) of each instead of `n`.
+    pub(crate) fn stream_batch(&self, sent: usize) -> usize {
+        use gotatun::udp::UdpSend;
+        match self {
+            Self::System(_) | Self::Bound(_) => self.max_number_of_packets_to_send().max(1),
+            Self::Datagram(_) => sent.clamp(1, BOUND_BATCH),
+        }
+    }
+}
+
+/// Send `packets` through a datagram socket in order, one batch per run of
+/// packets bound for the same address, and remove them all.
+///
+/// A packet the socket fails to send is lost, as it would be on any link,
+/// and the rest go on; the first such failure is returned once every packet
+/// was tried. A socket that has closed for good ends the call with its error,
+/// and the packets not yet sent are lost with it.
+async fn send_datagram_runs(
+    socket: &dyn DatagramSocket,
+    packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
+) -> std::io::Result<()> {
+    let mut failed = None;
+    let mut closed = None;
+    let mut at = 0;
+    'runs: while at < packets.len() {
+        let target = packets[at].1;
+        let run = packets[at..]
+            .iter()
+            .take_while(|(_, to)| *to == target)
+            .count();
+        let datagrams: Vec<&[u8]> = packets[at..at + run]
+            .iter()
+            .map(|(packet, _)| &packet[..])
+            .collect();
+        let mut sent = 0;
+        while sent < run {
+            match socket.send_batch_to(&datagrams[sent..], target).await {
+                // A count of none for a batch that is not empty would send
+                // nothing forever; that datagram is taken as lost instead.
+                Ok(count) => sent += count.max(1),
+                Err(error) if socket.is_closed() => {
+                    closed = Some(error);
+                    break 'runs;
+                }
+                Err(error) => {
+                    failed.get_or_insert(error);
+                    sent += 1;
+                }
+            }
+        }
+        at += run;
+    }
+    packets.clear();
+    match closed.or(failed) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 impl gotatun::udp::UdpSend for TunnelSocket {
@@ -847,8 +915,7 @@ impl gotatun::udp::UdpSend for TunnelSocket {
     fn max_number_of_packets_to_send(&self) -> usize {
         match self {
             Self::System(socket) => socket.max_number_of_packets_to_send(),
-            Self::Bound(_) => BOUND_BATCH,
-            Self::Datagram(_) => 1,
+            Self::Bound(_) | Self::Datagram(_) => BOUND_BATCH,
         }
     }
     async fn send_many_to(
@@ -859,12 +926,7 @@ impl gotatun::udp::UdpSend for TunnelSocket {
         match self {
             Self::System(socket) => socket.send_many_to(buffer, packets).await,
             Self::Bound(socket) => socket.send_many(packets).await,
-            Self::Datagram(_) => {
-                for (packet, target) in packets.drain(..) {
-                    self.send_to(packet, target).await?;
-                }
-                Ok(())
-            }
+            Self::Datagram(socket) => send_datagram_runs(socket.as_ref(), packets).await,
         }
     }
     fn local_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {

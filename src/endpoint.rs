@@ -67,6 +67,30 @@ pub trait DatagramSocket: Send + Sync {
     /// Send one datagram to `target`, waiting for room rather than dropping.
     async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<()>;
 
+    /// Send several datagrams to `target`, in order, waiting for room rather
+    /// than dropping, exactly as one [`send_to`](Self::send_to) per datagram
+    /// would.
+    ///
+    /// Returns how many datagrams, from the start of `datagrams`, were
+    /// accepted. Every one is accepted unless a send fails. A failure on the
+    /// first datagram is returned as the error, and none was accepted. A
+    /// failure on a later datagram ends the call early with the count
+    /// accepted before it; the caller sends the rest again (call again with
+    /// `&datagrams[count..]`), and that call meets the failure on its first
+    /// datagram. An empty `datagrams` accepts none and returns `Ok(0)`.
+    ///
+    /// The default implementation calls [`send_to`](Self::send_to) once per
+    /// datagram. A socket that can hand over several datagrams for less than
+    /// several single sends overrides it, keeping these semantics.
+    async fn send_batch_to(&self, datagrams: &[&[u8]], target: SocketAddr) -> io::Result<usize> {
+        for (sent, datagram) in datagrams.iter().enumerate() {
+            if let Err(error) = self.send_to(datagram, target).await {
+                return if sent == 0 { Err(error) } else { Ok(sent) };
+            }
+        }
+        Ok(datagrams.len())
+    }
+
     /// Receive one datagram into `buffer`, returning its length and sender.
     async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
 
@@ -158,5 +182,106 @@ impl EndpointResolver for RecordingResolver {
     async fn resolve(&self, host: &str) -> io::Result<Vec<std::net::IpAddr>> {
         self.asked.lock().unwrap().push(host.to_string());
         Ok(self.answer.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A socket that keeps every datagram sent to it and fails the send of
+    /// any datagram whose first byte is in `refuse`. It implements only the
+    /// single send, so a batch takes the default implementation.
+    #[derive(Default)]
+    struct RecordingSocket {
+        sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+        refuse: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl DatagramSocket for RecordingSocket {
+        async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<()> {
+            if self.refuse.contains(&data[0]) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "refused"));
+            }
+            self.sent.lock().unwrap().push((data.to_vec(), target));
+            Ok(())
+        }
+
+        async fn recv_from(&self, _buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+
+        fn local_addr(&self) -> Option<SocketAddr> {
+            None
+        }
+
+        fn link_mtu(&self) -> Option<u16> {
+            None
+        }
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+
+        async fn closed(&self) {
+            std::future::pending().await
+        }
+    }
+
+    fn target() -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 2], 4000))
+    }
+
+    /// The default batch sends each datagram once, in order, to the target.
+    #[tokio::test]
+    async fn the_default_batch_sends_each_datagram_once_in_order() {
+        let socket = RecordingSocket::default();
+        let datagrams: [&[u8]; 4] = [&[0, 10], &[1, 11, 12], &[2], &[3, 13]];
+        assert_eq!(socket.send_batch_to(&datagrams, target()).await.unwrap(), 4);
+        let sent = socket.sent.lock().unwrap().clone();
+        let expected: Vec<(Vec<u8>, SocketAddr)> = datagrams
+            .iter()
+            .map(|datagram| (datagram.to_vec(), target()))
+            .collect();
+        assert_eq!(sent, expected);
+        assert_eq!(socket.send_batch_to(&[], target()).await.unwrap(), 0);
+        assert_eq!(socket.sent.lock().unwrap().len(), 4);
+    }
+
+    /// A failure part way returns the count sent before it and sends
+    /// nothing after it; the call for the rest meets the failure as its
+    /// error, and a failure on the first datagram sends none.
+    #[tokio::test]
+    async fn the_default_batch_stops_at_a_failure_and_counts_what_went() {
+        let socket = RecordingSocket {
+            refuse: vec![2],
+            ..Default::default()
+        };
+        let datagrams: [&[u8]; 4] = [&[0], &[1], &[2], &[3]];
+        assert_eq!(socket.send_batch_to(&datagrams, target()).await.unwrap(), 2);
+        let error = socket
+            .send_batch_to(&datagrams[2..], target())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let sent: Vec<Vec<u8>> = socket
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(datagram, _)| datagram.clone())
+            .collect();
+        assert_eq!(sent, vec![vec![0], vec![1]]);
+        // Past the refused one, the rest go.
+        assert_eq!(
+            socket
+                .send_batch_to(&datagrams[3..], target())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(socket.sent.lock().unwrap().len(), 3);
     }
 }

@@ -96,33 +96,67 @@ impl WgUdpSocket {
     /// Waits for room in the send buffer rather than failing, so a caller
     /// sending faster than the link drains is slowed instead of dropped.
     pub async fn send_to(&self, data: &[u8], remote: SocketAddr) -> io::Result<()> {
+        self.send_batch_to(&[data], remote).await.map(|_| ())
+    }
+
+    /// Send several datagrams to `remote`, in order, with the semantics of
+    /// [`DatagramSocket::send_batch_to`].
+    ///
+    /// The whole batch is queued under one hold of the stack's lock and
+    /// followed by one wake of the stack, where single sends take the lock
+    /// and wake the stack once per datagram. Only when the send buffer fills
+    /// part way does the socket wake the stack for what it queued so far and
+    /// wait for room, as single sends would.
+    pub async fn send_batch_to(
+        &self,
+        datagrams: &[&[u8]],
+        remote: SocketAddr,
+    ) -> io::Result<usize> {
+        if datagrams.is_empty() {
+            return Ok(0);
+        }
         let endpoint = IpEndpoint::from(remote);
         let handle = self.handle;
         let _sending = self.send_lock.lock().await;
-        let queued = std::future::poll_fn(|context| {
-            self.shared.peek_stack(|stack| {
+        let mut sent = 0;
+        std::future::poll_fn(|context| {
+            let (progressed, outcome) = self.shared.peek_stack(|stack| {
+                let before = sent;
                 if self.shared.is_stopped() {
-                    return Poll::Ready(Err(stopped()));
+                    return (false, Poll::Ready(Err(stopped())));
                 }
                 let socket = stack.sockets_mut().get_mut::<udp::Socket>(handle);
-                match socket.send_slice(data, endpoint) {
-                    Ok(()) => Poll::Ready(Ok(())),
-                    Err(udp::SendError::BufferFull) => {
-                        socket.register_send_waker(context.waker());
-                        Poll::Pending
+                while let Some(datagram) = datagrams.get(sent) {
+                    match socket.send_slice(datagram, endpoint) {
+                        Ok(()) => sent += 1,
+                        Err(udp::SendError::BufferFull) => {
+                            socket.register_send_waker(context.waker());
+                            return (sent > before, Poll::Pending);
+                        }
+                        Err(udp::SendError::Unaddressable) => {
+                            return (
+                                sent > before,
+                                Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "the tunnel has no address in that destination's family",
+                                ))),
+                            );
+                        }
                     }
-                    Err(udp::SendError::Unaddressable) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "the tunnel has no address in that destination's family",
-                    ))),
                 }
-            })
+                (sent > before, Poll::Ready(Ok(())))
+            });
+            if progressed {
+                self.shared.wake();
+            }
+            match outcome {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(sent)),
+                Poll::Ready(Err(_)) if sent > 0 => Poll::Ready(Ok(sent)),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            }
         })
-        .await;
-        if queued.is_ok() {
-            self.shared.wake();
-        }
-        queued
+        .await
     }
 
     /// Receive one datagram, returning how much was written and who sent it.
@@ -167,6 +201,10 @@ fn stopped() -> io::Error {
 impl DatagramSocket for WgUdpSocket {
     async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<()> {
         WgUdpSocket::send_to(self, data, target).await
+    }
+
+    async fn send_batch_to(&self, datagrams: &[&[u8]], target: SocketAddr) -> io::Result<usize> {
+        WgUdpSocket::send_batch_to(self, datagrams, target).await
     }
 
     async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {

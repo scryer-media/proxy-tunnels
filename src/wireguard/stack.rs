@@ -162,6 +162,35 @@ pub(crate) struct StackShared {
     /// that, so every socket wrapper must fail rather than wait.
     stopped: std::sync::atomic::AtomicBool,
     stopped_notify: Notify,
+    #[cfg(test)]
+    pub(crate) counts: StackCounts,
+}
+
+/// How often the stack's lock was taken and its pump woken.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct StackCounts {
+    pub(crate) locks: std::sync::atomic::AtomicUsize,
+    pub(crate) wakes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl StackCounts {
+    /// The locks and wakes counted so far.
+    pub(crate) fn read(&self) -> (usize, usize) {
+        (
+            self.locks.load(Ordering::SeqCst),
+            self.wakes.load(Ordering::SeqCst),
+        )
+    }
+
+    fn lock(&self) {
+        self.locks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake(&self) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl StackShared {
@@ -171,11 +200,8 @@ impl StackShared {
     /// Every mutation goes through here: forgetting the wake is the one bug
     /// this design can have, so it is not possible to forget it.
     pub(crate) fn with_stack<R>(&self, f: impl FnOnce(&mut StackInner) -> R) -> R {
-        let result = {
-            let mut inner = self.inner.lock().expect("tunnel stack lock poisoned");
-            f(&mut inner)
-        };
-        self.wake.notify_one();
+        let result = self.peek_stack(f);
+        self.wake();
         result
     }
 
@@ -183,12 +209,16 @@ impl StackShared {
     /// queued something. The caller rings [`Self::wake`] itself when they did,
     /// which keeps a would-block poll from costing a pointless stack poll.
     pub(crate) fn peek_stack<R>(&self, f: impl FnOnce(&mut StackInner) -> R) -> R {
+        #[cfg(test)]
+        self.counts.lock();
         let mut inner = self.inner.lock().expect("tunnel stack lock poisoned");
         f(&mut inner)
     }
 
     /// Ask the pump for a poll.
     pub(crate) fn wake(&self) {
+        #[cfg(test)]
+        self.counts.wake();
         self.wake.notify_one();
     }
 
@@ -632,6 +662,8 @@ impl WgStack {
             config,
             stopped: std::sync::atomic::AtomicBool::new(false),
             stopped_notify: Notify::new(),
+            #[cfg(test)]
+            counts: StackCounts::default(),
         });
 
         WgStack { shared }
@@ -1115,6 +1147,142 @@ mod resource_tests {
             assert_eq!(from, SocketAddr::from(([10, 0, 0, 2], 4000)));
             assert_eq!(buffer[..4], index.to_be_bytes(), "datagram {index}");
         }
+    }
+
+    /// A stack with no engine, for driving sends and passes by hand.
+    fn engine_stack(name: &str) -> WgStack {
+        WgStack::build_for_engine(StackConfig {
+            addresses: vec!["10.0.0.1/24".parse().unwrap()],
+            dns_servers: vec!["10.0.0.2".parse().unwrap()],
+            mtu: 1280,
+            proxy_config_id: name.into(),
+            download_tuning: false,
+            max_sockets: DEFAULT_MAX_SOCKETS,
+        })
+    }
+
+    /// Payloads of `count` datagrams, each different and of its own length.
+    fn payloads(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|index| {
+                let mut payload = vec![index as u8; 100 + index * 7];
+                payload[..4].copy_from_slice(&(index as u32).to_be_bytes());
+                payload
+            })
+            .collect()
+    }
+
+    /// Run one pass and return each UDP datagram the stack sent: its
+    /// destination, source port and payload, in the order sent.
+    fn sent_datagrams(stack: &WgStack) -> Vec<(SocketAddr, u16, Vec<u8>)> {
+        use smoltcp::wire::{Ipv4Packet, UdpPacket};
+        let mut inbound = Vec::new();
+        let mut outbound = Vec::new();
+        stack
+            .shared()
+            .peek_stack(|inner| inner.pass(&mut inbound, &mut outbound));
+        outbound
+            .into_iter()
+            .map(|packet| {
+                let packet: Packet = packet.into();
+                let ip = Ipv4Packet::new_checked(&packet[..]).expect("an IPv4 packet");
+                let udp = UdpPacket::new_checked(ip.payload()).expect("a UDP datagram");
+                (
+                    SocketAddr::new(std::net::IpAddr::V4(ip.dst_addr()), udp.dst_port()),
+                    udp.src_port(),
+                    udp.payload().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// Poll `future` once, outside any runtime; it must finish.
+    fn ready<F: Future>(future: F) -> F::Output {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(future).poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("the send waited with room in the buffer"),
+        }
+    }
+
+    /// A batch sent through a socket inside the tunnel leaves the stack as
+    /// the same datagrams, bytes and order, as one single send per datagram,
+    /// for one hold of the stack's lock and one wake where the single sends
+    /// take one of each per datagram.
+    #[test]
+    fn a_batch_send_leaves_as_the_single_sends_do_for_one_lock_and_one_wake() {
+        const COUNT: usize = 40;
+        let target = SocketAddr::from(([10, 0, 0, 2], 4000));
+        let payloads = payloads(COUNT);
+        let datagrams: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+
+        let single = engine_stack("single-send-test");
+        let single_socket = single.bind_transport_udp(51000).unwrap();
+        let before = single.shared().counts.read();
+        for datagram in &datagrams {
+            ready(single_socket.send_to(datagram, target)).unwrap();
+        }
+        let after = single.shared().counts.read();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (COUNT, COUNT));
+        let singles = sent_datagrams(&single);
+
+        let batch = engine_stack("batch-send-test");
+        let batch_socket = batch.bind_transport_udp(51000).unwrap();
+        let before = batch.shared().counts.read();
+        let accepted = ready(batch_socket.send_batch_to(&datagrams, target)).unwrap();
+        let after = batch.shared().counts.read();
+        assert_eq!(accepted, COUNT);
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+        let batched = sent_datagrams(&batch);
+
+        assert_eq!(singles.len(), COUNT);
+        assert_eq!(batched, singles);
+        for (index, (to, from_port, payload)) in batched.iter().enumerate() {
+            assert_eq!((*to, *from_port), (target, 51000));
+            assert_eq!(payload, &payloads[index], "datagram {index}");
+        }
+    }
+
+    /// A carried tunnel's engine hands a whole flush to its carrier's socket
+    /// as one batch: one hold of the carrier's lock and one wake of its
+    /// engine for the lot, and every packet leaves in order.
+    #[test]
+    fn a_carried_tunnels_flush_takes_the_carriers_lock_and_wakes_it_once() {
+        use gotatun::udp::UdpSend;
+        const COUNT: usize = 40;
+        let target = SocketAddr::from(([10, 0, 0, 2], 4000));
+        let payloads = payloads(COUNT);
+        let carrier = engine_stack("carrier-flush-test");
+        let socket: Arc<dyn crate::endpoint::DatagramSocket> =
+            Arc::new(carrier.bind_transport_udp(51000).unwrap());
+        let carried = crate::wireguard::transport::TunnelSocket::Datagram(socket);
+        let mut packets: Vec<(Packet, SocketAddr)> = payloads
+            .iter()
+            .map(|payload| (Packet::copy_from(&payload[..]), target))
+            .collect();
+
+        let before = carrier.shared().counts.read();
+        ready(carried.send_many_to(&mut Default::default(), &mut packets)).unwrap();
+        let after = carrier.shared().counts.read();
+
+        assert!(packets.is_empty());
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+        let sent: Vec<Vec<u8>> = sent_datagrams(&carrier)
+            .into_iter()
+            .map(|(_, _, payload)| payload)
+            .collect();
+        assert_eq!(sent, payloads);
+
+        // A pass streams its packets into the carrier in batches as large as
+        // what it already sent: 1, 1, 2, 4, ... up to one send call's worth.
+        let mut sent = 0;
+        let mut batches = Vec::new();
+        while sent < 300 {
+            let batch = carried.stream_batch(sent);
+            batches.push(batch);
+            sent += batch;
+        }
+        assert_eq!(batches, [1, 1, 2, 4, 8, 16, 32, 64, 64, 64, 64]);
     }
 
     fn isolated_stack() -> WgStack {
