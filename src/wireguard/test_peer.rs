@@ -528,8 +528,7 @@ async fn forward_udp(stack: WgStack, port: u16, target: SocketAddr, log: Arc<Mut
         let session = match sessions.get(&source) {
             Some(session) => Arc::clone(session),
             None => {
-                let Ok(session) = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await
-                else {
+                let Ok(session) = relay_session_socket() else {
                     continue;
                 };
                 if session.connect(target).await.is_err() {
@@ -552,6 +551,24 @@ async fn forward_udp(stack: WgStack, port: u16, target: SocketAddr, log: Arc<Mut
         };
         let _ = session.send(datagram).await;
     }
+}
+
+/// How much the relay's loopback sockets ask the kernel to queue: what a
+/// tunnel's own socket asks for.
+const RELAY_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+
+/// A loopback socket for one inside source's answers.
+///
+/// Its reader hands one datagram at a time to the stack, so a burst from the
+/// next peer queues in the kernel meanwhile. At the kernel's default queue
+/// that burst overflowed and was dropped, and the tunnel nested inside lost
+/// segments to the relay. The buffer is asked for, not required: a kernel
+/// that caps it still relays, with a shallower queue.
+fn relay_session_socket() -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(RELAY_SOCKET_BUFFER);
+    socket.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(socket)
 }
 
 /// Whether `datagram` has the shape of a WireGuard message: type 1 to 4,
