@@ -98,8 +98,15 @@ impl BoundSocket {
             None => Ok(false),
             Some(current) if current == target => Ok(true),
             Some(_) => {
-                socket2::SockRef::from(&self.socket).connect(&target.into())?;
+                let socket = socket2::SockRef::from(&self.socket);
+                socket.connect(&target.into())?;
                 *connected = Some(target);
+                // An error still pending now was earned by the old peer:
+                // nothing has gone to the new one yet, and once connected the
+                // socket no longer matches the old peer's ICMP. Left in place,
+                // the kernel reports it on the next send and drops that
+                // datagram, the first one meant for the new peer.
+                let _ = socket.take_error();
                 Ok(true)
             }
         }
@@ -220,18 +227,54 @@ impl BoundSocket {
         })
     }
 
+    /// Read one datagram into `packet` without waiting; its length and source.
+    fn try_recv_into(
+        &self,
+        packet: &mut gotatun::packet::Packet,
+    ) -> std::io::Result<(usize, std::net::SocketAddr)> {
+        match self.connected() {
+            Some(peer) => Ok((self.socket.try_recv(packet)?, peer)),
+            None => self.socket.try_recv_from(packet),
+        }
+    }
+
     /// Read one datagram without waiting.
     fn try_recv_one(
         &self,
         pool: &mut gotatun::packet::PacketBufPool,
     ) -> std::io::Result<(gotatun::packet::Packet, std::net::SocketAddr)> {
         let mut packet = pool.get();
-        let (size, source) = match self.connected() {
-            Some(peer) => (self.socket.try_recv(&mut packet)?, peer),
-            None => self.socket.try_recv_from(&mut packet)?,
-        };
+        let (size, source) = self.try_recv_into(&mut packet)?;
         packet.truncate(size);
         Ok((packet, source))
+    }
+
+    /// Read one datagram without waiting into a spare buffer, or a fresh one
+    /// from `pool` when none is spare. A failed read keeps the buffer spare.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            target_pointer_width = "64",
+            target_endian = "little"
+        )),
+        allow(dead_code)
+    )]
+    fn try_recv_spare(
+        &self,
+        pool: &mut gotatun::packet::PacketBufPool,
+        spare: &mut Vec<gotatun::packet::Packet>,
+    ) -> std::io::Result<(gotatun::packet::Packet, std::net::SocketAddr)> {
+        let mut packet = spare.pop().unwrap_or_else(|| pool.get());
+        match self.try_recv_into(&mut packet) {
+            Ok((size, source)) => {
+                packet.truncate(size);
+                Ok((packet, source))
+            }
+            Err(error) => {
+                spare.push(packet);
+                Err(error)
+            }
+        }
     }
 
     /// Wait for and read exactly one datagram.
@@ -252,15 +295,23 @@ impl BoundSocket {
 
     /// Wait until the socket is readable, then read up to [`BOUND_BATCH`]
     /// datagrams, stopping early when the socket would block.
+    ///
+    /// Datagrams land in `batch`'s spare buffers; a read takes from `pool`
+    /// only as many buffers as the previous read filled.
     async fn recv_many(
         &self,
+        batch: &mut RecvBatch,
         pool: &mut gotatun::packet::PacketBufPool,
         packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
     ) -> std::io::Result<()> {
         let start = packets.len();
         loop {
             self.socket.readable().await?;
-            match self.try_recv_batch(pool, packets) {
+            #[cfg(test)]
+            {
+                batch.passes += 1;
+            }
+            match self.try_recv_batch(pool, &mut batch.spare, packets) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) if is_peer_refusal(&error) => {}
@@ -282,11 +333,12 @@ impl BoundSocket {
     fn try_recv_batch(
         &self,
         pool: &mut gotatun::packet::PacketBufPool,
+        spare: &mut Vec<gotatun::packet::Packet>,
         packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
     ) -> std::io::Result<()> {
         let mut read = 0;
         while read < BOUND_BATCH {
-            match self.try_recv_one(pool) {
+            match self.try_recv_spare(pool, spare) {
                 Ok(received) => {
                     packets.push(received);
                     read += 1;
@@ -309,6 +361,16 @@ impl BoundSocket {
     /// Read what the socket holds, up to [`BOUND_BATCH`] datagrams, with one
     /// `recvmmsg` when the socket is connected. Errors only when nothing was
     /// read.
+    ///
+    /// The read goes into `spare`, topped up from `pool` only by the buffers
+    /// the last read handed on; the buffers it leaves empty stay spare for
+    /// the next one.
+    ///
+    /// A read that fills fewer buffers than it offered found the socket's
+    /// queue empty, so it clears the socket's readiness as a failed read
+    /// would. Left set, the next wait would return at once and spend a
+    /// `recvmmsg` that finds nothing. A datagram that lands after the read
+    /// raises readiness again, as it does after a read that failed.
     #[cfg(all(
         target_os = "linux",
         target_pointer_width = "64",
@@ -317,26 +379,45 @@ impl BoundSocket {
     fn try_recv_batch(
         &self,
         pool: &mut gotatun::packet::PacketBufPool,
+        spare: &mut Vec<gotatun::packet::Packet>,
         packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
     ) -> std::io::Result<()> {
         let Some(peer) = self.connected() else {
-            let mut packet = pool.get();
-            let (size, source) = self.socket.try_recv_from(&mut packet)?;
-            packet.truncate(size);
-            packets.push((packet, source));
+            packets.push(self.try_recv_spare(pool, spare)?);
             return Ok(());
         };
-        let mut buffers: Vec<gotatun::packet::Packet> =
-            (0..BOUND_BATCH).map(|_| pool.get()).collect();
-        let sizes = self.socket.try_io(tokio::io::Interest::READABLE, || {
-            mmsg::recv(&self.socket, &mut buffers)
-        })?;
-        for (mut packet, size) in buffers.into_iter().zip(sizes) {
-            packet.truncate(size);
-            packets.push((packet, peer));
+        while spare.len() < BOUND_BATCH {
+            spare.push(pool.get());
         }
+        let mut received = 0;
+        let result = self.socket.try_io(tokio::io::Interest::READABLE, || {
+            received = mmsg::recv(&self.socket, spare)?;
+            if received < spare.len() {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(())
+            }
+        });
+        if received == 0 {
+            return result;
+        }
+        packets.extend(spare.drain(..received).map(|packet| (packet, peer)));
         Ok(())
     }
+}
+
+/// The receive side's own state, kept by the task that reads the socket from
+/// one read to the next.
+#[derive(Default)]
+pub(crate) struct RecvBatch {
+    /// What an OS socket's receive needs, made on its first read: a socket
+    /// the consumer bound, or one inside another tunnel, never needs it.
+    system: Option<Box<<UdpSocket as gotatun::udp::UdpRecv>::RecvManyBuf>>,
+    /// Empty packet buffers, full length, that the next read fills first.
+    spare: Vec<gotatun::packet::Packet>,
+    /// Readiness wake-ups that led to a read attempt.
+    #[cfg(test)]
+    passes: usize,
 }
 
 /// Whether `error` is the far side's host refusing a datagram: an ICMP
@@ -485,28 +566,36 @@ mod mmsg {
         Ok(sent as usize)
     }
 
-    /// Receive up to `buffers.len()` datagrams from the connected peer, one
-    /// per buffer; returns each received datagram's length, in order.
+    /// Receive up to `buffers.len()` (at most [`BOUND_BATCH`]) datagrams from
+    /// the connected peer, one per leading buffer, each buffer cut to its
+    /// datagram's length; returns how many arrived. Buffers past those are
+    /// left untouched.
     pub(super) fn recv(
         socket: &tokio::net::UdpSocket,
         buffers: &mut [gotatun::packet::Packet],
-    ) -> std::io::Result<Vec<usize>> {
-        let mut iovs: Vec<Iovec> = buffers
-            .iter_mut()
-            .map(|buffer| Iovec {
+    ) -> std::io::Result<usize> {
+        let count = buffers.len().min(BOUND_BATCH);
+        let mut iovs: [Iovec; BOUND_BATCH] = std::array::from_fn(|_| Iovec {
+            base: std::ptr::null_mut(),
+            len: 0,
+        });
+        for (iov, buffer) in iovs.iter_mut().zip(buffers.iter_mut()) {
+            *iov = Iovec {
                 base: buffer.as_mut_ptr().cast(),
                 len: buffer.len(),
-            })
-            .collect();
-        let mut headers: Vec<Mmsghdr> = iovs.iter_mut().map(|iov| header(iov)).collect();
-        // SAFETY: every header points at one live iovec, and every iovec at
-        // a distinct live buffer of the stated length that nothing else
-        // touches during the call.
+            };
+        }
+        let first = iovs.as_mut_ptr();
+        let mut headers: [Mmsghdr; BOUND_BATCH] =
+            std::array::from_fn(|index| header(first.wrapping_add(index)));
+        // SAFETY: the first `count` headers each point at one live iovec, and
+        // each of those iovecs at a distinct live buffer of the stated length
+        // that nothing else touches during the call.
         let received = unsafe {
             recvmmsg(
                 socket.as_raw_fd(),
                 headers.as_mut_ptr(),
-                headers.len() as c_uint,
+                count as c_uint,
                 MSG_DONTWAIT,
                 std::ptr::null_mut(),
             )
@@ -514,10 +603,11 @@ mod mmsg {
         if received < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(headers[..received as usize]
-            .iter()
-            .map(|header| header.len as usize)
-            .collect())
+        let received = received as usize;
+        for (buffer, header) in buffers.iter_mut().zip(&headers[..received]) {
+            buffer.truncate(header.len as usize);
+        }
+        Ok(received)
     }
 }
 
@@ -577,7 +667,7 @@ impl gotatun::udp::UdpSend for TunnelSocket {
 }
 
 impl gotatun::udp::UdpRecv for TunnelSocket {
-    type RecvManyBuf = <UdpSocket as gotatun::udp::UdpRecv>::RecvManyBuf;
+    type RecvManyBuf = RecvBatch;
 
     async fn recv_from(
         &mut self,
@@ -612,8 +702,11 @@ impl gotatun::udp::UdpRecv for TunnelSocket {
         packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
     ) -> std::io::Result<()> {
         match self {
-            Self::System(socket) => socket.recv_many_from(buffer, pool, packets).await,
-            Self::Bound(socket) => socket.recv_many(pool, packets).await,
+            Self::System(socket) => {
+                let system = buffer.system.get_or_insert_with(Default::default);
+                socket.recv_many_from(system, pool, packets).await
+            }
+            Self::Bound(socket) => socket.recv_many(buffer, pool, packets).await,
             Self::Datagram(_) => {
                 packets.push(self.recv_from(pool).await?);
                 Ok(())
@@ -771,7 +864,10 @@ mod tests {
         second.send_to(b"three", ours).unwrap();
         let mut pool = PacketBufPool::new(8);
         let mut packets = Vec::new();
-        socket.recv_many(&mut pool, &mut packets).await.unwrap();
+        socket
+            .recv_many(&mut RecvBatch::default(), &mut pool, &mut packets)
+            .await
+            .unwrap();
         assert_eq!(packets.len(), 1);
         assert_eq!(&packets[0].0[..], b"three");
         assert_eq!(packets[0].1, second.local_addr().unwrap());
@@ -794,7 +890,10 @@ mod tests {
         let mut packets = Vec::new();
         while packets.len() < COUNT {
             let before = packets.len();
-            socket.recv_many(&mut pool, &mut packets).await.unwrap();
+            socket
+                .recv_many(&mut RecvBatch::default(), &mut pool, &mut packets)
+                .await
+                .unwrap();
             assert!(packets.len() - before <= BOUND_BATCH);
         }
         let order: Vec<u32> = packets
@@ -937,7 +1036,111 @@ mod tests {
         live.send_to(b"back", ours).unwrap();
         let mut pool = PacketBufPool::new(4);
         let mut packets = Vec::new();
-        socket.recv_many(&mut pool, &mut packets).await.unwrap();
+        socket
+            .recv_many(&mut RecvBatch::default(), &mut pool, &mut packets)
+            .await
+            .unwrap();
         assert_eq!(&packets[0].0[..], b"back");
+    }
+
+    /// The datagram `index` of the reuse test: its number, then a length and
+    /// filler that vary with it, so a buffer written twice or cut to the
+    /// wrong length shows.
+    fn numbered(index: u32) -> Vec<u8> {
+        let mut bytes = index.to_be_bytes().to_vec();
+        bytes.resize(4 + (index as usize * 37) % 1200, index as u8);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn reused_buffers_keep_every_datagram_intact_and_in_order() {
+        let peer = loopback();
+        let socket = bound_to(peer.local_addr().unwrap());
+        let ours = socket.socket.local_addr().unwrap();
+        socket2::SockRef::from(&socket.socket)
+            .set_recv_buffer_size(1 << 22)
+            .unwrap();
+        let mut pool = PacketBufPool::new(16);
+        let mut batch = RecvBatch::default();
+        // Every packet stays held until the end, so a buffer handed on twice
+        // would hold a later datagram where an earlier one should be.
+        let mut held = Vec::new();
+        let mut next = 0u32;
+        // Short, full and longer-than-a-batch bursts, each read until empty.
+        for burst in [
+            1,
+            3,
+            BOUND_BATCH,
+            1,
+            BOUND_BATCH + 1,
+            7,
+            2 * BOUND_BATCH + 5,
+            2,
+        ] {
+            for _ in 0..burst {
+                peer.send_to(&numbered(next), ours).unwrap();
+                next += 1;
+            }
+            let goal = next as usize;
+            while held.len() < goal {
+                let spare: Vec<*const u8> = batch.spare.iter().map(|p| p.as_ptr()).collect();
+                let before = held.len();
+                socket
+                    .recv_many(&mut batch, &mut pool, &mut held)
+                    .await
+                    .unwrap();
+                let read = held.len() - before;
+                assert!(read <= BOUND_BATCH);
+                // A read fills the buffers left spare by the last one first.
+                for (packet, _) in &held[before..before + read.min(spare.len())] {
+                    assert!(
+                        spare.contains(&packet.as_ptr()),
+                        "a spare buffer was skipped"
+                    );
+                }
+                assert!(batch.spare.len() <= BOUND_BATCH);
+            }
+        }
+        for (index, (packet, source)) in held.iter().enumerate() {
+            assert_eq!(*source, peer.local_addr().unwrap());
+            assert_eq!(&packet[..], &numbered(index as u32)[..], "datagram {index}");
+        }
+        let mut starts: Vec<usize> = held.iter().map(|(p, _)| p.as_ptr() as usize).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        assert_eq!(
+            starts.len(),
+            held.len(),
+            "two held datagrams share a buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_that_empties_the_socket_spends_no_extra_wakeup() {
+        let peer = loopback();
+        let socket = bound_to(peer.local_addr().unwrap());
+        let ours = socket.socket.local_addr().unwrap();
+        for index in 0..5u32 {
+            peer.send_to(&index.to_be_bytes(), ours).unwrap();
+        }
+        let mut pool = PacketBufPool::new(16);
+        let mut batch = RecvBatch::default();
+        let mut packets = Vec::new();
+        socket
+            .recv_many(&mut batch, &mut pool, &mut packets)
+            .await
+            .unwrap();
+        assert_eq!(packets.len(), 5);
+        assert_eq!(batch.passes, 1);
+        // Nothing is queued now. The next read waits for the datagram sent
+        // while it is parked, and reads it on the one wake-up it brings.
+        let send = async {
+            tokio::task::yield_now().await;
+            peer.send_to(b"later", ours).unwrap();
+        };
+        let (read, ()) = tokio::join!(socket.recv_many(&mut batch, &mut pool, &mut packets), send);
+        read.unwrap();
+        assert_eq!(&packets[5].0[..], b"later");
+        assert_eq!(batch.passes, 2, "a read found the socket empty");
     }
 }
