@@ -13,7 +13,6 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -148,11 +147,16 @@ pub struct WireGuardTestPeer {
 /// The engine's transports, with a UDP factory that reports its port.
 type TestPeerTransports = (PortReportingUdpFactory, DeviceToStack, StackToDevice);
 
-/// Binds exactly as the engine's factory does, then records the port the
-/// socket landed on. gotatun keeps that port to itself.
+/// Binds as the engine's factory does, on IPv4 loopback, then records the
+/// address the socket landed on. gotatun keeps that address to itself.
+///
+/// gotatun's device asks for a dual-stack socket, and macOS can give one a
+/// port another program's IPv4 socket holds, which then takes every datagram
+/// a client sends the peer (see `os_socket_params`). An IPv4 loopback socket
+/// gets a port of its own.
 struct PortReportingUdpFactory {
     inner: TunnelUdpFactory,
-    bound_port: Arc<AtomicU16>,
+    bound: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 impl UdpTransportFactory for PortReportingUdpFactory {
@@ -163,11 +167,12 @@ impl UdpTransportFactory for PortReportingUdpFactory {
         &mut self,
         params: &UdpTransportFactoryParams,
     ) -> std::io::Result<(TunnelSocket, TunnelSocket)> {
-        let (send, recv) = self.inner.bind(params).await?;
-        self.bound_port.store(
-            send.local_addr()?.expect("bound UDP address").port(),
-            Ordering::Relaxed,
-        );
+        let params = UdpTransportFactoryParams {
+            addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..*params
+        };
+        let (send, recv) = self.inner.bind(&params).await?;
+        *self.bound.lock().expect("bound address") = send.local_addr()?;
         Ok((send, recv))
     }
 }
@@ -229,16 +234,17 @@ impl WireGuardTestPeer {
         // Port 0: the operating system picks the port as the socket binds, and
         // the factory reports it. Probing for a free port first and binding it
         // afterwards races every other test on the machine for that port.
-        let bound_port = Arc::new(AtomicU16::new(0));
+        let bound = Arc::new(Mutex::new(None));
         let device = DeviceBuilder::new()
             .with_udp(PortReportingUdpFactory {
                 inner: TunnelUdpFactory {
+                    endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
                     tuning: download_tuning,
                     bound: None,
                     source: Arc::new(Mutex::new(None)),
                     datagram: None,
                 },
-                bound_port: Arc::clone(&bound_port),
+                bound: Arc::clone(&bound),
             })
             .with_ip_pair(to_stack, to_device)
             .with_listen_port(0)
@@ -247,9 +253,10 @@ impl WireGuardTestPeer {
             .build()
             .await
             .expect("the test peer's device binds");
-        let port = bound_port.load(Ordering::Relaxed);
-        assert_ne!(port, 0, "the test peer's device reports its bound port");
-        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let endpoint = bound
+            .lock()
+            .expect("bound address")
+            .expect("the test peer's device reports its bound address");
 
         let dns_queries = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(Mutex::new(Vec::new()));

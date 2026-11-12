@@ -11,6 +11,9 @@ use gotatun::udp::{
 
 pub(crate) struct TunnelUdpFactory {
     pub tuning: bool,
+    /// The peer the tunnel sends to. Its family decides how an OS socket
+    /// binds.
+    pub endpoint: std::net::SocketAddr,
     pub bound: Option<(
         std::sync::Arc<dyn crate::endpoint::UdpSocketFactory>,
         std::net::SocketAddr,
@@ -762,6 +765,15 @@ impl UdpTransportFactory for TunnelUdpFactory {
             )));
             return Ok((socket.clone(), socket));
         }
+        // An unaddressed socket binds in the endpoint's family, never
+        // dual-stack.
+        let own = UdpTransportFactoryParams {
+            addr: params.addr.or(super::os_socket_params(self.endpoint).addr),
+            port: params.port,
+            #[cfg(target_os = "linux")]
+            fwmark: params.fwmark,
+        };
+        let params = &own;
         let (send, recv) = if self.tuning {
             bind_with_buffer(params, 4 * 1024 * 1024).await?
         } else {

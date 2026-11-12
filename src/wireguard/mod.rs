@@ -566,6 +566,7 @@ impl WireGuardTunnelProvider {
             // port is configured: nothing dials *us*.
             .with_udp(transport::TunnelUdpFactory {
                 tuning: self.download_tuning,
+                endpoint,
                 bound: self.udp_factory.clone().map(|factory| (factory, endpoint)),
                 source: self.source.clone(),
                 datagram,
@@ -1071,6 +1072,31 @@ fn ipv4_header_checksum(header: &Ipv4Header) -> u16 {
 /// The header's own bytes, via a packet, so no zerocopy import is needed here.
 fn header_bytes(header: &Ipv4Header) -> Vec<u8> {
     Packet::copy_from(header).into_bytes().as_ref().to_vec()
+}
+
+/// How a tunnel's own OS socket binds: an ephemeral port on the wildcard
+/// address of `endpoint`'s family, never a dual-stack socket.
+///
+/// macOS picks an ephemeral port for a dual-stack socket without looking at
+/// the IPv4 sockets on the machine, so such a socket can share its port with
+/// another program's IPv4 socket. That socket is the more specific match and
+/// receives every IPv4 datagram for the port: the peer's answers never reach
+/// the tunnel, and its handshake times out. A socket of the endpoint's own
+/// family gets a port no other socket of that family holds. Only an
+/// IPv4-mapped IPv6 endpoint, which only a dual-stack socket can reach, keeps
+/// one.
+pub(crate) fn os_socket_params(endpoint: SocketAddr) -> gotatun::udp::UdpTransportFactoryParams {
+    let addr = match endpoint {
+        SocketAddr::V4(_) => Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => None,
+        SocketAddr::V6(_) => Some(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+    };
+    gotatun::udp::UdpTransportFactoryParams {
+        addr,
+        port: 0,
+        #[cfg(target_os = "linux")]
+        fwmark: None,
+    }
 }
 
 fn base64_of(key: &[u8; 32]) -> String {
