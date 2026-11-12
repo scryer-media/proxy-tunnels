@@ -2,11 +2,11 @@
 //!
 //! A pass of the engine reads every datagram the UDP socket holds (up to a
 //! bound), decrypts each one, hands the lot to the smoltcp stack, polls the
-//! stack once, encrypts whatever the stack composed, and writes it all to the
-//! socket in batches. Decryption, the stack and encryption happen on the
-//! engine's own task, on the packets' own buffers, with no channel or task
-//! between them, so a burst of packets costs one wake-up rather than several
-//! per packet.
+//! stack once, encrypts whatever the stack composed, and writes it to the
+//! socket in batches, each as soon as it is encrypted. Decryption, the stack
+//! and encryption happen on the engine's own task, on the packets' own
+//! buffers, with no channel or task between them, so a burst of packets
+//! costs one wake-up rather than several per packet.
 //!
 //! ```text
 //!   UDP ──▶ verify ─▶ decrypt ─▶ smoltcp poll ─▶ encrypt ──▶ UDP
@@ -238,8 +238,15 @@ impl Engine {
             // A full queue means the stack had more to send than one pass
             // takes: go round again at once rather than wait.
             let more = outbound.len() >= PACKET_QUEUE_DEPTH;
+            // Each send's worth leaves as soon as it is encrypted, so the far
+            // end, or the carrier's engine on its own thread, starts on the
+            // first packets while the rest are still being encrypted.
+            let most = self.send.max_number_of_packets_to_send().max(1);
             for packet in outbound.drain(..) {
                 self.encrypt(packet, &mut wire);
+                if wire.len() >= most {
+                    self.flush(&mut wire, &mut chunk).await;
+                }
             }
             self.flush(&mut wire, &mut chunk).await;
 
