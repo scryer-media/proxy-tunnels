@@ -32,6 +32,9 @@ pub struct WgTcpStream {
     /// Set once `poll_shutdown` (or a fatal error) has closed our half, so a
     /// second shutdown is a no-op rather than a state-machine violation.
     shut_down: bool,
+    /// Set once a read saw the far side's FIN. Only then is the end of the
+    /// connection an end of stream; any other end is an error.
+    fin_seen: bool,
 }
 
 impl WgTcpStream {
@@ -42,6 +45,26 @@ impl WgTcpStream {
             let socket = stack.sockets_mut().get_mut::<tcp::Socket>(self.handle);
             (socket.recv_queue(), socket.recv_capacity())
         })
+    }
+
+    /// The socket's TCP state and the bytes not yet acknowledged by the peer.
+    #[cfg(test)]
+    pub(crate) fn socket_state(&self) -> (tcp::State, usize) {
+        self.shared.peek_stack(|stack| {
+            let socket = stack.sockets_mut().get_mut::<tcp::Socket>(self.handle);
+            (socket.state(), socket.send_queue())
+        })
+    }
+
+    /// Reset the connection: the peer is sent an RST, not a FIN.
+    #[cfg(test)]
+    pub(crate) fn abort(&mut self) {
+        self.shared.with_stack(|stack| {
+            stack
+                .sockets_mut()
+                .get_mut::<tcp::Socket>(self.handle)
+                .abort();
+        });
     }
 
     /// Dial `remote` and wait for the connection to establish.
@@ -116,6 +139,7 @@ impl WgTcpStream {
                 handle,
                 peer: remote,
                 shut_down: false,
+                fin_seen: false,
             }),
             Ok(false) => {
                 shared.with_stack(|stack| stack.discard(handle));
@@ -151,6 +175,7 @@ impl WgTcpStream {
             handle,
             peer,
             shut_down: false,
+            fin_seen: false,
         }
     }
 
@@ -222,13 +247,20 @@ impl AsyncRead for WgTcpStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let handle = this.handle;
-        let read = this.shared.peek_stack(|stack| {
+        let fin_seen = &mut this.fin_seen;
+        let shared = &this.shared;
+        let read = shared.peek_stack(|stack| {
             let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
-            if !socket.may_recv() {
-                // Either the far side sent its FIN or the connection is gone.
-                // Both are end-of-stream to a reader; a reset that lost data
-                // is reported by the writer, which is where it matters.
-                return Poll::Ready(Ok((0, false)));
+            // Only these states follow a FIN from the far side. smoltcp
+            // forgets the FIN when it leaves TIME-WAIT, so remember it here.
+            if matches!(
+                socket.state(),
+                tcp::State::CloseWait
+                    | tcp::State::LastAck
+                    | tcp::State::Closing
+                    | tcp::State::TimeWait
+            ) {
+                *fin_seen = true;
             }
             let narrow = window_was_narrow(socket.recv_capacity(), socket.recv_queue());
             match socket.recv_slice(buffer.initialize_unfilled()) {
@@ -237,11 +269,27 @@ impl AsyncRead for WgTcpStream {
                     Poll::Pending
                 }
                 Ok(read) => Poll::Ready(Ok((read, narrow))),
-                // `Finished` is a clean end of stream; `InvalidState` means the
-                // socket is not connected, which is the same to a reader.
-                Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => {
+                // The far side sent its FIN and every byte before it has been
+                // read: the stream is complete.
+                Err(tcp::RecvError::Finished) => {
+                    *fin_seen = true;
                     Poll::Ready(Ok((0, false)))
                 }
+                Err(tcp::RecvError::InvalidState) if *fin_seen => Poll::Ready(Ok((0, false))),
+                // The connection ended without a FIN: reset by the far side,
+                // timed out, or torn down with the tunnel. What arrived may be
+                // cut short, so this is never an end of stream.
+                Err(tcp::RecvError::InvalidState) => Poll::Ready(Err(if shared.is_stopped() {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "the tunnel stopped before this connection finished",
+                    )
+                } else {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "the tunnel connection was reset before the far side finished sending",
+                    )
+                })),
             }
         });
 
