@@ -895,6 +895,58 @@ async fn a_stalled_endpoint_lookup_ends_at_the_deadline_and_frees_the_lock() {
     provider.shutdown().await;
 }
 
+/// Refuses to bind for an IPv6 peer, as on a host with no IPv6, and binds
+/// IPv4 loopback otherwise. Records each peer it was asked to bind for.
+#[derive(Default)]
+struct NoIpv6UdpFactory(std::sync::Mutex<Vec<SocketAddr>>);
+
+impl crate::endpoint::UdpSocketFactory for NoIpv6UdpFactory {
+    fn bind(&self, peer: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+        self.0.lock().unwrap().push(peer);
+        if peer.is_ipv6() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no IPv6 on this host",
+            ));
+        }
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        socket.set_nonblocking(true)?;
+        Ok(socket)
+    }
+}
+
+/// A proxy address this host cannot bind a socket for is skipped, and the
+/// next resolved address connects.
+#[tokio::test]
+async fn an_unbindable_proxy_address_falls_through_to_the_next() {
+    let fixture = Fixture::start(Mode::Echo).await;
+    let mut spec = fixture.spec();
+    spec.host = "localhost".into();
+    let port = spec.port;
+    let resolver = Arc::new(crate::endpoint::RecordingResolver {
+        answer: vec![
+            IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+            IpAddr::from([127, 0, 0, 1]),
+        ],
+        asked: Default::default(),
+    });
+    let factory = Arc::new(NoIpv6UdpFactory::default());
+    let provider = Http3TunnelProvider::with_root_certificates(spec, roots())
+        .unwrap()
+        .with_endpoint_resolver(resolver)
+        .with_udp_factory(factory.clone());
+    echo(&provider, "destination.invalid").await;
+    assert_eq!(
+        *factory.0.lock().unwrap(),
+        vec![
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ]
+    );
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), 1);
+    provider.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_proxy_named_by_host_with_no_resolver_is_not_dialled() {
     let fixture = Fixture::start(Mode::Echo).await;

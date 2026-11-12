@@ -133,6 +133,10 @@ const BRING_UP_RESEND: Duration = Duration::from_secs(1);
 /// tunnel on every unreachable host behind it.
 const RECENT_HANDSHAKE: Duration = Duration::from_secs(120);
 
+/// How many of an endpoint name's addresses a bring-up tries, in the order
+/// the resolver gave them.
+const MAX_ENDPOINT_ADDRESSES: usize = 8;
+
 /// What WireGuard adds to every packet it carries: a 16-byte data-message
 /// header (type, receiver index, counter) and a 16-byte authentication tag.
 pub const WIREGUARD_DATA_OVERHEAD: u16 = 32;
@@ -480,9 +484,47 @@ impl WireGuardTunnelProvider {
     /// Everything between "a validated spec" and "a tunnel that has shaken
     /// hands": resolve the endpoint, start the stack, build the device, prove
     /// the peer answers. Resolution and the handshake share one deadline.
+    ///
+    /// An endpoint name that resolves to several addresses is tried in order,
+    /// each address given an even share of what is left, and a failure to
+    /// reach one moves on to the next. That never widens trust: every
+    /// address must complete a handshake with the configured peer key, and
+    /// nothing falls back to a direct connection.
     async fn bring_up(&self, deadline: tokio::time::Instant) -> Result<WgTunnel, TunnelError> {
         self.spec.validate()?;
 
+        let endpoints = self.resolve_endpoint(deadline).await?;
+        let count = endpoints.len();
+        let mut last = None;
+        for (index, endpoint) in endpoints.into_iter().enumerate() {
+            let attempt = tokio::time::Instant::now() + share_of(deadline, count - index);
+            match self.bring_up_at(endpoint, attempt).await {
+                Ok(tunnel) => return Ok(tunnel),
+                Err(error @ TunnelError::WireGuardConnect { .. }) if index + 1 < count => {
+                    tracing::debug!(
+                        proxy_config_id = self.spec.proxy_config_id.as_str(),
+                        endpoint = %endpoint,
+                        error = %error,
+                        "the WireGuard endpoint address did not answer; trying the next"
+                    );
+                    last = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| TunnelError::WireGuardConnect {
+            host: self.spec.endpoint_host.clone(),
+            port: self.spec.endpoint_port,
+            detail: "the endpoint name resolved to no addresses".to_string(),
+        }))
+    }
+
+    /// Bring the tunnel up against one endpoint address, by `deadline`.
+    async fn bring_up_at(
+        &self,
+        endpoint: SocketAddr,
+        deadline: tokio::time::Instant,
+    ) -> Result<WgTunnel, TunnelError> {
         let caller = tokio::runtime::Handle::try_current().map_err(|_| {
             TunnelError::Engine("a WireGuard tunnel needs a tokio runtime".to_string())
         })?;
@@ -495,8 +537,6 @@ impl WireGuardTunnelProvider {
         let runtime = worker
             .as_ref()
             .map_or(caller, |worker| worker.handle().clone());
-
-        let endpoint = self.resolve_endpoint(deadline).await?;
 
         // A carried tunnel binds its socket first: the link it lands on
         // decides how large this tunnel's packets may be. Binding may bring
@@ -711,14 +751,30 @@ impl WireGuardTunnelProvider {
     async fn resolve_endpoint(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<SocketAddr, TunnelError> {
+    ) -> Result<Vec<SocketAddr>, TunnelError> {
         let host = self.spec.endpoint_host.trim().to_string();
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         if let Ok(address) = bare.parse::<IpAddr>() {
-            return Ok(SocketAddr::new(address, self.spec.endpoint_port));
+            return Ok(vec![SocketAddr::new(address, self.spec.endpoint_port)]);
         }
 
         let port = self.spec.endpoint_port;
+        let endpoints = |addresses: Vec<IpAddr>| {
+            let endpoints: Vec<SocketAddr> = addresses
+                .into_iter()
+                .take(MAX_ENDPOINT_ADDRESSES)
+                .map(|address| SocketAddr::new(address, port))
+                .collect();
+            if endpoints.is_empty() {
+                Err(TunnelError::WireGuardConnect {
+                    host: host.clone(),
+                    port,
+                    detail: "the endpoint name resolved to no addresses".to_string(),
+                })
+            } else {
+                Ok(endpoints)
+            }
+        };
         if let Some(transport) = &self.datagram {
             // Asked of the carrier, which may have to come up first and
             // bounds that and the lookup by its own timeouts.
@@ -732,19 +788,11 @@ impl WireGuardTunnelProvider {
                     detail,
                 }
             })?;
-            return addresses
-                .into_iter()
-                .next()
-                .map(|address| SocketAddr::new(address, port))
-                .ok_or_else(|| TunnelError::WireGuardConnect {
-                    host: host.clone(),
-                    port,
-                    detail: "the endpoint name resolved to no addresses".to_string(),
-                });
+            return endpoints(addresses);
         }
         let Some(resolver) = &self.endpoint_resolver else {
             return Err(TunnelError::WireGuardConnect {
-                host,
+                host: host.clone(),
                 port,
                 detail: "the endpoint is a name and no resolver was given for it".to_string(),
             });
@@ -763,15 +811,7 @@ impl WireGuardTunnelProvider {
             detail: format!("the endpoint name could not be resolved: {error}"),
         })?;
 
-        addresses
-            .into_iter()
-            .next()
-            .map(|address| SocketAddr::new(address, port))
-            .ok_or_else(|| TunnelError::WireGuardConnect {
-                host: host.clone(),
-                port,
-                detail: "the endpoint name resolved to no addresses".to_string(),
-            })
+        endpoints(addresses)
     }
 
     /// One dial attempt on a tunnel that is already up, done by `deadline`.

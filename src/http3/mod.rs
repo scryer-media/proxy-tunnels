@@ -254,21 +254,25 @@ impl Http3TunnelProvider {
                 return Err(self.connect_error("HTTP/3 dial deadline exceeded"));
             }
             let attempt_deadline = now + remaining / (addresses.len() - index) as u32;
-            let socket = self
-                .udp_factory
-                .bind(address)
-                .map_err(|_| self.connect_error("could not bind QUIC UDP socket"))?;
+            // A socket this host cannot open for one address (no IPv6 route,
+            // say) is that address's failure, not the proxy's: try the next.
+            let Ok(socket) = self.udp_factory.bind(address) else {
+                last = self.connect_error("could not bind QUIC UDP socket");
+                continue;
+            };
             let source = socket
                 .local_addr()
                 .ok()
                 .filter(|addr| !addr.ip().is_unspecified());
-            let endpoint = quinn::Endpoint::new(
+            let Ok(endpoint) = quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
                 None,
                 socket,
                 Arc::new(quinn::TokioRuntime),
-            )
-            .map_err(|_| self.connect_error("could not create QUIC endpoint"))?;
+            ) else {
+                last = self.connect_error("could not create QUIC endpoint");
+                continue;
+            };
             let connecting = endpoint
                 .connect_with(self.config.clone(), address, host)
                 .map_err(|_| self.connect_error("invalid QUIC endpoint configuration"))?;
