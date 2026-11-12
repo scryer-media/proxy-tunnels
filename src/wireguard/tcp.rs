@@ -22,7 +22,7 @@ use smoltcp::wire::IpEndpoint;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::TunnelError;
-use crate::wireguard::stack::{MAX_LISTEN_BACKLOG, StackInner, StackShared};
+use crate::wireguard::stack::{MAX_LISTEN_BACKLOG, StackInner, StackShared, TcpBuffers};
 
 /// A TCP connection to something on the far side of the tunnel.
 pub struct WgTcpStream {
@@ -47,6 +47,15 @@ impl WgTcpStream {
         })
     }
 
+    /// The receive and send buffers' capacities.
+    #[cfg(test)]
+    pub(crate) fn buffer_capacities(&self) -> (usize, usize) {
+        self.shared.peek_stack(|stack| {
+            let socket = stack.sockets_mut().get_mut::<tcp::Socket>(self.handle);
+            (socket.recv_capacity(), socket.send_capacity())
+        })
+    }
+
     /// The socket's TCP state and the bytes not yet acknowledged by the peer.
     #[cfg(test)]
     pub(crate) fn socket_state(&self) -> (tcp::State, usize) {
@@ -67,7 +76,8 @@ impl WgTcpStream {
         });
     }
 
-    /// Dial `remote` and wait for the connection to establish.
+    /// Dial `remote` and wait for the connection to establish, on a socket
+    /// holding `buffers`, or the stack's default sizes.
     ///
     /// The caller has already claimed a socket slot; on any failure the socket
     /// is removed immediately rather than retired, because a connection that
@@ -76,10 +86,11 @@ impl WgTcpStream {
         shared: Arc<StackShared>,
         remote: SocketAddr,
         timeout: Duration,
+        buffers: Option<TcpBuffers>,
     ) -> Result<WgTcpStream, TunnelError> {
         let endpoint = IpEndpoint::from(remote);
         let (handle, started) = shared.with_stack(|stack| {
-            let handle = stack.add_tcp_socket();
+            let handle = stack.add_tcp_socket(buffers);
             let local_port = stack.next_ephemeral_port();
             let (sockets, context) = stack.socket_and_context();
             let started = sockets
@@ -410,12 +421,16 @@ pub struct WgTcpListener {
     listening: Vec<SocketHandle>,
     /// How many sockets the pool keeps listening while the tunnel has room.
     backlog: usize,
+    /// The buffers every socket in the pool holds, or `None` for the
+    /// stack's default sizes.
+    buffers: Option<TcpBuffers>,
 }
 
 impl WgTcpListener {
     /// Listen on `port` (`0` for a free ephemeral one) on every tunnel
     /// address with `backlog` sockets, held between 1 and
-    /// [`MAX_LISTEN_BACKLOG`]. The listener reports `address` and the port.
+    /// [`MAX_LISTEN_BACKLOG`], each holding `buffers` or the stack's default
+    /// sizes. The listener reports `address` and the port.
     ///
     /// Every socket's slot is claimed before any socket exists, so a backlog
     /// the tunnel cannot hold fails whole and allocates nothing. The port is
@@ -426,6 +441,7 @@ impl WgTcpListener {
         address: IpAddr,
         port: u16,
         backlog: usize,
+        buffers: Option<TcpBuffers>,
     ) -> Result<Self, TunnelError> {
         if shared.is_stopped() {
             return Err(stopped());
@@ -441,7 +457,7 @@ impl WgTcpListener {
             let port = stack.take_listen_port(port)?;
             let mut listening = Vec::with_capacity(backlog);
             for _ in 0..backlog {
-                match listen_on(stack, port) {
+                match listen_on(stack, port, buffers) {
                     Ok(handle) => listening.push(handle),
                     Err(error) => {
                         for handle in listening {
@@ -462,17 +478,22 @@ impl WgTcpListener {
             local: SocketAddr::new(address, port),
             listening,
             backlog,
+            buffers,
         })
     }
 
     /// Bring the pool back to its backlog, as far as the tunnel has room.
     fn refill(&mut self) {
         let port = self.local.port();
+        let buffers = self.buffers;
         while self.listening.len() < self.backlog {
             let Ok(slot) = self.shared.claim_socket() else {
                 return;
             };
-            match self.shared.with_stack(|stack| listen_on(stack, port)) {
+            match self
+                .shared
+                .with_stack(|stack| listen_on(stack, port, buffers))
+            {
                 Ok(handle) => {
                     slot.keep();
                     self.listening.push(handle);
@@ -581,9 +602,14 @@ fn stopped() -> TunnelError {
     TunnelError::Engine("the tunnel has stopped".to_string())
 }
 
-/// Add one socket listening on `port`.
-fn listen_on(stack: &mut StackInner, port: u16) -> Result<SocketHandle, TunnelError> {
-    let handle = stack.add_tcp_socket();
+/// Add one socket listening on `port`, holding `buffers` or the stack's
+/// default sizes.
+fn listen_on(
+    stack: &mut StackInner,
+    port: u16,
+    buffers: Option<TcpBuffers>,
+) -> Result<SocketHandle, TunnelError> {
+    let handle = stack.add_tcp_socket(buffers);
     match stack
         .sockets_mut()
         .get_mut::<tcp::Socket>(handle)

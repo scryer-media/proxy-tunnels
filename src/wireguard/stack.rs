@@ -103,6 +103,81 @@ pub const MAX_LISTEN_BACKLOG: usize = 64;
 /// consumers open several.
 const TCP_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Send and receive buffer per TCP socket, each way, on a tunnel built with
+/// download tuning: the most a socket may hold, [`MAX_TCP_BUFFER_BYTES`].
+const TUNED_TCP_BUFFER_BYTES: usize = MAX_TCP_BUFFER_BYTES;
+
+/// The smallest receive or send buffer a TCP socket may be given.
+///
+/// Below this a buffer holds only a handful of full-sized segments, and a
+/// receive window that small keeps even a short round trip from being
+/// filled.
+pub const MIN_TCP_BUFFER_BYTES: usize = 16 * 1024;
+
+/// The largest receive or send buffer a TCP socket may be given: what a
+/// download-tuned tunnel gives every socket.
+///
+/// Holding asked sizes to this keeps the memory bound the socket cap gives
+/// a tunnel: no socket ever holds more than a tuned tunnel's sockets do.
+pub const MAX_TCP_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// The receive and send buffer sizes of one TCP socket inside a tunnel.
+///
+/// The receive buffer is the window the far side may fill before it waits,
+/// and its size sets the window scale the socket advertises when it
+/// connects. The send buffer is how much the socket holds that the far
+/// side has not acknowledged yet. A connection that mostly downloads wants
+/// the first, one that mostly uploads the second.
+///
+/// Both are held between [`MIN_TCP_BUFFER_BYTES`] and
+/// [`MAX_TCP_BUFFER_BYTES`]: they are caller input, and a socket's buffers
+/// are memory the tunnel holds for as long as the socket lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TcpBuffers {
+    receive: usize,
+    send: usize,
+}
+
+impl TcpBuffers {
+    /// `receive` and `send` bytes, each held to its bounds.
+    pub const fn new(receive: usize, send: usize) -> Self {
+        Self {
+            receive: clamp_buffer(receive),
+            send: clamp_buffer(send),
+        }
+    }
+
+    /// The receive buffer, in bytes.
+    pub const fn receive(&self) -> usize {
+        self.receive
+    }
+
+    /// The send buffer, in bytes.
+    pub const fn send(&self) -> usize {
+        self.send
+    }
+
+    /// What every socket on a stack gets unless it asks for other sizes.
+    fn default_for(download_tuning: bool) -> Self {
+        let bytes = if download_tuning {
+            TUNED_TCP_BUFFER_BYTES
+        } else {
+            TCP_BUFFER_BYTES
+        };
+        Self::new(bytes, bytes)
+    }
+}
+
+const fn clamp_buffer(bytes: usize) -> usize {
+    if bytes < MIN_TCP_BUFFER_BYTES {
+        MIN_TCP_BUFFER_BYTES
+    } else if bytes > MAX_TCP_BUFFER_BYTES {
+        MAX_TCP_BUFFER_BYTES
+    } else {
+        bytes
+    }
+}
+
 /// How many engine passes' worth of datagrams a socket carrying another
 /// tunnel receives.
 ///
@@ -272,7 +347,7 @@ impl StackShared {
     pub(crate) fn claim_socket(&self) -> Result<SocketSlot<'_>, TunnelError> {
         let cap = self.config.max_sockets;
         if self.open_sockets.open.load(Ordering::SeqCst) >= cap {
-            self.with_stack(|inner| inner.reclaim_finished(inner.now(), true));
+            self.with_stack(|inner| inner.reclaim(inner.now()));
         }
         let claimed =
             self.open_sockets
@@ -404,7 +479,8 @@ pub(crate) struct StackInner {
     next_port: u16,
     closing: Vec<Closing>,
     open_sockets: Arc<SocketSlots>,
-    tcp_buffer_bytes: usize,
+    /// What a TCP socket that asks for no sizes of its own gets.
+    tcp_buffers: TcpBuffers,
     /// The ports listeners on this stack hold, each for as long as its
     /// listener lives, whether or not a socket is listening on it now.
     listen_ports: HashSet<u16>,
@@ -429,10 +505,12 @@ impl StackInner {
         (&mut self.sockets, self.iface.context())
     }
 
-    pub(crate) fn add_tcp_socket(&mut self) -> SocketHandle {
+    /// A TCP socket with `buffers`, or with the stack's default sizes.
+    pub(crate) fn add_tcp_socket(&mut self, buffers: Option<TcpBuffers>) -> SocketHandle {
+        let buffers = buffers.unwrap_or(self.tcp_buffers);
         let socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; self.tcp_buffer_bytes]),
-            tcp::SocketBuffer::new(vec![0u8; self.tcp_buffer_bytes]),
+            tcp::SocketBuffer::new(vec![0u8; buffers.receive()]),
+            tcp::SocketBuffer::new(vec![0u8; buffers.send()]),
         );
         self.sockets.add(socket)
     }
@@ -564,12 +642,21 @@ impl StackInner {
         }
     }
 
-    /// Free the slots of sockets that finished closing.
+    /// Free the slots, and the buffers, of sockets that finished closing.
+    ///
+    /// A retired socket in TIME-WAIT has finished: both FINs were sent and
+    /// acknowledged, every byte either way was delivered, and nobody reads
+    /// the socket any more. Holding it for smoltcp's ten seconds of
+    /// TIME-WAIT would keep both its buffers for nothing. Removing it only
+    /// changes the answer to a FIN the far side sends again because our last
+    /// acknowledgement was lost: a reset instead of a second acknowledgement,
+    /// for a connection the far side has already seen complete. A dialled
+    /// socket's four-tuple does not come back soon enough to meet the old
+    /// connection's late segments, because a stack reuses a port only after
+    /// every other one in the ephemeral range. Every other closing state
+    /// still has something to deliver and keeps its socket until it finishes
+    /// or its [`LINGER`] runs out.
     fn reclaim(&mut self, now: Instant) {
-        self.reclaim_finished(now, false);
-    }
-
-    fn reclaim_finished(&mut self, now: Instant, under_pressure: bool) {
         let mut index = 0;
         while index < self.closing.len() {
             let Closing {
@@ -578,11 +665,7 @@ impl StackInner {
                 counted,
             } = self.closing[index];
             let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-            // Retired TIME-WAIT sockets have no payload or FIN awaiting ACK.
-            // Preserve their linger normally, but do not block new downloads
-            // solely on those buffers. Other closing states stay charged.
-            let finished = socket.state() == tcp::State::Closed
-                || (under_pressure && socket.state() == tcp::State::TimeWait);
+            let finished = matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait);
             if !finished && now < deadline {
                 index += 1;
                 continue;
@@ -712,11 +795,7 @@ impl WgStack {
         let open_sockets = Arc::new(SocketSlots::default());
         let shared = Arc::new(StackShared {
             inner: Mutex::new(StackInner {
-                tcp_buffer_bytes: if config.download_tuning {
-                    1024 * 1024
-                } else {
-                    TCP_BUFFER_BYTES
-                },
+                tcp_buffers: TcpBuffers::default_for(config.download_tuning),
                 iface,
                 sockets,
                 phy,
@@ -749,8 +828,29 @@ impl WgStack {
         remote: SocketAddr,
         timeout: Duration,
     ) -> Result<WgTcpStream, TunnelError> {
+        self.connect_sized(remote, timeout, None).await
+    }
+
+    /// Open a TCP connection to `remote` through the tunnel, its socket
+    /// holding `buffers` instead of the stack's default sizes.
+    pub async fn connect_with(
+        &self,
+        remote: SocketAddr,
+        timeout: Duration,
+        buffers: TcpBuffers,
+    ) -> Result<WgTcpStream, TunnelError> {
+        self.connect_sized(remote, timeout, Some(buffers)).await
+    }
+
+    pub(crate) async fn connect_sized(
+        &self,
+        remote: SocketAddr,
+        timeout: Duration,
+        buffers: Option<TcpBuffers>,
+    ) -> Result<WgTcpStream, TunnelError> {
         let slot = self.shared.claim_socket()?;
-        let stream = WgTcpStream::connect(Arc::clone(&self.shared), remote, timeout).await?;
+        let stream =
+            WgTcpStream::connect(Arc::clone(&self.shared), remote, timeout, buffers).await?;
         slot.keep();
         Ok(stream)
     }
@@ -768,6 +868,26 @@ impl WgStack {
     /// so a backlog the tunnel has no room for fails with
     /// [`TunnelError::AtCapacity`] and listens on nothing.
     pub fn listen(&self, port: u16, backlog: usize) -> Result<WgTcpListener, TunnelError> {
+        self.listen_sized(port, backlog, None)
+    }
+
+    /// Like [`Self::listen`], every listening socket, and so every connection
+    /// it accepts, holding `buffers` instead of the stack's default sizes.
+    pub fn listen_with(
+        &self,
+        port: u16,
+        backlog: usize,
+        buffers: TcpBuffers,
+    ) -> Result<WgTcpListener, TunnelError> {
+        self.listen_sized(port, backlog, Some(buffers))
+    }
+
+    pub(crate) fn listen_sized(
+        &self,
+        port: u16,
+        backlog: usize,
+        buffers: Option<TcpBuffers>,
+    ) -> Result<WgTcpListener, TunnelError> {
         let address = self
             .shared
             .config()
@@ -775,7 +895,7 @@ impl WgStack {
             .first()
             .map(|cidr| cidr.address)
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-        WgTcpListener::bind(Arc::clone(&self.shared), address, port, backlog)
+        WgTcpListener::bind(Arc::clone(&self.shared), address, port, backlog, buffers)
     }
 
     /// Whether a listener on this stack holds `port`.
@@ -1365,7 +1485,7 @@ mod resource_tests {
         for _ in 0..DEFAULT_MAX_SOCKETS {
             let slot = shared.claim_socket().unwrap();
             shared.with_stack(|inner| {
-                let handle = inner.add_tcp_socket();
+                let handle = inner.add_tcp_socket(None);
                 let port = inner.next_ephemeral_port();
                 let (sockets, context) = inner.socket_and_context();
                 sockets
@@ -1728,7 +1848,39 @@ mod link_tests {
     struct Pair {
         near: WgStack,
         far: WgStack,
+        /// Every SYN that crossed the wire, in order.
+        syns: Arc<std::sync::Mutex<Vec<Syn>>>,
         tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    /// What a SYN, or a SYN-ACK, told the far side about its sender's
+    /// receive window.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Syn {
+        source_port: u16,
+        acknowledges: bool,
+        window: u16,
+        window_scale: Option<u8>,
+    }
+
+    fn syn_in(packet: &[u8]) -> Option<Syn> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{Ipv4Packet, TcpControl, TcpPacket, TcpRepr};
+        let ip = Ipv4Packet::new_checked(packet).ok()?;
+        let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+        let repr = TcpRepr::parse(
+            &tcp,
+            &ip.src_addr().into(),
+            &ip.dst_addr().into(),
+            &ChecksumCapabilities::ignored(),
+        )
+        .ok()?;
+        (repr.control == TcpControl::Syn).then_some(Syn {
+            source_port: repr.src_port,
+            acknowledges: repr.ack_number.is_some(),
+            window: repr.window_len,
+            window_scale: repr.window_scale,
+        })
     }
 
     impl Drop for Pair {
@@ -1776,13 +1928,20 @@ mod link_tests {
             Arc::new(Notify::new()),
             &runtime,
         );
+        let syns = Arc::new(std::sync::Mutex::new(Vec::new()));
         let wire = |mut from: crate::wireguard::adapter::StackToDevice,
                     mut to: crate::wireguard::adapter::DeviceToStack| {
+            let syns = Arc::clone(&syns);
             tokio::spawn(async move {
                 let mut pool = PacketBufPool::new(1);
                 while let Ok(packets) = from.recv(&mut pool).await {
                     let packets: Vec<_> = packets.collect();
                     for packet in packets {
+                        let bytes: gotatun::packet::Packet = packet.into();
+                        if let Some(syn) = syn_in(&bytes[..]) {
+                            syns.lock().unwrap().push(syn);
+                        }
+                        let packet = bytes.try_into_ip().expect("an IP packet");
                         if to.send(packet).await.is_err() {
                             return;
                         }
@@ -1799,6 +1958,7 @@ mod link_tests {
             ],
             near,
             far,
+            syns,
         }
     }
 
@@ -2090,6 +2250,189 @@ mod link_tests {
             "a full buffer is ready at once: {read:?}"
         );
         assert_eq!(buffer.filled().len(), 0);
+    }
+
+    const KIB: usize = 1024;
+    const FAR: SocketAddr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 9, 0, 2)),
+        PORT,
+    );
+    // Far above any run; the test runner bounds the test.
+    const FOREVER: Duration = Duration::from_secs(3600);
+
+    fn syn_from(pair: &Pair, port: u16, acknowledges: bool) -> Syn {
+        let syns = pair.syns.lock().unwrap();
+        *syns
+            .iter()
+            .find(|syn| syn.source_port == port && syn.acknowledges == acknowledges)
+            .expect("the SYN crossed the wire")
+    }
+
+    /// A dial and a listener that ask for nothing hold the stack's default
+    /// sizes, and their handshake offers what a tuned socket always offered:
+    /// a full 16-bit window, with a shift of 5.
+    #[tokio::test]
+    async fn a_default_dial_keeps_the_stacks_sizes_and_window_scale() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let accepted = accepted.unwrap();
+        assert_eq!(dialled.buffer_capacities(), (1024 * KIB, 1024 * KIB));
+        assert_eq!(accepted.buffer_capacities(), (1024 * KIB, 1024 * KIB));
+
+        let dial_syn = syn_from(&pair, accepted.peer_addr().port(), false);
+        assert_eq!(
+            (dial_syn.window, dial_syn.window_scale),
+            (u16::MAX, Some(5))
+        );
+        let answer = syn_from(&pair, PORT, true);
+        assert_eq!((answer.window, answer.window_scale), (u16::MAX, Some(5)));
+    }
+
+    /// A sized dial and a sized listener hold exactly the sizes they asked
+    /// for, the listener's idle sockets included, and each handshake offers
+    /// the window scale of its own receive buffer: what a stack built with
+    /// that buffer as its default offers.
+    #[tokio::test]
+    async fn a_sized_dial_and_listener_hold_their_sizes_and_scale_to_them() {
+        let pair = pair();
+        let listened = TcpBuffers::new(128 * KIB, 512 * KIB);
+        let mut listener = pair.far.listen_with(PORT, 2, listened).unwrap();
+        pair.far.shared.peek_stack(|inner| {
+            for (_, socket) in inner.sockets.iter() {
+                if let smoltcp::socket::Socket::Tcp(socket) = socket {
+                    assert!(socket.is_listening());
+                    assert_eq!(
+                        (socket.recv_capacity(), socket.send_capacity()),
+                        (128 * KIB, 512 * KIB)
+                    );
+                }
+            }
+        });
+        let dialled_with = TcpBuffers::new(256 * KIB, 64 * KIB);
+        let (accepted, dialled) = tokio::join!(
+            listener.accept(),
+            pair.near.connect_with(FAR, FOREVER, dialled_with)
+        );
+        let (accepted, dialled) = (accepted.unwrap(), dialled.unwrap());
+        assert_eq!(dialled.buffer_capacities(), (256 * KIB, 64 * KIB));
+        assert_eq!(accepted.buffer_capacities(), (128 * KIB, 512 * KIB));
+
+        // smoltcp shifts by the bits a capacity takes past 16: 1 MiB takes
+        // 21 bits, so 5; 256 KiB takes 19, so 3; 128 KiB takes 18, so 2.
+        let dial_syn = syn_from(&pair, accepted.peer_addr().port(), false);
+        assert_eq!(
+            (dial_syn.window, dial_syn.window_scale),
+            (u16::MAX, Some(3))
+        );
+        let answer = syn_from(&pair, PORT, true);
+        assert_eq!((answer.window, answer.window_scale), (u16::MAX, Some(2)));
+    }
+
+    /// Sizes outside the bounds are held to them; sizes inside are kept.
+    #[test]
+    fn asked_sizes_are_held_to_their_bounds() {
+        let low = TcpBuffers::new(0, 1);
+        assert_eq!(
+            (low.receive(), low.send()),
+            (MIN_TCP_BUFFER_BYTES, MIN_TCP_BUFFER_BYTES)
+        );
+        let high = TcpBuffers::new(usize::MAX, MAX_TCP_BUFFER_BYTES + 1);
+        assert_eq!(
+            (high.receive(), high.send()),
+            (MAX_TCP_BUFFER_BYTES, MAX_TCP_BUFFER_BYTES)
+        );
+        let edges = TcpBuffers::new(MIN_TCP_BUFFER_BYTES, MAX_TCP_BUFFER_BYTES);
+        assert_eq!(
+            (edges.receive(), edges.send()),
+            (MIN_TCP_BUFFER_BYTES, MAX_TCP_BUFFER_BYTES)
+        );
+        let inside = TcpBuffers::new(200 * KIB + 3, 64 * KIB);
+        assert_eq!((inside.receive(), inside.send()), (200 * KIB + 3, 64 * KIB));
+    }
+
+    /// Sized sockets carry a body each way at once, every byte in order, and
+    /// a receiver that stops reading is sent its whole receive buffer before
+    /// the sender waits: the window it offered is all of the buffer.
+    #[tokio::test]
+    async fn sized_sockets_move_every_byte_both_ways_and_use_their_whole_window() {
+        let pair = pair();
+        let mut listener = pair
+            .far
+            .listen_with(PORT, 1, TcpBuffers::new(192 * KIB, 96 * KIB))
+            .unwrap();
+        let down = pattern(3 * 1024 * KIB + 11);
+        let up: Vec<u8> = pattern(2 * 1024 * KIB + 7).into_iter().rev().collect();
+        let (sent_down, expected_up) = (down.clone(), up.clone());
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            let send = async {
+                writer.write_all(&sent_down).await.unwrap();
+                writer.shutdown().await.unwrap();
+            };
+            let mut received = Vec::new();
+            let receive = reader.read_to_end(&mut received);
+            let ((), read) = tokio::join!(send, receive);
+            read.unwrap();
+            assert!(received == expected_up, "every byte up, in order");
+        });
+        let stream = pair
+            .near
+            .connect_with(FAR, FOREVER, TcpBuffers::new(160 * KIB, 48 * KIB))
+            .await
+            .unwrap();
+        loop {
+            let (queued, capacity) = stream.receive_buffer();
+            assert_eq!(capacity, 160 * KIB);
+            if capacity - queued < 1420 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let send = async {
+            writer.write_all(&up).await.unwrap();
+            writer.shutdown().await.unwrap();
+        };
+        let mut received = Vec::new();
+        let receive = reader.read_to_end(&mut received);
+        let ((), read) = tokio::join!(send, receive);
+        read.unwrap();
+        assert!(received == down, "every byte down, in order");
+        server.await.unwrap();
+    }
+
+    /// A socket that closed first and reached TIME-WAIT has delivered every
+    /// byte both ways. Once its stream is dropped, its buffers and its slot
+    /// are given back at the next reclaim, not after TIME-WAIT's wait.
+    #[tokio::test]
+    async fn a_finished_socket_gives_its_buffers_back_without_waiting_out_time_wait() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, mut dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let mut accepted = accepted.unwrap();
+        drop(listener);
+        let sockets_before = socket_count(&pair.near);
+
+        dialled.write_all(b"the last request").await.unwrap();
+        dialled.shutdown().await.unwrap();
+        let mut request = Vec::new();
+        accepted.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"the last request");
+        accepted.shutdown().await.unwrap();
+        while dialled.socket_state().0 != tcp::State::TimeWait {
+            tokio::task::yield_now().await;
+        }
+
+        drop(dialled);
+        pair.near.shared.with_stack(|inner| {
+            inner.reclaim(inner.now());
+            assert!(inner.closing.is_empty(), "nothing left to linger");
+        });
+        assert_eq!(socket_count(&pair.near), sockets_before - 1);
+        assert_eq!(open_slots(&pair.near), 0);
+        drop(accepted);
     }
 
     #[test]

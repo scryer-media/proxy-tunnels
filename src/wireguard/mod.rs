@@ -93,7 +93,8 @@ pub use spec::{
     validate_wireguard_keys,
 };
 pub use stack::{
-    DEFAULT_MAX_SOCKETS, MAX_LISTEN_BACKLOG, MAX_MAX_SOCKETS, MIN_MAX_SOCKETS, WgStack, socket_cap,
+    DEFAULT_MAX_SOCKETS, MAX_LISTEN_BACKLOG, MAX_MAX_SOCKETS, MAX_TCP_BUFFER_BYTES,
+    MIN_MAX_SOCKETS, MIN_TCP_BUFFER_BYTES, TcpBuffers, WgStack, socket_cap,
 };
 pub use tcp::{WgTcpListener, WgTcpStream};
 pub use udp::WgUdpSocket;
@@ -373,6 +374,37 @@ impl WireGuardTunnelProvider {
     /// listening listens again, on the new tunnel.
     pub async fn listen(&self, port: u16, backlog: usize) -> Result<WgTcpListener, TunnelError> {
         self.tunnel().await?.stack.listen(port, backlog)
+    }
+
+    /// Like [`Self::listen`], every connection the listener accepts holding
+    /// `buffers` instead of the tunnel's default sizes. The sizes apply to
+    /// this tunnel's own stack, where the listener's sockets live, however
+    /// many tunnels carry it.
+    pub async fn listen_with(
+        &self,
+        port: u16,
+        backlog: usize,
+        buffers: TcpBuffers,
+    ) -> Result<WgTcpListener, TunnelError> {
+        self.tunnel()
+            .await?
+            .stack
+            .listen_with(port, backlog, buffers)
+    }
+
+    /// Like [`TunnelProvider::dial`], the connection's socket holding
+    /// `buffers` instead of the tunnel's default sizes.
+    ///
+    /// The socket lives on this tunnel's own stack, so the sizes apply there
+    /// however many tunnels carry this one; a tunnel beneath only carries its
+    /// datagrams.
+    pub async fn dial_with(
+        &self,
+        host: &str,
+        port: u16,
+        buffers: TcpBuffers,
+    ) -> Result<WgTcpStream, TunnelError> {
+        self.dial_sized(host, port, Some(buffers)).await
     }
 
     /// Whether the tunnel that is current now is alive and a listener inside
@@ -816,6 +848,69 @@ impl WireGuardTunnelProvider {
         endpoints(addresses)
     }
 
+    /// A dial whose socket holds `buffers`, or the tunnel's default sizes
+    /// when `None`.
+    async fn dial_sized(
+        &self,
+        host: &str,
+        port: u16,
+        buffers: Option<TcpBuffers>,
+    ) -> Result<WgTcpStream, TunnelError> {
+        let tunnel = self.tunnel().await.inspect_err(|error| {
+            self.observer
+                .tunnel_dial_failed(&self.spec.proxy_config_id, &error.to_string());
+        })?;
+
+        // One deadline covers the whole dial: resolution, every address, and
+        // the rebuild and second attempt when there is one. A tunnel whose
+        // peer shook hands moments ago is provably up, so a silence on it is
+        // the destination's and is never retried; any other tunnel keeps
+        // half the budget back for a rebuild and a second attempt.
+        let deadline = self.request_deadline();
+        let recently_shaken =
+            matches!(tunnel.last_handshake_age(), Some(age) if age < RECENT_HANDSHAKE);
+        let first_deadline = if recently_shaken {
+            deadline
+        } else {
+            tokio::time::Instant::now() + self.spec.request_timeout / 2
+        };
+        let outcome = match self
+            .dial_on(&tunnel, host, port, first_deadline, buffers)
+            .await
+        {
+            Ok(stream) => Ok(stream),
+            Err(DialFailure::Destination(error)) => Err(error),
+            Err(DialFailure::Tunnel(first)) if recently_shaken => Err(first),
+            Err(DialFailure::Tunnel(first)) => {
+                tracing::debug!(
+                    proxy_config_id = self.spec.proxy_config_id.as_str(),
+                    error = %first,
+                    "the WireGuard tunnel answered nothing; bringing it up again once"
+                );
+                match self.replace_tunnel(&tunnel, deadline).await {
+                    Ok(tunnel) => self
+                        .dial_on(&tunnel, host, port, deadline, buffers)
+                        .await
+                        .map_err(DialFailure::into_error),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+
+        match outcome {
+            Ok(stream) => {
+                self.observer
+                    .tunnel_dial_succeeded(&self.spec.proxy_config_id);
+                Ok(stream)
+            }
+            Err(error) => {
+                self.observer
+                    .tunnel_dial_failed(&self.spec.proxy_config_id, &error.to_string());
+                Err(error)
+            }
+        }
+    }
+
     /// One dial attempt on a tunnel that is already up, done by `deadline`.
     ///
     /// Resolution and every address share that deadline. Each address gets
@@ -827,7 +922,8 @@ impl WireGuardTunnelProvider {
         host: &str,
         port: u16,
         deadline: tokio::time::Instant,
-    ) -> Result<Box<dyn TunnelStream>, DialFailure> {
+        buffers: Option<TcpBuffers>,
+    ) -> Result<WgTcpStream, DialFailure> {
         let out_of_time = || TunnelError::Dial {
             host: host.to_string(),
             port,
@@ -853,10 +949,10 @@ impl WireGuardTunnelProvider {
             }
             match tunnel
                 .stack
-                .connect(SocketAddr::new(address, port), share)
+                .connect_sized(SocketAddr::new(address, port), share, buffers)
                 .await
             {
-                Ok(stream) => return Ok(Box::new(stream) as Box<dyn TunnelStream>),
+                Ok(stream) => return Ok(stream),
                 Err(error) => last = Some(error),
             }
         }
@@ -949,56 +1045,9 @@ impl TunnelProvider for WireGuardTunnelProvider {
     }
 
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        let tunnel = self.tunnel().await.inspect_err(|error| {
-            self.observer
-                .tunnel_dial_failed(&self.spec.proxy_config_id, &error.to_string());
-        })?;
-
-        // One deadline covers the whole dial: resolution, every address, and
-        // the rebuild and second attempt when there is one. A tunnel whose
-        // peer shook hands moments ago is provably up, so a silence on it is
-        // the destination's and is never retried; any other tunnel keeps
-        // half the budget back for a rebuild and a second attempt.
-        let deadline = self.request_deadline();
-        let recently_shaken =
-            matches!(tunnel.last_handshake_age(), Some(age) if age < RECENT_HANDSHAKE);
-        let first_deadline = if recently_shaken {
-            deadline
-        } else {
-            tokio::time::Instant::now() + self.spec.request_timeout / 2
-        };
-        let outcome = match self.dial_on(&tunnel, host, port, first_deadline).await {
-            Ok(stream) => Ok(stream),
-            Err(DialFailure::Destination(error)) => Err(error),
-            Err(DialFailure::Tunnel(first)) if recently_shaken => Err(first),
-            Err(DialFailure::Tunnel(first)) => {
-                tracing::debug!(
-                    proxy_config_id = self.spec.proxy_config_id.as_str(),
-                    error = %first,
-                    "the WireGuard tunnel answered nothing; bringing it up again once"
-                );
-                match self.replace_tunnel(&tunnel, deadline).await {
-                    Ok(tunnel) => self
-                        .dial_on(&tunnel, host, port, deadline)
-                        .await
-                        .map_err(DialFailure::into_error),
-                    Err(error) => Err(error),
-                }
-            }
-        };
-
-        match outcome {
-            Ok(stream) => {
-                self.observer
-                    .tunnel_dial_succeeded(&self.spec.proxy_config_id);
-                Ok(stream)
-            }
-            Err(error) => {
-                self.observer
-                    .tunnel_dial_failed(&self.spec.proxy_config_id, &error.to_string());
-                Err(error)
-            }
-        }
+        self.dial_sized(host, port, None)
+            .await
+            .map(|stream| Box::new(stream) as Box<dyn TunnelStream>)
     }
 
     fn describe(&self) -> String {

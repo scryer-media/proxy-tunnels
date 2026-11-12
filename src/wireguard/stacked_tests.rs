@@ -239,6 +239,37 @@ async fn a_tunnel_inside_a_tunnel_carries_bytes_both_ways() {
     outer.shutdown().await;
 }
 
+/// A sized dial through a tunnel carried inside another holds its sizes on
+/// the carried tunnel's stack, where its socket lives, and carries the
+/// whole body. The tunnel beneath carries only datagrams and holds no TCP
+/// socket of the dial's.
+#[tokio::test]
+async fn a_sized_dial_inside_a_tunnel_holds_its_sizes_on_the_carried_tunnel() {
+    let body = large_body();
+    let peers = Stacked::start(body.clone()).await;
+    let outer = peers.outer_provider(Arc::new(NoopTunnelObserver));
+    let inner = peers.inner_provider(&outer);
+    let buffers = crate::wireguard::TcpBuffers::new(96 * 1024, 32 * 1024);
+
+    let mut stream = inner
+        .dial_with("origin.tunnel.test", TEST_PEER_HTTP_PORT, buffers)
+        .await
+        .expect("a dial through both tunnels");
+    assert_eq!(stream.buffer_capacities(), (96 * 1024, 32 * 1024));
+    stream
+        .write_all(b"GET /stacked HTTP/1.1\r\nHost: origin.tunnel.test\r\n\r\n")
+        .await
+        .expect("request");
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).await.expect("response");
+    let response = String::from_utf8_lossy(&answer);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:.80}");
+    assert!(response.ends_with(&body), "the whole body must arrive");
+    drop(stream);
+    inner.shutdown().await;
+    outer.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_carried_tunnel_leaves_room_for_the_carriers_headers() {
     let peers = Stacked::start("small".to_string()).await;
