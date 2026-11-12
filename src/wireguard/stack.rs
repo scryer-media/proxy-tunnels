@@ -82,6 +82,18 @@ pub fn socket_cap(asked: usize) -> usize {
     asked.clamp(MIN_MAX_SOCKETS, MAX_MAX_SOCKETS)
 }
 
+/// The most sockets one listener keeps listening at once; a larger backlog
+/// asked of [`WgStack::listen`] is held to this, as `listen(2)` holds one to
+/// `SOMAXCONN`.
+///
+/// Each listening socket owns a full pair of TCP buffers and one of the
+/// tunnel's socket slots, so the backlog is memory taken from the cap before
+/// any connection arrives. 64 is a quarter of [`DEFAULT_MAX_SOCKETS`]: a
+/// listener on a default tunnel always leaves three quarters of it for dials
+/// and accepted connections, and 64 sockets still take a burst of handshakes
+/// that arrive together.
+pub const MAX_LISTEN_BACKLOG: usize = 64;
+
 /// Send and receive buffer per TCP socket, each way.
 ///
 /// 64 KiB is the largest window a receiver can advertise without window
@@ -261,6 +273,11 @@ impl StackShared {
 
     pub(crate) fn release_socket(&self) {
         self.open_sockets.release();
+    }
+
+    /// Rung each time a socket slot frees.
+    pub(crate) fn slot_freed(&self) -> Arc<Notify> {
+        self.open_sockets.freed.notify()
     }
 
     /// Whether the pump has stopped, so no packet will ever move again.
@@ -688,6 +705,11 @@ impl WgStack {
     /// of sockets listen on one port (that is how the backlog works), so a
     /// port another listener on this stack already holds is refused here
     /// rather than silently shared.
+    ///
+    /// `backlog` is how many sockets listen at once, held between 1 and
+    /// [`MAX_LISTEN_BACKLOG`]. Each takes one of the tunnel's socket slots,
+    /// so a backlog the tunnel has no room for fails with
+    /// [`TunnelError::AtCapacity`] and listens on nothing.
     pub fn listen(&self, port: u16, backlog: usize) -> Result<WgTcpListener, TunnelError> {
         let port = if port == 0 {
             self.free_listen_port()?
@@ -1494,6 +1516,80 @@ mod resource_tests {
         assert!(stack.shared.claim_socket().is_ok());
     }
 
+    /// A stack with no engine and no resolver, capped at `max_sockets`.
+    fn capped_engine_stack(max_sockets: usize) -> WgStack {
+        WgStack::build_for_engine(StackConfig {
+            addresses: vec!["10.0.0.1/24".parse().unwrap()],
+            dns_servers: Vec::new(),
+            mtu: 1280,
+            proxy_config_id: "listen-cap-test".into(),
+            download_tuning: false,
+            max_sockets,
+        })
+    }
+
+    fn open_slots(stack: &WgStack) -> usize {
+        stack.shared.open_sockets.open.load(Ordering::SeqCst)
+    }
+
+    fn socket_count(stack: &WgStack) -> usize {
+        stack
+            .shared
+            .peek_stack(|inner| inner.sockets.iter().count())
+    }
+
+    /// A listener's sockets are charged to the tunnel's cap: a backlog the
+    /// cap cannot hold fails as a full tunnel and creates no socket, however
+    /// large it is, and one that fits holds a slot per listening socket.
+    #[test]
+    fn a_listeners_backlog_is_charged_to_the_socket_cap() {
+        let stack = capped_engine_stack(MIN_MAX_SOCKETS);
+        for backlog in [MIN_MAX_SOCKETS + 1, 100, usize::MAX] {
+            let refused = stack.listen(7000, backlog);
+            assert!(
+                matches!(
+                    refused,
+                    Err(TunnelError::AtCapacity {
+                        open: MIN_MAX_SOCKETS,
+                        ..
+                    })
+                ),
+                "a backlog of {backlog} does not fit a cap of {MIN_MAX_SOCKETS}"
+            );
+            assert_eq!(socket_count(&stack), 0, "backlog {backlog}");
+            assert_eq!(open_slots(&stack), 0, "backlog {backlog}");
+        }
+
+        let listener = stack.listen(7000, 4).unwrap();
+        assert_eq!((open_slots(&stack), socket_count(&stack)), (4, 4));
+        // The other twelve slots are what dials and other listeners share.
+        let rest = stack.listen(7001, MIN_MAX_SOCKETS - 4).unwrap();
+        assert_eq!(open_slots(&stack), MIN_MAX_SOCKETS);
+        assert!(matches!(
+            stack.shared.claim_socket(),
+            Err(TunnelError::AtCapacity { .. })
+        ));
+        drop((listener, rest));
+        assert_eq!((open_slots(&stack), socket_count(&stack)), (0, 0));
+    }
+
+    /// A backlog past [`MAX_LISTEN_BACKLOG`] is held to it, and the 16 a
+    /// consumer typically asks for fits a default tunnel.
+    #[test]
+    fn a_listeners_backlog_is_held_to_its_bound() {
+        let stack = capped_engine_stack(DEFAULT_MAX_SOCKETS);
+        let typical = stack.listen(7000, 16).unwrap();
+        assert_eq!((open_slots(&stack), socket_count(&stack)), (16, 16));
+        let large = stack.listen(7001, 4 * MAX_LISTEN_BACKLOG).unwrap();
+        assert_eq!(open_slots(&stack), 16 + MAX_LISTEN_BACKLOG);
+        assert_eq!(socket_count(&stack), 16 + MAX_LISTEN_BACKLOG);
+        drop(large);
+        let none = stack.listen(7001, 0).unwrap();
+        assert_eq!(open_slots(&stack), 17, "a backlog of 0 still listens");
+        drop((typical, none));
+        assert_eq!((open_slots(&stack), socket_count(&stack)), (0, 0));
+    }
+
     /// What one poll of a stack holding `count` idle established TCP
     /// connections costs, on this machine. Two stacks are wired back to back,
     /// one dials the other `count` times, and once every connection is up the
@@ -1585,6 +1681,11 @@ mod link_tests {
     }
 
     fn pair() -> Pair {
+        pair_with_far_cap(DEFAULT_MAX_SOCKETS)
+    }
+
+    /// Two stacks back to back, the far one capped at `far_cap` sockets.
+    fn pair_with_far_cap(far_cap: usize) -> Pair {
         let runtime = tokio::runtime::Handle::current();
         let (near_in, near_out, near_inbound, near_outbound) = ip_channels(1420);
         let (far_in, far_out, far_inbound, far_outbound) = ip_channels(1420);
@@ -1596,7 +1697,10 @@ mod link_tests {
             &runtime,
         );
         let (far, far_pump) = WgStack::start(
-            config("10.9.0.2/24"),
+            StackConfig {
+                max_sockets: far_cap,
+                ..config("10.9.0.2/24")
+            },
             far_inbound,
             far_outbound,
             Arc::new(Notify::new()),
@@ -1791,6 +1895,105 @@ mod link_tests {
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
         let again = stream.read(&mut more).await.expect_err("still reset");
         assert_eq!(again.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    fn open_slots(stack: &WgStack) -> usize {
+        stack.shared.open_sockets.open.load(Ordering::SeqCst)
+    }
+
+    fn socket_count(stack: &WgStack) -> usize {
+        stack
+            .shared
+            .peek_stack(|inner| inner.sockets.iter().count())
+    }
+
+    fn listening_count(stack: &WgStack) -> usize {
+        stack.shared.peek_stack(|inner| {
+            inner
+                .sockets
+                .iter()
+                .filter(|(_, socket)| match socket {
+                    smoltcp::socket::Socket::Tcp(socket) => socket.is_listening(),
+                    _ => false,
+                })
+                .count()
+        })
+    }
+
+    async fn dial(pair: &Pair) -> WgTcpStream {
+        pair.near
+            .connect(
+                SocketAddr::from(([10, 9, 0, 2], PORT)),
+                // Far above any run; the test runner bounds the test.
+                Duration::from_secs(3600),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// An accepted connection takes over the slot its listening socket held,
+    /// and the listener puts a fresh listening socket, with a slot of its
+    /// own, in its place: one slot per socket, none counted twice.
+    #[tokio::test]
+    async fn an_accepted_stream_holds_one_slot_and_its_listener_is_refilled() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 16).unwrap();
+        assert_eq!((open_slots(&pair.far), socket_count(&pair.far)), (16, 16));
+
+        let (accepted, dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let accepted = accepted.unwrap();
+        assert_eq!(open_slots(&pair.far), 17);
+        assert_eq!(socket_count(&pair.far), 17);
+        assert_eq!(listening_count(&pair.far), 16);
+
+        drop(listener);
+        assert_eq!((open_slots(&pair.far), socket_count(&pair.far)), (1, 1));
+        drop((accepted, dialled));
+    }
+
+    /// On a full tunnel the listener hands out what it accepted and runs
+    /// short rather than go past the cap; once a slot frees, a waiting accept
+    /// takes it, listens again and accepts the next connection.
+    #[tokio::test]
+    async fn a_listener_on_a_full_tunnel_runs_short_and_refills_when_a_slot_frees() {
+        let pair = pair_with_far_cap(MIN_MAX_SOCKETS);
+        let mut listener = pair.far.listen(PORT, MIN_MAX_SOCKETS).unwrap();
+        assert_eq!(open_slots(&pair.far), MIN_MAX_SOCKETS);
+
+        let mut far_streams = Vec::new();
+        let mut near_streams = Vec::new();
+        for _ in 0..MIN_MAX_SOCKETS {
+            let (accepted, dialled) = tokio::join!(listener.accept(), dial(&pair));
+            far_streams.push(accepted.unwrap());
+            near_streams.push(dialled);
+        }
+        assert_eq!(open_slots(&pair.far), MIN_MAX_SOCKETS);
+        assert_eq!(socket_count(&pair.far), MIN_MAX_SOCKETS);
+        assert_eq!(listening_count(&pair.far), 0);
+
+        let waiting = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            (listener, accepted)
+        });
+
+        // Free one slot: the near side closes first, so the far socket
+        // finishes in LAST-ACK and closes for good.
+        let far = far_streams.pop().unwrap();
+        drop(near_streams.pop());
+        while far.socket_state().0 != tcp::State::CloseWait {
+            tokio::task::yield_now().await;
+        }
+        drop(far);
+
+        while listening_count(&pair.far) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(open_slots(&pair.far), MIN_MAX_SOCKETS);
+        let dialled = dial(&pair).await;
+        let (_listener, accepted) = waiting.await.unwrap();
+        let accepted = accepted.unwrap();
+        assert_eq!(open_slots(&pair.far), MIN_MAX_SOCKETS);
+        drop((accepted, dialled));
     }
 
     #[test]
