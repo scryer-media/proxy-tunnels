@@ -65,6 +65,14 @@ pub(crate) struct BoundSocket {
     /// The address the socket is connected to, or `None` while it sends and
     /// receives with explicit addresses.
     connected: std::sync::Mutex<Option<std::net::SocketAddr>>,
+    /// Whether runs of equal-sized datagrams still go out as one segmented
+    /// (GSO) send. Cleared for good the first time the kernel refuses one.
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    segmented: std::sync::atomic::AtomicBool,
 }
 
 impl BoundSocket {
@@ -81,6 +89,12 @@ impl BoundSocket {
         Self {
             socket,
             connected: std::sync::Mutex::new(connected),
+            #[cfg(all(
+                target_os = "linux",
+                target_pointer_width = "64",
+                target_endian = "little"
+            ))]
+            segmented: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -193,7 +207,8 @@ impl BoundSocket {
 
     /// Send a leading run of `packets` without waiting; how many were sent.
     ///
-    /// The run of packets bound for one address goes out in one `sendmmsg`.
+    /// The run of packets bound for one address goes out in one `sendmmsg`,
+    /// with each stretch of equal-sized packets as one segmented message.
     /// `sendmmsg` fails only when its first message fails; a refusal there
     /// is that one packet lost, which [`Self::send_many`] counts and steps
     /// past, so no packet is sent twice. A failure on a later message ends
@@ -223,7 +238,7 @@ impl BoundSocket {
             .map(|(packet, _)| &packet[..])
             .collect();
         self.socket.try_io(tokio::io::Interest::WRITABLE, || {
-            mmsg::send(&self.socket, &datagrams)
+            mmsg::send(&self.socket, &datagrams, &self.segmented)
         })
     }
 
@@ -587,35 +602,147 @@ mod mmsg {
         }
     }
 
+    const SOL_UDP: c_int = 17;
+    const UDP_SEGMENT: c_int = 103;
+    /// The most segments one segmented send may carry on every kernel that
+    /// supports it.
+    const MAX_SEGMENTS: usize = 64;
+    /// The most payload one UDP datagram, and so one segmented send, holds.
+    const MAX_SEGMENTED_BYTES: usize = 65_507;
+
+    /// A control message naming the segment size of a segmented send.
+    #[repr(C, align(8))]
+    #[derive(Clone, Copy)]
+    struct SegmentSize {
+        len: usize,
+        level: c_int,
+        kind: c_int,
+        size: u16,
+        _padding: [u8; 6],
+    }
+
+    const _: () = assert!(std::mem::size_of::<SegmentSize>() == 24);
+
+    /// The length of a [`SegmentSize`] up to the end of its data.
+    const SEGMENT_SIZE_LEN: usize = 16 + std::mem::size_of::<u16>();
+
+    /// Split the leading datagrams into runs one segmented send can carry,
+    /// writing each run's length to `runs`; returns how many runs. Every
+    /// datagram of a run but the last has the run's first length and the
+    /// last is no longer, as the kernel cuts a segmented send into pieces of
+    /// that first length.
+    pub(super) fn segment_runs(datagrams: &[&[u8]], runs: &mut [usize]) -> usize {
+        let mut count = 0;
+        let mut index = 0;
+        while index < datagrams.len() && count < runs.len() {
+            let size = datagrams[index].len();
+            let mut run = 1;
+            let mut bytes = size;
+            while index + run < datagrams.len()
+                && run < MAX_SEGMENTS
+                && size > 0
+                && datagrams[index + run - 1].len() == size
+                && datagrams[index + run].len() <= size
+                && bytes + datagrams[index + run].len() <= MAX_SEGMENTED_BYTES
+            {
+                bytes += datagrams[index + run].len();
+                run += 1;
+            }
+            runs[count] = run;
+            count += 1;
+            index += run;
+        }
+        count
+    }
+
     /// Send `datagrams` (at most [`BOUND_BATCH`]) to the connected peer;
     /// returns how many left.
+    ///
+    /// While `segmented` holds, each run of equal-sized datagrams is one
+    /// message the kernel segments (UDP GSO), so the run crosses the network
+    /// stack once rather than once per datagram. The first time the kernel
+    /// refuses a segmented message (no support for it, or a segment larger
+    /// than the route allows) `segmented` is cleared and the send repeated
+    /// with one message per datagram.
     pub(super) fn send(
         socket: &tokio::net::UdpSocket,
         datagrams: &[&[u8]],
+        segmented: &std::sync::atomic::AtomicBool,
     ) -> std::io::Result<usize> {
+        use std::sync::atomic::Ordering;
+
         let count = datagrams.len().min(BOUND_BATCH);
-        let mut iovs: Vec<Iovec> = datagrams[..count]
-            .iter()
-            .map(|datagram| Iovec {
+        let datagrams = &datagrams[..count];
+        let mut iovs: [Iovec; BOUND_BATCH] = std::array::from_fn(|_| Iovec {
+            base: std::ptr::null_mut(),
+            len: 0,
+        });
+        for (iov, datagram) in iovs.iter_mut().zip(datagrams) {
+            *iov = Iovec {
                 base: datagram.as_ptr().cast_mut().cast(),
                 len: datagram.len(),
-            })
-            .collect();
-        let mut headers: Vec<Mmsghdr> = iovs.iter_mut().map(|iov| header(iov)).collect();
-        // SAFETY: every header points at one live iovec, and every iovec at
-        // a live datagram that the kernel only reads; `count` headers exist.
+            };
+        }
+        let mut runs = [1usize; BOUND_BATCH];
+        let mut controls = [SegmentSize {
+            len: SEGMENT_SIZE_LEN,
+            level: SOL_UDP,
+            kind: UDP_SEGMENT,
+            size: 0,
+            _padding: [0; 6],
+        }; BOUND_BATCH];
+        let first = iovs.as_mut_ptr();
+        let mut headers: [Mmsghdr; BOUND_BATCH] =
+            std::array::from_fn(|index| header(first.wrapping_add(index)));
+
+        let segment = segmented.load(Ordering::Relaxed);
+        let messages = if segment {
+            let messages = segment_runs(datagrams, &mut runs);
+            let mut start = 0;
+            for index in 0..messages {
+                let header = &mut headers[index].hdr;
+                header.iov = first.wrapping_add(start);
+                header.iovlen = runs[index];
+                if runs[index] > 1 {
+                    controls[index].size = datagrams[start].len() as u16;
+                    header.control = (&raw mut controls[index]).cast();
+                    header.controllen = std::mem::size_of::<SegmentSize>();
+                }
+                start += runs[index];
+            }
+            messages
+        } else {
+            count
+        };
+        // SAFETY: each of the first `messages` headers points at a run of
+        // live iovecs inside `iovs`, and at most at one live control message
+        // in `controls`; every iovec points at a live datagram that the
+        // kernel only reads.
         let sent = unsafe {
             sendmmsg(
                 socket.as_raw_fd(),
                 headers.as_mut_ptr(),
-                count as c_uint,
+                messages as c_uint,
                 MSG_DONTWAIT,
             )
         };
         if sent < 0 {
-            return Err(std::io::Error::last_os_error());
+            let error = std::io::Error::last_os_error();
+            // EIO, EINVAL, ENOPROTOOPT and EOPNOTSUPP: the kernel or the
+            // route cannot segment this message.
+            if segment && runs[0] > 1 && matches!(error.raw_os_error(), Some(5 | 22 | 92 | 95)) {
+                tracing::debug!(%error, "the tunnel UDP socket sends unsegmented from now on");
+                segmented.store(false, Ordering::Relaxed);
+                return send(socket, datagrams, segmented);
+            }
+            return Err(error);
         }
-        Ok(sent as usize)
+        let sent = sent as usize;
+        Ok(if segment {
+            runs[..sent].iter().sum()
+        } else {
+            sent
+        })
     }
 
     /// Receive up to `buffers.len()` (at most [`BOUND_BATCH`]) datagrams from
@@ -1084,6 +1211,61 @@ mod tests {
         for index in 0..COUNT as u32 {
             assert_eq!(received(&peer).0, index.to_be_bytes());
         }
+    }
+
+    #[tokio::test]
+    async fn a_batch_send_of_mixed_sizes_delivers_each_datagram_whole_and_in_order() {
+        // Runs of equal sizes, a shorter datagram closing a run, a longer one
+        // opening the next, and a run longer than one segmented send holds.
+        let mut sizes = vec![1200, 1200, 1200, 700, 1300, 1300, 64, 64, 1452];
+        sizes.extend(std::iter::repeat_n(1000, 70));
+        sizes.extend([999, 1000, 1]);
+        let peer = loopback();
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(1 << 22)
+            .unwrap();
+        let socket = bound_to(peer.local_addr().unwrap());
+        let pool = PacketBufPool::new(sizes.len());
+        let mut packets: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, &size)| {
+                let body: Vec<u8> = (0..size).map(|at| (index + at) as u8).collect();
+                (packet(&pool, &body), peer.local_addr().unwrap())
+            })
+            .collect();
+        socket.send_many(&mut packets).await.unwrap();
+        assert!(packets.is_empty());
+        for (index, &size) in sizes.iter().enumerate() {
+            let body: Vec<u8> = (0..size).map(|at| (index + at) as u8).collect();
+            assert_eq!(received(&peer).0, body, "datagram {index}");
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    #[test]
+    fn segment_runs_end_at_a_shorter_datagram_a_longer_one_or_the_limits() {
+        let runs_of = |sizes: &[usize]| {
+            let bodies: Vec<Vec<u8>> = sizes.iter().map(|&size| vec![0; size]).collect();
+            let datagrams: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+            let mut runs = [0; BOUND_BATCH];
+            let count = mmsg::segment_runs(&datagrams, &mut runs);
+            runs[..count].to_vec()
+        };
+        assert_eq!(runs_of(&[]), Vec::<usize>::new());
+        assert_eq!(runs_of(&[100]), vec![1]);
+        assert_eq!(runs_of(&[100, 100, 100]), vec![3]);
+        assert_eq!(runs_of(&[100, 100, 50, 100]), vec![3, 1]);
+        assert_eq!(runs_of(&[100, 200, 200]), vec![1, 2]);
+        assert_eq!(runs_of(&[100, 50, 50]), vec![2, 1]);
+        // Sixty-four segments at most.
+        assert_eq!(runs_of(&[10; 64 + 3]), vec![64, 3]);
+        // No more than one datagram's worth of bytes: 65,507 / 1,452 is 45.
+        assert_eq!(runs_of(&[1452; 50]), vec![45, 5]);
     }
 
     #[tokio::test]
