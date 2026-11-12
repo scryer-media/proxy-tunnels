@@ -65,8 +65,8 @@ pub use socks5::Socks5Credentials;
 pub use ssh::{SshTunnelProvider, TunnelHandshake, validate_private_key};
 pub use wireguard::{
     DEFAULT_MAX_SOCKETS, DEFAULT_WIREGUARD_KEEPALIVE, DEFAULT_WIREGUARD_MTU, IpCidr,
-    MAX_MAX_SOCKETS, MAX_WIREGUARD_MTU, MIN_CARRIED_MTU, MIN_MAX_SOCKETS, MIN_WIREGUARD_MTU,
-    WIREGUARD_DATA_OVERHEAD, WIREGUARD_KEY_MESSAGE, WgStack, WgTcpListener, WgTcpStream,
-    WgUdpSocket, WireGuardHandshake, WireGuardSpec, WireGuardTunnelProvider, carried_mtu,
-    parse_key, public_key_of, validate_wireguard_keys,
+    MAX_LISTEN_BACKLOG, MAX_MAX_SOCKETS, MAX_WIREGUARD_MTU, MIN_CARRIED_MTU, MIN_MAX_SOCKETS,
+    MIN_WIREGUARD_MTU, WIREGUARD_DATA_OVERHEAD, WIREGUARD_KEY_MESSAGE, WgStack, WgTcpListener,
+    WgTcpStream, WgUdpSocket, WireGuardHandshake, WireGuardSpec, WireGuardTunnelProvider,
+    carried_mtu, parse_key, public_key_of, validate_wireguard_keys,
 };
