@@ -137,11 +137,15 @@ impl BoundSocket {
     }
 
     async fn send_to(&self, packet: &[u8], target: std::net::SocketAddr) -> std::io::Result<()> {
+        let mut refused = false;
         loop {
             match self.try_send_one(packet, target) {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     self.socket.writable().await?;
                 }
+                // See `is_peer_refusal`: the refusal was an earlier
+                // datagram's, and this one has not left yet.
+                Err(error) if is_peer_refusal(&error) && !refused => refused = true,
                 Err(error) if is_peer_refusal(&error) => return Ok(()),
                 result => return result,
             }
@@ -154,7 +158,8 @@ impl BoundSocket {
     /// written until it would block, and only then does the task wait for
     /// room. A refusal reported by the far side's host (an ICMP port
     /// unreachable surfacing on a connected socket) is packet loss, not a
-    /// broken socket, so the datagram is counted as sent and the rest go on.
+    /// broken socket: the refused datagram is tried once more, and refused
+    /// again it is counted as sent and the rest go on.
     async fn send_many(
         &self,
         packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
@@ -173,6 +178,8 @@ impl BoundSocket {
         ) -> std::io::Result<usize>,
     ) -> std::io::Result<()> {
         let mut sent = 0;
+        // The packet the last refusal fell on, which is tried once more.
+        let mut refused = None;
         let result = loop {
             if sent == packets.len() {
                 break Ok(());
@@ -183,6 +190,9 @@ impl BoundSocket {
                     if let Err(error) = self.socket.writable().await {
                         break Err(error);
                     }
+                }
+                Err(error) if is_peer_refusal(&error) && refused != Some(sent) => {
+                    refused = Some(sent);
                 }
                 Err(error) if is_peer_refusal(&error) => sent += 1,
                 Err(error) => break Err(error),
@@ -490,6 +500,13 @@ pub(crate) struct RecvBatch {
 /// Whether `error` is the far side's host refusing a datagram: an ICMP
 /// unreachable that a connected socket reports on a later call. That is one
 /// lost datagram, not a broken socket.
+///
+/// On a send the refusal is an earlier datagram's: the datagram the send
+/// carried did not leave, so a refused send is tried once more. After the
+/// socket turns to a new peer, the old peer's refusal can still land on the
+/// first send to the new one (macOS reports a refusal whose ICMP it matched
+/// before the reconnect), and without the second try that datagram, the
+/// first for the new peer, would be lost.
 fn is_peer_refusal(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -500,8 +517,9 @@ fn is_peer_refusal(error: &std::io::Error) -> bool {
 /// Send a leading run of `packets` one at a time with `send_one`; how many
 /// were dealt with.
 ///
-/// A refusal counts its packet as dealt with (lost) and the run goes on with
-/// the next, so a later call never sends it again. Any other error ends the
+/// A refused packet is tried once more (see [`is_peer_refusal`]); refused
+/// again, it counts as dealt with (lost) and the run goes on with the next,
+/// so a later call never sends it again. Any other error ends the
 /// run: it is returned when nothing was sent, and otherwise left for the
 /// next call to meet on its first packet.
 #[cfg(any(
@@ -518,7 +536,11 @@ fn send_each(
 ) -> std::io::Result<usize> {
     let mut sent = 0;
     for (packet, target) in packets {
-        match send_one(packet, *target) {
+        let result = match send_one(packet, *target) {
+            Err(error) if is_peer_refusal(&error) => send_one(packet, *target),
+            result => result,
+        };
+        match result {
             Ok(()) => sent += 1,
             Err(error) if is_peer_refusal(&error) => sent += 1,
             Err(error) if sent > 0 => {
@@ -1319,7 +1341,71 @@ mod tests {
             .await
             .unwrap();
         assert!(packets.is_empty());
-        assert_eq!(attempts, vec![0, 1, 2, 3, 4, 5], "each packet tried once");
+        assert_eq!(
+            attempts,
+            vec![0, 1, 2, 2, 3, 4, 5],
+            "the refused packet is tried once more, every other packet once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_earned_by_an_earlier_datagram_does_not_lose_this_one() {
+        // A refusal reports an earlier datagram's fate: the packet whose send
+        // met it has not left, and goes on the second try.
+        let peer = loopback().local_addr().unwrap();
+        let socket = bound_to(peer);
+        let pool = PacketBufPool::new(8);
+        let mut packets: Vec<_> = (0..4u8)
+            .map(|index| (packet(&pool, &[index]), peer))
+            .collect();
+        let mut pending_refusal = true;
+        let mut delivered: Vec<u8> = Vec::new();
+        socket
+            .send_many_with(&mut packets, |run| {
+                send_each(run, |datagram, _| {
+                    if datagram[0] == 1 && pending_refusal {
+                        pending_refusal = false;
+                        return Err(std::io::ErrorKind::ConnectionRefused.into());
+                    }
+                    delivered.push(datagram[0]);
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(packets.is_empty());
+        assert_eq!(delivered, vec![0, 1, 2, 3], "each packet delivered once");
+    }
+
+    #[tokio::test]
+    async fn a_batch_send_refused_on_its_first_packet_tries_that_packet_once_more() {
+        // The segmented send reports a refusal for the run's first packet;
+        // the next call starts at that packet again, and only a second
+        // refusal counts it lost.
+        let peer = loopback().local_addr().unwrap();
+        let socket = bound_to(peer);
+        let pool = PacketBufPool::new(8);
+        let mut packets: Vec<_> = (0..3u8)
+            .map(|index| (packet(&pool, &[index]), peer))
+            .collect();
+        let mut calls: Vec<u8> = Vec::new();
+        socket
+            .send_many_with(&mut packets, |run| {
+                calls.push(run[0].0[0]);
+                if calls.len() <= 3 {
+                    Err(std::io::ErrorKind::ConnectionRefused.into())
+                } else {
+                    Ok(run.len())
+                }
+            })
+            .await
+            .unwrap();
+        assert!(packets.is_empty());
+        assert_eq!(
+            calls,
+            vec![0, 0, 1, 1],
+            "packet 0 refused twice is lost, packet 1 refused once goes on its second try"
+        );
     }
 
     #[tokio::test]
