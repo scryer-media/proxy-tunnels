@@ -572,6 +572,7 @@ impl WireGuardTunnelProvider {
             allowed: allowed_networks(&self.spec),
             mtu,
             probe: Box::new(move || handshake_probe(&probe_spec)),
+            own_thread: worker.is_some(),
         };
         let status = Arc::new(engine::EngineStatus::default());
         let shutdown = Arc::new(Notify::new());

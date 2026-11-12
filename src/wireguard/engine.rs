@@ -57,6 +57,46 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100;
 /// socket read beyond it.
 const RECEIVE_BUFFERS: usize = PACKET_QUEUE_DEPTH + 64;
 
+/// How long a pass may wait, on a busy link, for more datagrams to join the
+/// few it read.
+///
+/// A real link hands datagrams over spaced out, one or two per read, and
+/// every pass costs a wake of the engine, a stack poll, an ACK and a wake of
+/// each reader it fed, whatever it carries. Holding a short read this long
+/// gathers the link's next datagrams into the same pass. Measured on a paced
+/// 25 MB/s link with a 40 ms round trip, one tunnel's download then costs
+/// well under half the CPU per gigabyte, at the same speed.
+///
+/// The cost is that delay on the datagrams held: the first of a pass waits
+/// the whole hold, the last none. It is paid only where it is small next to
+/// the round trip ([`HOLD_ROUND_TRIP_SHARE`]), and it adds up over nested
+/// tunnels, each of which holds. A hold of 1 ms (which tokio's millisecond
+/// timer made nearly 2 ms) slowed three nested tunnels by a quarter at
+/// 100 MB/s; 500 µs cost three nested tunnels resends at 25 MB/s; this one
+/// cost neither.
+const RECEIVE_HOLD: Duration = Duration::from_micros(350);
+
+/// A pass holds a read only when [`RECEIVE_HOLD`] is at most this share of
+/// the tunnel's round trip (1/20, 5%), as the last handshake measured it. A
+/// connection whose window, not the link, limits it slows by about that
+/// share at worst; one the link limits does not slow at all. Over a short
+/// round trip (loopback, a LAN) the engine never holds.
+const HOLD_ROUND_TRIP_SHARE: u32 = 20;
+
+/// A read of at least this many datagrams is already a burst, and is never
+/// held.
+const HOLD_BELOW: usize = 8;
+
+/// A pass holds a read only when the link has lately brought at least this
+/// many datagrams per [`RECEIVE_HOLD`]. A hold that gathers fewer costs more
+/// than the passes it saves: measured on a paced 10 MB/s upload, whose ACKs
+/// come about one per hold, holding cost a quarter more CPU per gigabyte.
+const HOLD_GATHERS: u128 = 2;
+
+/// How long the link's arrival rate is counted over before it is judged
+/// again.
+const RATE_WINDOW: Duration = Duration::from_millis(4);
+
 /// What one tunnel's engine is built from.
 pub(crate) struct EngineConfig {
     pub(crate) private_key: StaticSecret,
@@ -74,6 +114,10 @@ pub(crate) struct EngineConfig {
     pub(crate) mtu: u16,
     /// Makes the packet whose sending starts a handshake.
     pub(crate) probe: Box<dyn Fn() -> Packet<Ip> + Send + Sync>,
+    /// Whether the engine runs on a thread of its own, which it may then
+    /// block for a [`RECEIVE_HOLD`]. An engine on the caller's runtime never
+    /// holds.
+    pub(crate) own_thread: bool,
 }
 
 /// What the rest of the tunnel can see of, and ask of, a running engine.
@@ -120,6 +164,10 @@ pub(crate) struct Engine {
     status: Arc<EngineStatus>,
     /// Scratch the socket reuses across batched sends.
     send_buf: <TunnelSocket as UdpSend>::SendManyBuf,
+    /// When the last handshake initiation went out, until its response.
+    initiated: Option<std::time::Instant>,
+    /// The round trip the last answered initiation measured.
+    round_trip: Option<Duration>,
 }
 
 impl Engine {
@@ -145,6 +193,16 @@ impl Engine {
             recv,
             status,
             send_buf: Default::default(),
+            initiated: None,
+            round_trip: None,
+        }
+    }
+
+    /// Note an outgoing handshake initiation, whose response measures the
+    /// round trip.
+    fn note_sent(&mut self, packet: &WgKind) {
+        if matches!(packet, WgKind::HandshakeInit(_)) {
+            self.initiated = Some(std::time::Instant::now());
         }
     }
 
@@ -162,6 +220,7 @@ impl Engine {
         let timer = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(timer);
         let mut next_tick = tokio::time::Instant::now() + TIMER_TICK;
+        let mut arrivals = ArrivalRate::new(tokio::time::Instant::now());
 
         self.initiate(&mut wire);
         loop {
@@ -208,6 +267,18 @@ impl Engine {
                 () = &mut timer => false,
                 () = tokio::task::yield_now(), if immediate => false,
             };
+            // A short read on a busy link waits a hold for the rest of the
+            // link's datagrams to queue behind it: see `RECEIVE_HOLD`. The
+            // hold blocks the thread, because tokio's timer counts whole
+            // milliseconds; the thread runs only this tunnel, and a shutdown
+            // waits at most one hold.
+            if received
+                && self.config.own_thread
+                && holds(datagrams.len(), self.round_trip)
+                && arrivals.busy(tokio::time::Instant::now())
+            {
+                std::thread::sleep(RECEIVE_HOLD);
+            }
             // Decrypt what was read, then read again: whatever arrived while
             // those were decrypted joins the same pass, up to what one pass
             // hands the stack. Each pass costs a stack poll, an ACK and a
@@ -237,6 +308,7 @@ impl Engine {
                     break;
                 }
             }
+            arrivals.note(taken, tokio::time::Instant::now());
         }
 
         let (dropped, overrun) = shared.peek_stack(|stack| stack.drop_counts());
@@ -259,7 +331,10 @@ impl Engine {
     /// and the expiry of old sessions.
     fn run_timers(&mut self, wire: &mut Vec<(Packet, SocketAddr)>) {
         match self.tunn.update_timers() {
-            Ok(Some(packet)) => wire.push((packet.into(), self.config.endpoint)),
+            Ok(Some(packet)) => {
+                self.note_sent(&packet);
+                wire.push((packet.into(), self.config.endpoint));
+            }
             Ok(None) | Err(WireGuardError::ConnectionExpired) => {}
             Err(error) => tracing::debug!(?error, "the tunnel's timers failed"),
         }
@@ -278,6 +353,7 @@ impl Engine {
             .tunn
             .handle_outgoing_packet(packet.into(), Some(&mut self.mtu))
         {
+            self.note_sent(&packet);
             wire.push((packet.into(), self.config.endpoint));
         }
     }
@@ -300,11 +376,15 @@ impl Engine {
             Err(_) => return,
         };
         let handshake = matches!(message, WgKind::HandshakeInit(_) | WgKind::HandshakeResp(_));
+        let response = matches!(message, WgKind::HandshakeResp(_));
         match self.tunn.handle_incoming_packet(message) {
             TunnResult::Done | TunnResult::Err(_) => {}
             TunnResult::WriteToNetwork(answer) => {
                 if handshake {
                     self.status.handshook();
+                }
+                if response && let Some(initiated) = self.initiated.take() {
+                    self.round_trip = Some(initiated.elapsed());
                 }
                 wire.push((answer.into(), source));
                 for queued in self.tunn.get_queued_packets(&mut self.mtu) {
@@ -369,6 +449,64 @@ fn fresh_tunn(
     )
 }
 
+/// Whether a pass that read `read` datagrams may wait [`RECEIVE_HOLD`] for
+/// more, over a tunnel whose last handshake took `round_trip`. Whether the
+/// link is busy enough is [`ArrivalRate::busy`].
+fn holds(read: usize, round_trip: Option<Duration>) -> bool {
+    read < HOLD_BELOW
+        && round_trip.is_some_and(|round_trip| round_trip >= RECEIVE_HOLD * HOLD_ROUND_TRIP_SHARE)
+}
+
+/// How fast datagrams have lately arrived, judged once per [`RATE_WINDOW`],
+/// and when they last did.
+struct ArrivalRate {
+    /// When the window being counted began.
+    since: tokio::time::Instant,
+    /// Datagrams taken in since then.
+    count: u128,
+    /// The last judgement.
+    busy: bool,
+    /// When the last pass that took datagrams in finished.
+    last: Option<tokio::time::Instant>,
+}
+
+impl ArrivalRate {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            since: now,
+            count: 0,
+            busy: false,
+            last: None,
+        }
+    }
+
+    /// Count in the `taken` datagrams of a pass that finished at `now`.
+    fn note(&mut self, taken: usize, now: tokio::time::Instant) {
+        if taken > 0 {
+            self.count += taken as u128;
+            self.last = Some(now);
+        }
+    }
+
+    /// Whether the link brought at least [`HOLD_GATHERS`] datagrams per
+    /// [`RECEIVE_HOLD`] over the last full window, and the pass before this
+    /// read took datagrams in less than a hold ago. A read after any pause,
+    /// such as the answer to a request or the start of a connection's next
+    /// window, is taken at once.
+    fn busy(&mut self, now: tokio::time::Instant) -> bool {
+        let elapsed = now.duration_since(self.since);
+        if elapsed >= RATE_WINDOW {
+            self.busy = self.count * RECEIVE_HOLD.as_nanos() >= HOLD_GATHERS * elapsed.as_nanos();
+            self.since = now;
+            self.count = 0;
+        }
+        self.busy
+            && self
+                .last
+                .is_some_and(|last| now.duration_since(last) <= RECEIVE_HOLD)
+    }
+}
+
 /// Poll `future` once, without waiting: its output if it is ready now.
 fn poll_now<F: Future>(future: F) -> Option<F::Output> {
     let mut future = std::pin::pin!(future);
@@ -376,5 +514,80 @@ fn poll_now<F: Future>(future: F) -> Option<F::Output> {
     match future.as_mut().poll(&mut context) {
         Poll::Ready(output) => Some(output),
         Poll::Pending => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FAR: Duration = Duration::from_millis(40);
+
+    /// A rate that has just judged a window in which `per_hold` datagrams
+    /// came per hold, at `now`.
+    fn judged(per_hold: u128, now: tokio::time::Instant) -> ArrivalRate {
+        let mut rate = ArrivalRate::new(now - RATE_WINDOW);
+        let came = (per_hold * RATE_WINDOW.as_nanos()).div_ceil(RECEIVE_HOLD.as_nanos());
+        rate.note(came as usize, now);
+        rate.busy(now);
+        rate
+    }
+
+    #[test]
+    fn a_short_read_on_a_far_link_may_be_held() {
+        assert!(holds(1, Some(FAR)));
+        assert!(holds(HOLD_BELOW - 1, Some(FAR)));
+    }
+
+    #[test]
+    fn a_burst_is_never_held() {
+        assert!(!holds(HOLD_BELOW, Some(FAR)));
+    }
+
+    #[test]
+    fn a_tunnel_with_a_short_or_unknown_round_trip_never_holds() {
+        let near = RECEIVE_HOLD * HOLD_ROUND_TRIP_SHARE - Duration::from_micros(1);
+        assert!(!holds(1, Some(near)));
+        assert!(!holds(1, None));
+        assert!(holds(1, Some(RECEIVE_HOLD * HOLD_ROUND_TRIP_SHARE)));
+    }
+
+    #[test]
+    fn a_link_that_fills_a_hold_is_busy() {
+        let now = tokio::time::Instant::now();
+        assert!(judged(HOLD_GATHERS, now).busy(now));
+        assert!(judged(HOLD_GATHERS * 10, now).busy(now));
+    }
+
+    #[test]
+    fn a_link_that_brings_less_than_a_hold_gathers_is_not_busy() {
+        let now = tokio::time::Instant::now();
+        assert!(!judged(HOLD_GATHERS - 1, now).busy(now));
+        assert!(!ArrivalRate::new(now).busy(now), "nothing counted yet");
+    }
+
+    #[test]
+    fn the_judgement_holds_until_the_window_closes() {
+        let now = tokio::time::Instant::now();
+        let mut rate = judged(HOLD_GATHERS, now);
+        let soon = now + RECEIVE_HOLD / 2;
+        rate.note(1, soon);
+        assert!(rate.busy(soon + RECEIVE_HOLD / 2), "within the window");
+        // A quiet window: the next read is taken at once.
+        assert!(!rate.busy(now + RATE_WINDOW * 3));
+    }
+
+    #[test]
+    fn a_read_after_a_pause_is_taken_at_once() {
+        let now = tokio::time::Instant::now();
+        let mut rate = judged(HOLD_GATHERS * 10, now);
+        assert!(
+            rate.busy(now + RECEIVE_HOLD),
+            "straight after the last pass"
+        );
+        assert!(
+            !rate.busy(now + RECEIVE_HOLD * 2),
+            "a pause of more than a hold"
+        );
     }
 }
