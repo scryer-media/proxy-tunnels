@@ -1,4 +1,7 @@
-//! The in-memory seam between gotatun and smoltcp.
+//! The in-memory seam between a gotatun `Device` and smoltcp.
+//!
+//! Tunnels drive gotatun's `Tunn` directly from the engine; this seam joins
+//! the in-process test peer's `Device` to its smoltcp stack.
 //!
 //! gotatun is written against a TUN device, expressed as the pair of traits
 //! [`IpSend`] (device → operating system) and [`IpRecv`] (operating system →
@@ -35,14 +38,7 @@ use gotatun::packet::{Ip, Packet, PacketBufPool};
 use gotatun::tun::{IpRecv, IpSend, MtuWatcher};
 use tokio::sync::mpsc;
 
-/// How many packets may be in flight in either direction before the producer
-/// feels back-pressure.
-///
-/// A tunnel is a link, and links have queues. This one is deliberately small:
-/// it is one bandwidth-delay product's worth of a slow link, which is enough
-/// that a burst is absorbed and small enough that a stalled reader turns into
-/// loss (which TCP handles) rather than unbounded memory (which it does not).
-pub(crate) const PACKET_QUEUE_DEPTH: usize = 512;
+pub(crate) use crate::wireguard::phy::PACKET_QUEUE_DEPTH;
 
 /// Build the two channels that join one smoltcp stack to one gotatun device.
 ///

@@ -65,6 +65,14 @@ pub(crate) struct BoundSocket {
     /// The address the socket is connected to, or `None` while it sends and
     /// receives with explicit addresses.
     connected: std::sync::Mutex<Option<std::net::SocketAddr>>,
+    /// Whether runs of equal-sized datagrams still go out as one segmented
+    /// (GSO) send. Cleared for good the first time the kernel refuses one.
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    segmented: std::sync::atomic::AtomicBool,
 }
 
 impl BoundSocket {
@@ -81,6 +89,12 @@ impl BoundSocket {
         Self {
             socket,
             connected: std::sync::Mutex::new(connected),
+            #[cfg(all(
+                target_os = "linux",
+                target_pointer_width = "64",
+                target_endian = "little"
+            ))]
+            segmented: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -123,11 +137,15 @@ impl BoundSocket {
     }
 
     async fn send_to(&self, packet: &[u8], target: std::net::SocketAddr) -> std::io::Result<()> {
+        let mut refused = false;
         loop {
             match self.try_send_one(packet, target) {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     self.socket.writable().await?;
                 }
+                // See `is_peer_refusal`: the refusal was an earlier
+                // datagram's, and this one has not left yet.
+                Err(error) if is_peer_refusal(&error) && !refused => refused = true,
                 Err(error) if is_peer_refusal(&error) => return Ok(()),
                 result => return result,
             }
@@ -140,7 +158,8 @@ impl BoundSocket {
     /// written until it would block, and only then does the task wait for
     /// room. A refusal reported by the far side's host (an ICMP port
     /// unreachable surfacing on a connected socket) is packet loss, not a
-    /// broken socket, so the datagram is counted as sent and the rest go on.
+    /// broken socket: the refused datagram is tried once more, and refused
+    /// again it is counted as sent and the rest go on.
     async fn send_many(
         &self,
         packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
@@ -159,6 +178,8 @@ impl BoundSocket {
         ) -> std::io::Result<usize>,
     ) -> std::io::Result<()> {
         let mut sent = 0;
+        // The packet the last refusal fell on, which is tried once more.
+        let mut refused = None;
         let result = loop {
             if sent == packets.len() {
                 break Ok(());
@@ -169,6 +190,9 @@ impl BoundSocket {
                     if let Err(error) = self.socket.writable().await {
                         break Err(error);
                     }
+                }
+                Err(error) if is_peer_refusal(&error) && refused != Some(sent) => {
+                    refused = Some(sent);
                 }
                 Err(error) if is_peer_refusal(&error) => sent += 1,
                 Err(error) => break Err(error),
@@ -193,7 +217,8 @@ impl BoundSocket {
 
     /// Send a leading run of `packets` without waiting; how many were sent.
     ///
-    /// The run of packets bound for one address goes out in one `sendmmsg`.
+    /// The run of packets bound for one address goes out in one `sendmmsg`,
+    /// with each stretch of equal-sized packets as one segmented message.
     /// `sendmmsg` fails only when its first message fails; a refusal there
     /// is that one packet lost, which [`Self::send_many`] counts and steps
     /// past, so no packet is sent twice. A failure on a later message ends
@@ -223,7 +248,7 @@ impl BoundSocket {
             .map(|(packet, _)| &packet[..])
             .collect();
         self.socket.try_io(tokio::io::Interest::WRITABLE, || {
-            mmsg::send(&self.socket, &datagrams)
+            mmsg::send(&self.socket, &datagrams, &self.segmented)
         })
     }
 
@@ -404,6 +429,58 @@ impl BoundSocket {
         packets.extend(spare.drain(..received).map(|packet| (packet, peer)));
         Ok(())
     }
+
+    /// Read what the socket holds now, up to [`BOUND_BATCH`] datagrams,
+    /// whatever readiness was last seen; `None` when this socket cannot.
+    ///
+    /// A read that found the queue empty cleared the readiness, and only the
+    /// runtime's next look at the socket raises it again, so datagrams that
+    /// land meanwhile wait for that look. This asks the kernel itself, with
+    /// one `recvmmsg`. Each datagram that arrives raises readiness again
+    /// whether or not this read takes it, so nothing is missed: at worst the
+    /// next wait returns at once and its read finds nothing.
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    fn recv_queued(
+        &self,
+        pool: &mut gotatun::packet::PacketBufPool,
+        spare: &mut Vec<gotatun::packet::Packet>,
+        packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
+    ) -> Option<std::io::Result<()>> {
+        let peer = self.connected()?;
+        while spare.len() < BOUND_BATCH {
+            spare.push(pool.get());
+        }
+        Some(match mmsg::recv(&self.socket, spare) {
+            Ok(received) => {
+                packets.extend(spare.drain(..received).map(|packet| (packet, peer)));
+                Ok(())
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock || is_peer_refusal(&error) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        })
+    }
+
+    #[cfg(not(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    )))]
+    fn recv_queued(
+        &self,
+        _pool: &mut gotatun::packet::PacketBufPool,
+        _spare: &mut Vec<gotatun::packet::Packet>,
+        _packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
+    ) -> Option<std::io::Result<()>> {
+        None
+    }
 }
 
 /// The receive side's own state, kept by the task that reads the socket from
@@ -423,6 +500,13 @@ pub(crate) struct RecvBatch {
 /// Whether `error` is the far side's host refusing a datagram: an ICMP
 /// unreachable that a connected socket reports on a later call. That is one
 /// lost datagram, not a broken socket.
+///
+/// On a send the refusal is an earlier datagram's: the datagram the send
+/// carried did not leave, so a refused send is tried once more. After the
+/// socket turns to a new peer, the old peer's refusal can still land on the
+/// first send to the new one (macOS reports a refusal whose ICMP it matched
+/// before the reconnect), and without the second try that datagram, the
+/// first for the new peer, would be lost.
 fn is_peer_refusal(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -433,8 +517,9 @@ fn is_peer_refusal(error: &std::io::Error) -> bool {
 /// Send a leading run of `packets` one at a time with `send_one`; how many
 /// were dealt with.
 ///
-/// A refusal counts its packet as dealt with (lost) and the run goes on with
-/// the next, so a later call never sends it again. Any other error ends the
+/// A refused packet is tried once more (see [`is_peer_refusal`]); refused
+/// again, it counts as dealt with (lost) and the run goes on with the next,
+/// so a later call never sends it again. Any other error ends the
 /// run: it is returned when nothing was sent, and otherwise left for the
 /// next call to meet on its first packet.
 #[cfg(any(
@@ -451,7 +536,11 @@ fn send_each(
 ) -> std::io::Result<usize> {
     let mut sent = 0;
     for (packet, target) in packets {
-        match send_one(packet, *target) {
+        let result = match send_one(packet, *target) {
+            Err(error) if is_peer_refusal(&error) => send_one(packet, *target),
+            result => result,
+        };
+        match result {
             Ok(()) => sent += 1,
             Err(error) if is_peer_refusal(&error) => sent += 1,
             Err(error) if sent > 0 => {
@@ -535,35 +624,147 @@ mod mmsg {
         }
     }
 
+    const SOL_UDP: c_int = 17;
+    const UDP_SEGMENT: c_int = 103;
+    /// The most segments one segmented send may carry on every kernel that
+    /// supports it.
+    const MAX_SEGMENTS: usize = 64;
+    /// The most payload one UDP datagram, and so one segmented send, holds.
+    const MAX_SEGMENTED_BYTES: usize = 65_507;
+
+    /// A control message naming the segment size of a segmented send.
+    #[repr(C, align(8))]
+    #[derive(Clone, Copy)]
+    struct SegmentSize {
+        len: usize,
+        level: c_int,
+        kind: c_int,
+        size: u16,
+        _padding: [u8; 6],
+    }
+
+    const _: () = assert!(std::mem::size_of::<SegmentSize>() == 24);
+
+    /// The length of a [`SegmentSize`] up to the end of its data.
+    const SEGMENT_SIZE_LEN: usize = 16 + std::mem::size_of::<u16>();
+
+    /// Split the leading datagrams into runs one segmented send can carry,
+    /// writing each run's length to `runs`; returns how many runs. Every
+    /// datagram of a run but the last has the run's first length and the
+    /// last is no longer, as the kernel cuts a segmented send into pieces of
+    /// that first length.
+    pub(super) fn segment_runs(datagrams: &[&[u8]], runs: &mut [usize]) -> usize {
+        let mut count = 0;
+        let mut index = 0;
+        while index < datagrams.len() && count < runs.len() {
+            let size = datagrams[index].len();
+            let mut run = 1;
+            let mut bytes = size;
+            while index + run < datagrams.len()
+                && run < MAX_SEGMENTS
+                && size > 0
+                && datagrams[index + run - 1].len() == size
+                && datagrams[index + run].len() <= size
+                && bytes + datagrams[index + run].len() <= MAX_SEGMENTED_BYTES
+            {
+                bytes += datagrams[index + run].len();
+                run += 1;
+            }
+            runs[count] = run;
+            count += 1;
+            index += run;
+        }
+        count
+    }
+
     /// Send `datagrams` (at most [`BOUND_BATCH`]) to the connected peer;
     /// returns how many left.
+    ///
+    /// While `segmented` holds, each run of equal-sized datagrams is one
+    /// message the kernel segments (UDP GSO), so the run crosses the network
+    /// stack once rather than once per datagram. The first time the kernel
+    /// refuses a segmented message (no support for it, or a segment larger
+    /// than the route allows) `segmented` is cleared and the send repeated
+    /// with one message per datagram.
     pub(super) fn send(
         socket: &tokio::net::UdpSocket,
         datagrams: &[&[u8]],
+        segmented: &std::sync::atomic::AtomicBool,
     ) -> std::io::Result<usize> {
+        use std::sync::atomic::Ordering;
+
         let count = datagrams.len().min(BOUND_BATCH);
-        let mut iovs: Vec<Iovec> = datagrams[..count]
-            .iter()
-            .map(|datagram| Iovec {
+        let datagrams = &datagrams[..count];
+        let mut iovs: [Iovec; BOUND_BATCH] = std::array::from_fn(|_| Iovec {
+            base: std::ptr::null_mut(),
+            len: 0,
+        });
+        for (iov, datagram) in iovs.iter_mut().zip(datagrams) {
+            *iov = Iovec {
                 base: datagram.as_ptr().cast_mut().cast(),
                 len: datagram.len(),
-            })
-            .collect();
-        let mut headers: Vec<Mmsghdr> = iovs.iter_mut().map(|iov| header(iov)).collect();
-        // SAFETY: every header points at one live iovec, and every iovec at
-        // a live datagram that the kernel only reads; `count` headers exist.
+            };
+        }
+        let mut runs = [1usize; BOUND_BATCH];
+        let mut controls = [SegmentSize {
+            len: SEGMENT_SIZE_LEN,
+            level: SOL_UDP,
+            kind: UDP_SEGMENT,
+            size: 0,
+            _padding: [0; 6],
+        }; BOUND_BATCH];
+        let first = iovs.as_mut_ptr();
+        let mut headers: [Mmsghdr; BOUND_BATCH] =
+            std::array::from_fn(|index| header(first.wrapping_add(index)));
+
+        let segment = segmented.load(Ordering::Relaxed);
+        let messages = if segment {
+            let messages = segment_runs(datagrams, &mut runs);
+            let mut start = 0;
+            for index in 0..messages {
+                let header = &mut headers[index].hdr;
+                header.iov = first.wrapping_add(start);
+                header.iovlen = runs[index];
+                if runs[index] > 1 {
+                    controls[index].size = datagrams[start].len() as u16;
+                    header.control = (&raw mut controls[index]).cast();
+                    header.controllen = std::mem::size_of::<SegmentSize>();
+                }
+                start += runs[index];
+            }
+            messages
+        } else {
+            count
+        };
+        // SAFETY: each of the first `messages` headers points at a run of
+        // live iovecs inside `iovs`, and at most at one live control message
+        // in `controls`; every iovec points at a live datagram that the
+        // kernel only reads.
         let sent = unsafe {
             sendmmsg(
                 socket.as_raw_fd(),
                 headers.as_mut_ptr(),
-                count as c_uint,
+                messages as c_uint,
                 MSG_DONTWAIT,
             )
         };
         if sent < 0 {
-            return Err(std::io::Error::last_os_error());
+            let error = std::io::Error::last_os_error();
+            // EIO, EINVAL, ENOPROTOOPT and EOPNOTSUPP: the kernel or the
+            // route cannot segment this message.
+            if segment && runs[0] > 1 && matches!(error.raw_os_error(), Some(5 | 22 | 92 | 95)) {
+                tracing::debug!(%error, "the tunnel UDP socket sends unsegmented from now on");
+                segmented.store(false, Ordering::Relaxed);
+                return send(socket, datagrams, segmented);
+            }
+            return Err(error);
         }
-        Ok(sent as usize)
+        let sent = sent as usize;
+        Ok(if segment {
+            runs[..sent].iter().sum()
+        } else {
+            sent
+        })
     }
 
     /// Receive up to `buffers.len()` (at most [`BOUND_BATCH`]) datagrams from
@@ -611,6 +812,92 @@ mod mmsg {
     }
 }
 
+impl TunnelSocket {
+    /// Read what the socket holds now without waiting, asking the kernel
+    /// even when the last read found the queue empty; `None` when this
+    /// socket only knows what its last readiness said. Errors only when
+    /// the socket failed.
+    pub(crate) fn recv_queued(
+        &mut self,
+        batch: &mut RecvBatch,
+        pool: &mut gotatun::packet::PacketBufPool,
+        packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
+    ) -> Option<std::io::Result<()>> {
+        match self {
+            Self::Bound(socket) => socket.recv_queued(pool, &mut batch.spare, packets),
+            Self::System(_) | Self::Datagram(_) => None,
+        }
+    }
+
+    /// How many encrypted packets a pass gathers before it sends them, when
+    /// it has sent `sent` so far.
+    ///
+    /// An OS socket takes one send call's worth. A datagram socket inside
+    /// another tunnel takes as many as the pass already sent, starting from
+    /// one: 1, 1, 2, 4 and so on, up to [`BOUND_BATCH`]. The first packet
+    /// then leaves at once, so the carrier's engine on its own thread starts
+    /// on it while the rest are encrypted, and no packet waits behind more
+    /// packets than went before it. Each batch costs one hold of the
+    /// carrier's lock and one wake of its engine, so a pass of `n` packets
+    /// pays about log2(n) of each instead of `n`.
+    pub(crate) fn stream_batch(&self, sent: usize) -> usize {
+        use gotatun::udp::UdpSend;
+        match self {
+            Self::System(_) | Self::Bound(_) => self.max_number_of_packets_to_send().max(1),
+            Self::Datagram(_) => sent.clamp(1, BOUND_BATCH),
+        }
+    }
+}
+
+/// Send `packets` through a datagram socket in order, one batch per run of
+/// packets bound for the same address, and remove them all.
+///
+/// A packet the socket fails to send is lost, as it would be on any link,
+/// and the rest go on; the first such failure is returned once every packet
+/// was tried. A socket that has closed for good ends the call with its error,
+/// and the packets not yet sent are lost with it.
+async fn send_datagram_runs(
+    socket: &dyn DatagramSocket,
+    packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
+) -> std::io::Result<()> {
+    let mut failed = None;
+    let mut closed = None;
+    let mut at = 0;
+    'runs: while at < packets.len() {
+        let target = packets[at].1;
+        let run = packets[at..]
+            .iter()
+            .take_while(|(_, to)| *to == target)
+            .count();
+        let datagrams: Vec<&[u8]> = packets[at..at + run]
+            .iter()
+            .map(|(packet, _)| &packet[..])
+            .collect();
+        let mut sent = 0;
+        while sent < run {
+            match socket.send_batch_to(&datagrams[sent..], target).await {
+                // A count of none for a batch that is not empty would send
+                // nothing forever; that datagram is taken as lost instead.
+                Ok(count) => sent += count.max(1),
+                Err(error) if socket.is_closed() => {
+                    closed = Some(error);
+                    break 'runs;
+                }
+                Err(error) => {
+                    failed.get_or_insert(error);
+                    sent += 1;
+                }
+            }
+        }
+        at += run;
+    }
+    packets.clear();
+    match closed.or(failed) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 impl gotatun::udp::UdpSend for TunnelSocket {
     type SendManyBuf = <UdpSocket as gotatun::udp::UdpSend>::SendManyBuf;
 
@@ -628,8 +915,7 @@ impl gotatun::udp::UdpSend for TunnelSocket {
     fn max_number_of_packets_to_send(&self) -> usize {
         match self {
             Self::System(socket) => socket.max_number_of_packets_to_send(),
-            Self::Bound(_) => BOUND_BATCH,
-            Self::Datagram(_) => 1,
+            Self::Bound(_) | Self::Datagram(_) => BOUND_BATCH,
         }
     }
     async fn send_many_to(
@@ -640,12 +926,7 @@ impl gotatun::udp::UdpSend for TunnelSocket {
         match self {
             Self::System(socket) => socket.send_many_to(buffer, packets).await,
             Self::Bound(socket) => socket.send_many(packets).await,
-            Self::Datagram(_) => {
-                for (packet, target) in packets.drain(..) {
-                    self.send_to(packet, target).await?;
-                }
-                Ok(())
-            }
+            Self::Datagram(socket) => send_datagram_runs(socket.as_ref(), packets).await,
         }
     }
     fn local_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
@@ -873,6 +1154,92 @@ mod tests {
         assert_eq!(packets[0].1, second.local_addr().unwrap());
     }
 
+    /// Block until the kernel holds a datagram for `socket`, without reading
+    /// it and without touching what the runtime knows of the socket.
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    fn wait_until_queued(socket: &tokio::net::UdpSocket) {
+        use std::os::fd::AsRawFd;
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        unsafe extern "C" {
+            fn poll(fds: *mut PollFd, count: u64, timeout: i32) -> i32;
+        }
+        const POLLIN: i16 = 1;
+        let mut entry = PollFd {
+            fd: socket.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pollfd, for the duration of the call; a negative
+        // timeout waits for the condition itself.
+        let ready = unsafe { poll(&mut entry, 1, -1) };
+        assert_eq!(ready, 1, "poll: {}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    #[tokio::test]
+    async fn a_queued_read_takes_what_landed_after_the_queue_ran_dry() {
+        let peer = loopback();
+        let socket = Arc::new(bound_to(peer.local_addr().unwrap()));
+        let ours = socket.socket.local_addr().unwrap();
+        let mut tunnel = TunnelSocket::Bound(Arc::clone(&socket));
+        let mut batch = RecvBatch::default();
+        let mut pool = PacketBufPool::new(4 * BOUND_BATCH);
+        let mut packets = Vec::new();
+
+        // This read finds the queue short, so it leaves the socket marked
+        // not readable.
+        peer.send_to(b"one", ours).unwrap();
+        socket
+            .recv_many(&mut batch, &mut pool, &mut packets)
+            .await
+            .unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0].0[..], b"one");
+        packets.clear();
+
+        // Nothing queued: the read finds nothing and is not an error.
+        assert!(matches!(
+            tunnel.recv_queued(&mut batch, &mut pool, &mut packets),
+            Some(Ok(()))
+        ));
+        assert!(packets.is_empty());
+
+        // A datagram lands; the queued read takes it at once, with no wait
+        // for the runtime to see the socket readable again.
+        peer.send_to(b"two", ours).unwrap();
+        wait_until_queued(&socket.socket);
+        assert!(matches!(
+            tunnel.recv_queued(&mut batch, &mut pool, &mut packets),
+            Some(Ok(()))
+        ));
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0].0[..], b"two");
+        assert_eq!(packets[0].1, peer.local_addr().unwrap());
+
+        // The waiting read still works after it: a datagram that lands next
+        // is delivered, not lost behind readiness the queued read consumed.
+        packets.clear();
+        peer.send_to(b"three", ours).unwrap();
+        gotatun::udp::UdpRecv::recv_many_from(&mut tunnel, &mut batch, &mut pool, &mut packets)
+            .await
+            .unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0].0[..], b"three");
+    }
+
     #[tokio::test]
     async fn a_batch_drain_delivers_every_datagram_in_arrival_order() {
         const COUNT: usize = 3 * BOUND_BATCH + 7;
@@ -931,6 +1298,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_batch_send_of_mixed_sizes_delivers_each_datagram_whole_and_in_order() {
+        // Runs of equal sizes, a shorter datagram closing a run, a longer one
+        // opening the next, and a run longer than one segmented send holds.
+        let mut sizes = vec![1200, 1200, 1200, 700, 1300, 1300, 64, 64, 1452];
+        sizes.extend(std::iter::repeat_n(1000, 70));
+        sizes.extend([999, 1000, 1]);
+        let peer = loopback();
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(1 << 22)
+            .unwrap();
+        let socket = bound_to(peer.local_addr().unwrap());
+        let pool = PacketBufPool::new(sizes.len());
+        let mut packets: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, &size)| {
+                let body: Vec<u8> = (0..size).map(|at| (index + at) as u8).collect();
+                (packet(&pool, &body), peer.local_addr().unwrap())
+            })
+            .collect();
+        socket.send_many(&mut packets).await.unwrap();
+        assert!(packets.is_empty());
+        for (index, &size) in sizes.iter().enumerate() {
+            let body: Vec<u8> = (0..size).map(|at| (index + at) as u8).collect();
+            assert_eq!(received(&peer).0, body, "datagram {index}");
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    #[test]
+    fn segment_runs_end_at_a_shorter_datagram_a_longer_one_or_the_limits() {
+        let runs_of = |sizes: &[usize]| {
+            let bodies: Vec<Vec<u8>> = sizes.iter().map(|&size| vec![0; size]).collect();
+            let datagrams: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+            let mut runs = [0; BOUND_BATCH];
+            let count = mmsg::segment_runs(&datagrams, &mut runs);
+            runs[..count].to_vec()
+        };
+        assert_eq!(runs_of(&[]), Vec::<usize>::new());
+        assert_eq!(runs_of(&[100]), vec![1]);
+        assert_eq!(runs_of(&[100, 100, 100]), vec![3]);
+        assert_eq!(runs_of(&[100, 100, 50, 100]), vec![3, 1]);
+        assert_eq!(runs_of(&[100, 200, 200]), vec![1, 2]);
+        assert_eq!(runs_of(&[100, 50, 50]), vec![2, 1]);
+        // Sixty-four segments at most.
+        assert_eq!(runs_of(&[10; 64 + 3]), vec![64, 3]);
+        // No more than one datagram's worth of bytes: 65,507 / 1,452 is 45.
+        assert_eq!(runs_of(&[1452; 50]), vec![45, 5]);
+    }
+
+    #[tokio::test]
     async fn single_reads_deliver_every_queued_datagram_in_order() {
         const COUNT: u32 = 10;
         let peer = loopback();
@@ -981,7 +1403,71 @@ mod tests {
             .await
             .unwrap();
         assert!(packets.is_empty());
-        assert_eq!(attempts, vec![0, 1, 2, 3, 4, 5], "each packet tried once");
+        assert_eq!(
+            attempts,
+            vec![0, 1, 2, 2, 3, 4, 5],
+            "the refused packet is tried once more, every other packet once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_earned_by_an_earlier_datagram_does_not_lose_this_one() {
+        // A refusal reports an earlier datagram's fate: the packet whose send
+        // met it has not left, and goes on the second try.
+        let peer = loopback().local_addr().unwrap();
+        let socket = bound_to(peer);
+        let pool = PacketBufPool::new(8);
+        let mut packets: Vec<_> = (0..4u8)
+            .map(|index| (packet(&pool, &[index]), peer))
+            .collect();
+        let mut pending_refusal = true;
+        let mut delivered: Vec<u8> = Vec::new();
+        socket
+            .send_many_with(&mut packets, |run| {
+                send_each(run, |datagram, _| {
+                    if datagram[0] == 1 && pending_refusal {
+                        pending_refusal = false;
+                        return Err(std::io::ErrorKind::ConnectionRefused.into());
+                    }
+                    delivered.push(datagram[0]);
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(packets.is_empty());
+        assert_eq!(delivered, vec![0, 1, 2, 3], "each packet delivered once");
+    }
+
+    #[tokio::test]
+    async fn a_batch_send_refused_on_its_first_packet_tries_that_packet_once_more() {
+        // The segmented send reports a refusal for the run's first packet;
+        // the next call starts at that packet again, and only a second
+        // refusal counts it lost.
+        let peer = loopback().local_addr().unwrap();
+        let socket = bound_to(peer);
+        let pool = PacketBufPool::new(8);
+        let mut packets: Vec<_> = (0..3u8)
+            .map(|index| (packet(&pool, &[index]), peer))
+            .collect();
+        let mut calls: Vec<u8> = Vec::new();
+        socket
+            .send_many_with(&mut packets, |run| {
+                calls.push(run[0].0[0]);
+                if calls.len() <= 3 {
+                    Err(std::io::ErrorKind::ConnectionRefused.into())
+                } else {
+                    Ok(run.len())
+                }
+            })
+            .await
+            .unwrap();
+        assert!(packets.is_empty());
+        assert_eq!(
+            calls,
+            vec![0, 0, 1, 1],
+            "packet 0 refused twice is lost, packet 1 refused once goes on its second try"
+        );
     }
 
     #[tokio::test]

@@ -770,10 +770,13 @@ async fn authenticated_socks_front_uses_http3_and_revision_change_revokes_it() {
 
 #[tokio::test]
 async fn unreachable_udp_proxy_never_uses_tcp_or_direct_destination() {
-    let proxy_tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = proxy_tcp.local_addr().unwrap();
-    // Reserve UDP on the same port but do not answer QUIC packets.
-    let _proxy_udp = tokio::net::UdpSocket::bind(proxy_addr).await.unwrap();
+    // A UDP socket that never answers QUIC, and a TCP listener on its port
+    // that sees any fallback. UDP binds first: the machine holds far more
+    // UDP sockets than TCP listeners, so a port the kernel picked for UDP is
+    // far likelier to be free for TCP than the other way round.
+    let proxy_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_udp.local_addr().unwrap();
+    let proxy_tcp = tokio::net::TcpListener::bind(proxy_addr).await.unwrap();
     let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider = Http3TunnelProvider::new(Http3TunnelSpec {
         proxy_config_id: "no-fallback".into(),

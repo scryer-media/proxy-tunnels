@@ -15,7 +15,7 @@
 //!
 //! ```text
 //! cargo run --release --features test-support --example wireguard_loopback_bulk -- \
-//!     [direct-]download|[direct-]upload MIB STREAMS RUNS [TUNNELS]
+//!     [direct-]download|[direct-]upload MIB STREAMS RUNS [TUNNELS [RATE [DELAY]]]
 //! ```
 //!
 //! `MIB` is the total per run, split evenly over `STREAMS` concurrent
@@ -25,11 +25,27 @@
 //! `with_inner_wireguard` builds it. The child then runs one peer per tunnel,
 //! each relaying UDP inside its tunnel to the next peer. The `direct-` modes
 //! skip the tunnel and move the bytes over loopback TCP, as a floor.
+//!
+//! `RATE` (MB/s, default 0 = off) puts a paced link between the client and the
+//! outermost peer, in the child process: each direction leaves the link one
+//! datagram at a time, spaced evenly at `RATE`, and arrives `DELAY` ms later
+//! (default 20), as datagrams cross a real link rather than loopback's
+//! bursts. A datagram that finds a full second of the link's queue already
+//! waiting is dropped. The child prints what each direction carried and
+//! dropped when it exits, which on Linux is the only count of the client's
+//! datagrams (Linux leaves the `getrusage` message counters at zero).
+//!
+//! Each run also prints the process's voluntary and involuntary context
+//! switches per MB.
 use std::{
+    collections::VecDeque,
     io::{BufRead, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -56,21 +72,31 @@ fn main() -> Result<(), Error> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    if let [command, tunnels] = args.as_slice()
+    if let [command, tunnels, rate, delay] = args.as_slice()
         && command == "peer"
     {
-        return runtime.block_on(peer(tunnels.parse()?));
+        let link = Link {
+            rate: rate.parse()?,
+            delay: delay.parse()?,
+        };
+        return runtime.block_on(peer(tunnels.parse()?, link));
     }
-    let (mode, mib, streams, runs, tunnels) = match args.as_slice() {
-        [mode, mib, streams, runs] => (mode, mib, streams, runs, 1),
-        [mode, mib, streams, runs, tunnels] => (mode, mib, streams, runs, tunnels.parse()?),
+    let (mode, mib, streams, runs, rest) = match args.as_slice() {
+        [mode, mib, streams, runs, rest @ ..] if rest.len() <= 3 => {
+            (mode, mib, streams, runs, rest)
+        }
         _ => {
             return Err(
                 "usage: wireguard_loopback_bulk [direct-]download|[direct-]upload \
-                 MIB STREAMS RUNS [TUNNELS]"
+                 MIB STREAMS RUNS [TUNNELS [RATE [DELAY]]]"
                     .into(),
             );
         }
+    };
+    let tunnels: usize = rest.first().map_or(Ok(1), |value| value.parse())?;
+    let link = Link {
+        rate: rest.get(1).map_or(Ok(0.0), |value| value.parse())?,
+        delay: rest.get(2).map_or(Ok(20), |value| value.parse())?,
     };
     if !(1..=3).contains(&tunnels) {
         return Err("TUNNELS is 1, 2 or 3".into());
@@ -88,7 +114,138 @@ fn main() -> Result<(), Error> {
     if streams == 0 || bytes % streams != 0 {
         return Err("MIB must split evenly over STREAMS".into());
     }
-    runtime.block_on(client(upload, direct, bytes, streams, runs, tunnels))
+    runtime.block_on(client(upload, direct, bytes, streams, runs, tunnels, link))
+}
+
+/// The paced link between the client and the outermost peer.
+#[derive(Clone, Copy)]
+struct Link {
+    /// MB/s each way; 0 is no link, the client reaches the peer directly.
+    rate: f64,
+    /// One-way delay, ms.
+    delay: u64,
+}
+
+/// Datagrams one direction of the paced link carried and dropped.
+#[derive(Default)]
+struct LinkCounts {
+    carried: AtomicU64,
+    dropped: AtomicU64,
+}
+
+/// Start the paced link in front of `peer`: the address the client sends to,
+/// and each direction's counts (to the peer, then back).
+fn start_link(link: Link, peer: SocketAddr) -> std::io::Result<(SocketAddr, [Arc<LinkCounts>; 2])> {
+    let bind = |connect: Option<SocketAddr>| -> std::io::Result<UdpSocket> {
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+        socket.set_recv_buffer_size(4 << 20)?;
+        socket.set_send_buffer_size(4 << 20)?;
+        socket.bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())?;
+        if let Some(connect) = connect {
+            socket.connect(&connect.into())?;
+        }
+        Ok(socket.into())
+    };
+    let front = bind(None)?;
+    let back = bind(Some(peer))?;
+    let address = front.local_addr()?;
+    let client: Arc<OnceLock<SocketAddr>> = Arc::new(OnceLock::new());
+    let counts = [
+        Arc::new(LinkCounts::default()),
+        Arc::new(LinkCounts::default()),
+    ];
+    let rate = link.rate * 1e6;
+    let delay = Duration::from_millis(link.delay);
+
+    let (up_from, up_to) = (front.try_clone()?, back.try_clone()?);
+    let (up_client, up_counts) = (Arc::clone(&client), Arc::clone(&counts[0]));
+    std::thread::spawn(move || {
+        pace(
+            &up_from,
+            |buffer| {
+                let (read, source) = up_from.recv_from(buffer)?;
+                let _ = up_client.set(source);
+                Ok(read)
+            },
+            |datagram| {
+                let _ = up_to.send(datagram);
+            },
+            rate,
+            delay,
+            &up_counts,
+        )
+    });
+    let down_counts = Arc::clone(&counts[1]);
+    std::thread::spawn(move || {
+        pace(
+            &back,
+            |buffer| back.recv(buffer),
+            |datagram| {
+                if let Some(client) = client.get() {
+                    let _ = front.send_to(datagram, client);
+                }
+            },
+            rate,
+            delay,
+            &down_counts,
+        )
+    });
+    Ok((address, counts))
+}
+
+/// One direction of the paced link: every datagram `recv` yields leaves the
+/// link's one queue at `rate` bytes per second, back to back while the queue
+/// holds more, and reaches `send` `delay` after it left. Spins while the
+/// queue holds anything, so the spacing is exact to the microsecond rather
+/// than to a timer tick, and blocks on `socket` while the queue is empty.
+fn pace(
+    socket: &UdpSocket,
+    mut recv: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+    mut send: impl FnMut(&[u8]),
+    rate: f64,
+    delay: Duration,
+    counts: &LinkCounts,
+) -> std::io::Result<()> {
+    let mut queue: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
+    let mut spare: Vec<Vec<u8>> = Vec::new();
+    let mut link_free = Instant::now();
+    let mut blocking = false;
+    socket.set_nonblocking(true)?;
+    loop {
+        if queue.is_empty() != blocking {
+            blocking = queue.is_empty();
+            socket.set_nonblocking(!blocking)?;
+        }
+        let mut buffer = spare.pop().unwrap_or_default();
+        buffer.resize(65536, 0);
+        match recv(&mut buffer) {
+            Ok(read) => {
+                buffer.truncate(read);
+                let now = Instant::now();
+                let start = link_free.max(now);
+                if start.duration_since(now) > Duration::from_secs(1) {
+                    counts.dropped.fetch_add(1, Ordering::Relaxed);
+                    spare.push(buffer);
+                } else {
+                    link_free = start + Duration::from_secs_f64(read as f64 / rate);
+                    queue.push_back((link_free + delay, buffer));
+                }
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => spare.push(buffer),
+            Err(error) => return Err(error),
+        }
+        let now = Instant::now();
+        while let Some((due, _)) = queue.front()
+            && *due <= now
+        {
+            let (_, datagram) = queue.pop_front().expect("a due datagram");
+            send(&datagram);
+            counts.carried.fetch_add(1, Ordering::Relaxed);
+            spare.push(datagram);
+        }
+        std::hint::spin_loop();
+    }
 }
 
 /// The private key of the peer at `level`, 0 being the outermost.
@@ -99,9 +256,10 @@ fn peer_key(level: usize) -> [u8; 32] {
 /// The far side: `tunnels` test peers. The innermost one's TCP service
 /// forwards to a loopback source and sink; each one before it relays UDP on
 /// [`RELAY_PORT`] inside its tunnel to the next. Prints the source's port and
-/// each peer's endpoint port, outermost first, then serves until stdin
-/// closes.
-async fn peer(tunnels: usize) -> Result<(), Error> {
+/// each peer's endpoint port, outermost first (the paced link's port in
+/// place of the outermost peer's when `link` has a rate), then serves until
+/// stdin closes.
+async fn peer(tunnels: usize, link: Link) -> Result<(), Error> {
     let source = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let source_addr = source.local_addr()?;
     tokio::spawn(async move {
@@ -150,8 +308,15 @@ async fn peer(tunnels: usize) -> Result<(), Error> {
         );
     }
     let mut ready = format!("READY {}", source_addr.port());
-    for peer in peers.iter().rev() {
-        ready.push_str(&format!(" {}", peer.endpoint().port()));
+    let mut link_counts = None;
+    for (index, peer) in peers.iter().rev().enumerate() {
+        let mut endpoint = peer.endpoint();
+        if index == 0 && link.rate > 0.0 {
+            let (front, counts) = start_link(link, endpoint)?;
+            endpoint = front;
+            link_counts = Some(counts);
+        }
+        ready.push_str(&format!(" {}", endpoint.port()));
     }
     println!("{ready}");
     std::io::stdout().flush()?;
@@ -164,6 +329,16 @@ async fn peer(tunnels: usize) -> Result<(), Error> {
         {}
     })
     .await?;
+    if let Some([up, down]) = link_counts {
+        let load = |count: &AtomicU64| count.load(Ordering::Relaxed);
+        eprintln!(
+            "LINK up_carried={} up_dropped={} down_carried={} down_dropped={}",
+            load(&up.carried),
+            load(&up.dropped),
+            load(&down.carried),
+            load(&down.dropped)
+        );
+    }
     drop(peers);
     Ok(())
 }
@@ -175,10 +350,13 @@ async fn client(
     streams: u64,
     runs: usize,
     tunnels: usize,
+    link: Link,
 ) -> Result<(), Error> {
     let mut child = Command::new(std::env::current_exe()?)
         .arg("peer")
         .arg(tunnels.to_string())
+        .arg(link.rate.to_string())
+        .arg(link.delay.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
@@ -236,7 +414,7 @@ async fn client(
 
     let source_port: u16 = source_port.parse()?;
     println!(
-        "mode,run,MiB,streams,seconds,MB_per_s,cpu_s_per_GB,dgrams_sent_per_MB,dgrams_recv_per_MB,user_s_per_GB,sys_s_per_GB"
+        "mode,run,MiB,streams,seconds,MB_per_s,cpu_s_per_GB,dgrams_sent_per_MB,dgrams_recv_per_MB,user_s_per_GB,sys_s_per_GB,vcsw_per_MB,ivcsw_per_MB"
     );
     eprintln!("CLIENT_PID {}", std::process::id());
     for run in 1..=runs {
@@ -274,7 +452,7 @@ async fn client(
         let megabytes = bytes as f64 / 1e6;
         let cpu = after.cpu_seconds - before.cpu_seconds;
         println!(
-            "{}{}{},{run},{},{streams},{seconds:.2},{:.1},{:.2},{:.0},{:.0},{:.2},{:.2}",
+            "{}{}{},{run},{},{streams},{seconds:.2},{:.1},{:.2},{:.0},{:.0},{:.2},{:.2},{:.1},{:.1}",
             if direct { "direct-" } else { "" },
             if upload { "upload" } else { "download" },
             if tunnels > 1 {
@@ -289,6 +467,8 @@ async fn client(
             (after.received - before.received) as f64 / megabytes,
             (after.user - before.user) / (bytes as f64 / 1e9),
             (after.system - before.system) / (bytes as f64 / 1e9),
+            (after.voluntary - before.voluntary) as f64 / megabytes,
+            (after.involuntary - before.involuntary) as f64 / megabytes,
         );
     }
     provider.shutdown().await;
@@ -337,6 +517,8 @@ struct Usage {
     system: f64,
     sent: i64,
     received: i64,
+    voluntary: i64,
+    involuntary: i64,
 }
 
 #[repr(C)]
@@ -387,6 +569,8 @@ impl Usage {
             system: seconds(&usage.system),
             sent: usage.msgsnd,
             received: usage.msgrcv,
+            voluntary: usage.nvcsw,
+            involuntary: usage.nivcsw,
         }
     }
 }

@@ -6,15 +6,14 @@
 //!                                 ├─ resolve the name *through* the tunnel (smoltcp DNS)
 //!                                 └─ open a TCP socket on the tunnel's smoltcp interface
 //!                                       │
-//!                                    in-memory IpSend / IpRecv adapter
-//!                                       │
-//!                                    gotatun device — handshake, encrypt, rekey, keepalive
+//!                                    the tunnel's engine — one task: decrypt, poll, encrypt
+//!                                       │  (gotatun's Tunn: handshake, encrypt, rekey, keepalive)
 //!                                       │
 //!                                    Tokio UDP socket on an ephemeral local port
 //! ```
 //!
 //! Nothing here needs a `tun` device, a route, a firewall rule or a
-//! capability: the "network interface" is a pair of channels, and the only
+//! capability: the "network interface" is a queue in memory, and the only
 //! socket the operating system sees is one ordinary UDP socket. That is what
 //! makes a VPN tunnel usable from inside a container that has no `NET_ADMIN`,
 //! and it is why this can be a per-proxy tunnel rather than a machine-wide one.
@@ -22,9 +21,10 @@
 //! ## What each half owns
 //!
 //! * **gotatun** owns the protocol: the Noise handshake, encryption, rekeying,
-//!   keepalives, peer state, the WireGuard timers, and the UDP transport.
+//!   keepalives, session state and the WireGuard timers.
 //! * **smoltcp** owns everything above IP: the interface, TCP, UDP and DNS.
-//! * This module owns the seam and the lifecycle, and nothing else.
+//! * This module owns the engine that moves packets between the two and the
+//!   UDP socket ([`engine`]), and the lifecycle.
 //!
 //! ## Identity
 //!
@@ -45,8 +45,8 @@
 //! a tunnel can ride inside another:
 //!
 //! ```text
-//!   inner smoltcp ─▶ inner gotatun ─▶ UDP socket on the outer stack
-//!                                        ─▶ outer gotatun ─▶ OS UDP socket
+//!   inner smoltcp ─▶ inner engine ─▶ UDP socket on the outer stack
+//!                                        ─▶ outer engine ─▶ OS UDP socket
 //! ```
 //!
 //! The outer peer only ever sees the inner tunnel's WireGuard datagrams. The
@@ -55,7 +55,9 @@
 //! through the outer tunnel's resolver, and an inner tunnel whose carrier
 //! stopped is treated as dead rather than waited on.
 
+#[cfg(any(test, feature = "test-support"))]
 mod adapter;
+mod engine;
 mod phy;
 mod spec;
 mod stack;
@@ -75,8 +77,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gotatun::device::{Device, DeviceBuilder, Peer};
 use gotatun::packet::{Ip, IpNextProtocol, Ipv4Header, Packet};
+use gotatun::udp::UdpTransportFactory as _;
 use gotatun::x25519::{PublicKey, StaticSecret};
 use ipnetwork::IpNetwork;
 use tokio::sync::Notify;
@@ -101,7 +103,6 @@ pub use test_peer::{
     test_peer_private_key, test_preshared_key,
 };
 
-pub(crate) use adapter::ip_channels;
 pub(crate) use stack::StackConfig;
 
 /// gotatun's own point of no return: after three times `REJECT_AFTER_TIME`
@@ -173,13 +174,6 @@ pub fn carried_mtu(configured: u16, link_mtu: u16, endpoint: IpAddr) -> Result<u
     Ok(configured.min(available))
 }
 
-/// The transports one of our devices is built from.
-pub(crate) type WgTransports = (
-    transport::TunnelUdpFactory,
-    adapter::DeviceToStack,
-    adapter::StackToDevice,
-);
-
 /// What one successful handshake established. Returned by the health probe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WireGuardHandshake {
@@ -197,16 +191,15 @@ pub struct WireGuardHandshake {
     pub handshake_at: Duration,
 }
 
-/// One live WireGuard tunnel: a gotatun device, a smoltcp stack, and the pump
-/// that joins them.
+/// One live WireGuard tunnel: a smoltcp stack and the engine that drives it.
 struct WgTunnel {
     stack: WgStack,
-    /// `Option` only so [`Drop`] can take it and drop it *inside* the runtime
-    /// context, or explicit shutdown can await device termination.
-    device: tokio::sync::Mutex<Option<Device<WgTransports>>>,
+    /// The engine's task. It owns the UDP socket and the WireGuard session;
+    /// once it ends, the stack is stopped and nothing moves again.
     pump: tokio::task::JoinHandle<()>,
+    /// What the engine reports: when it last completed a handshake.
+    engine: Arc<engine::EngineStatus>,
     shutdown: Arc<Notify>,
-    peer_public_key: PublicKey,
     handshake_at: Duration,
     /// The socket this tunnel rides on when it is carried by another
     /// transport. Once it closes, the tunnel can never move a packet again.
@@ -215,12 +208,10 @@ struct WgTunnel {
     /// carrier is gone ends its connections instead of leaving them waiting
     /// for packets that can never arrive.
     carrier_watch: Option<tokio::task::JoinHandle<()>>,
-    /// The runtime the device's tasks live on. gotatun stops a device on drop
-    /// by spawning onto `Handle::try_current()`, and silently leaks it — UDP
-    /// socket, keepalives and all — when there is no current runtime. The
-    /// registry drops tunnels from plain threads (a config update on the
-    /// blocking plugin worker, `stop_all` at shutdown), so the drop has to
-    /// enter this handle first.
+    /// The runtime the engine's task lives on. The registry drops tunnels
+    /// from plain threads (a config update on the blocking plugin worker,
+    /// `stop_all` at shutdown), so the drop stops the engine by spawning onto
+    /// this handle rather than the current one, which may not exist.
     runtime: tokio::runtime::Handle,
     /// The thread `runtime` belongs to, for a tunnel built with download
     /// tuning (see [`worker`]); `None` when the tasks run on the caller's
@@ -231,10 +222,10 @@ struct WgTunnel {
 impl WgTunnel {
     /// Whether this tunnel is still worth dialling on.
     ///
-    /// Two ways to be dead: the stack pump stopped (which also means the
-    /// device's channels are closed), or the peer has gone quiet for longer
-    /// than WireGuard itself will tolerate, at which point gotatun has thrown
-    /// its keys away and no amount of waiting brings the session back.
+    /// Two ways to be dead: the engine stopped, or the peer has gone quiet
+    /// for longer than WireGuard itself will tolerate, at which point gotatun
+    /// has thrown its keys away and no amount of waiting brings the session
+    /// back.
     async fn is_alive(&self) -> bool {
         if self.pump.is_finished() {
             return false;
@@ -246,38 +237,22 @@ impl WgTunnel {
         {
             return false;
         }
-        match self.last_handshake_age().await {
+        match self.last_handshake_age() {
             Some(age) => age < SESSION_EXPIRY,
             None => false,
         }
     }
 
-    async fn last_handshake_age(&self) -> Option<Duration> {
-        match self.device.lock().await.as_ref() {
-            Some(device) => last_handshake_age(device, &self.peer_public_key).await,
-            None => None,
-        }
+    fn last_handshake_age(&self) -> Option<Duration> {
+        self.engine.last_handshake_age()
     }
-}
-
-/// How long ago the device last completed a handshake with `peer`, if ever.
-async fn last_handshake_age(device: &Device<WgTransports>, peer: &PublicKey) -> Option<Duration> {
-    device
-        .peers()
-        .await
-        .into_iter()
-        .find(|entry| entry.peer.public_key == *peer)
-        .and_then(|entry| entry.stats.last_handshake)
 }
 
 impl Drop for WgTunnel {
     fn drop(&mut self) {
-        // The device stops first, on its runtime whatever thread this drop
-        // runs on (see the field's comment for why that matters). Its tasks
-        // then end on their own cancellation; only after that does the pump
-        // stop and close the adapter channels, which those tasks would
-        // otherwise read as the tunnel device disappearing under them.
-        let device = self.device.get_mut().take();
+        // The engine stops on its runtime whatever thread this drop runs on
+        // (see the field's comment for why that matters), and its socket
+        // closes with it.
         let shutdown = Arc::clone(&self.shutdown);
         let pump = self.pump.abort_handle();
         let watch = self
@@ -287,9 +262,6 @@ impl Drop for WgTunnel {
         // A tunnel thread ends once this teardown has run on it.
         let thread = self.worker.as_mut().and_then(worker::TunnelWorker::release);
         self.runtime.spawn(async move {
-            if let Some(device) = device {
-                device.stop().await;
-            }
             shutdown.notify_waiters();
             pump.abort();
             if let Some(watch) = watch {
@@ -541,75 +513,73 @@ impl WireGuardTunnelProvider {
             }
         };
 
-        let (to_stack, to_device, inbound, outbound) = ip_channels(mtu);
-        let shutdown = Arc::new(Notify::new());
-        let probe_channel = outbound.clone();
-        let (stack, pump) = WgStack::start(
-            StackConfig {
-                addresses: self.spec.addresses.clone(),
-                dns_servers: self.spec.dns_servers.clone(),
-                mtu,
-                proxy_config_id: self.spec.proxy_config_id.clone(),
-                download_tuning: self.download_tuning,
-                max_sockets: stack::socket_cap(self.spec.max_sockets),
-            },
-            inbound,
-            outbound,
-            Arc::clone(&shutdown),
-            &runtime,
-        );
+        let stack = WgStack::build_for_engine(StackConfig {
+            addresses: self.spec.addresses.clone(),
+            dns_servers: self.spec.dns_servers.clone(),
+            mtu,
+            proxy_config_id: self.spec.proxy_config_id.clone(),
+            download_tuning: self.download_tuning,
+            max_sockets: stack::socket_cap(self.spec.max_sockets),
+        });
 
-        let peer_public_key = PublicKey::from(self.spec.peer_public_key);
-
-        let builder = DeviceBuilder::new()
-            // An ephemeral local port on an ordinary UDP socket. No listen
-            // port is configured: nothing dials *us*.
-            .with_udp(transport::TunnelUdpFactory {
-                tuning: self.download_tuning,
-                bound: self.udp_factory.clone().map(|factory| (factory, endpoint)),
-                source: self.source.clone(),
-                datagram,
-            })
-            .with_ip_pair(to_stack, to_device)
-            .with_private_key(StaticSecret::from(self.spec.private_key))
-            .with_peer(self.peer(endpoint));
-        // The device spawns its tasks onto the runtime it is built on.
-        let device = match &worker {
-            None => builder.build().await.map_err(|error| error.to_string()),
-            Some(_) => match runtime.spawn(builder.build()).await {
-                Ok(built) => built.map_err(|error| error.to_string()),
+        // An ephemeral local port on an ordinary UDP socket. No listen port is
+        // configured: nothing dials *us*. The socket is bound on the runtime
+        // the engine runs on, whose reactor then serves it.
+        let mut factory = transport::TunnelUdpFactory {
+            tuning: self.download_tuning,
+            bound: self.udp_factory.clone().map(|factory| (factory, endpoint)),
+            source: self.source.clone(),
+            datagram,
+        };
+        let params = os_socket_params(endpoint);
+        let bound = match &worker {
+            None => factory
+                .bind(&params)
+                .await
+                .map_err(|error| error.to_string()),
+            Some(_) => match runtime
+                .spawn(async move { factory.bind(&params).await })
+                .await
+            {
+                Ok(bound) => bound.map_err(|error| error.to_string()),
                 Err(error) => Err(error.to_string()),
             },
         };
+        let (send, recv) = bound.map_err(|detail| TunnelError::WireGuardConnect {
+            host: self.spec.endpoint_host.clone(),
+            port: self.spec.endpoint_port,
+            detail,
+        })?;
 
-        let device = match device {
-            Ok(device) => device,
-            Err(error) => {
-                shutdown.notify_waiters();
-                pump.abort();
-                return Err(TunnelError::WireGuardConnect {
-                    host: self.spec.endpoint_host.clone(),
-                    port: self.spec.endpoint_port,
-                    detail: error.to_string(),
-                });
-            }
+        // The engine starts by sending the probe, which makes it initiate:
+        // WireGuard only handshakes when it has something to send, so a
+        // tunnel with no persistent keepalive would otherwise sit idle until
+        // the first dial, and the point of waiting here is that a wrong key or
+        // an unreachable endpoint surfaces as a connect error rather than as a
+        // mysteriously slow first request.
+        let probe_spec = self.spec.clone();
+        let config = engine::EngineConfig {
+            private_key: StaticSecret::from(self.spec.private_key),
+            peer_public_key: PublicKey::from(self.spec.peer_public_key),
+            preshared_key: self.spec.preshared_key,
+            persistent_keepalive: self.spec.persistent_keepalive,
+            endpoint,
+            allowed: allowed_networks(&self.spec),
+            mtu,
+            probe: Box::new(move || handshake_probe(&probe_spec)),
+            own_thread: worker.is_some(),
         };
-
-        // Nudge the device into initiating. WireGuard only handshakes when it
-        // has something to send, so a tunnel with no persistent keepalive
-        // would otherwise sit idle until the first dial — and the point of
-        // waiting here is that a wrong key or an unreachable endpoint surfaces
-        // as a connect error rather than as a mysteriously slow first request.
+        let status = Arc::new(engine::EngineStatus::default());
+        let shutdown = Arc::new(Notify::new());
         let probed = std::time::Instant::now();
-        let _ = probe_channel.try_send(handshake_probe(&self.spec));
+        let pump = runtime.spawn(
+            engine::Engine::new(config, send, recv, Arc::clone(&status))
+                .run(Arc::clone(stack.shared()), Arc::clone(&shutdown)),
+        );
 
-        let handshake_at = match self
-            .await_handshake(&device, endpoint, &probe_channel, &pump, probed)
-            .await
-        {
+        let handshake_at = match self.await_handshake(&stack, &status, &pump, probed).await {
             Ok(handshake_at) => handshake_at,
             Err(error) => {
-                device.stop().await;
                 shutdown.notify_waiters();
                 pump.abort();
                 return Err(error);
@@ -634,10 +604,9 @@ impl WireGuardTunnelProvider {
 
         Ok(WgTunnel {
             stack,
-            device: tokio::sync::Mutex::new(Some(device)),
             pump,
+            engine: status,
             shutdown,
-            peer_public_key,
             handshake_at,
             carrier,
             carrier_watch,
@@ -655,60 +624,37 @@ impl WireGuardTunnelProvider {
         }
     }
 
-    /// The device's one peer: the spec's, at `endpoint`, on gotatun's own
-    /// timers.
-    fn peer(&self, endpoint: SocketAddr) -> Peer {
-        let mut peer = Peer::new(PublicKey::from(self.spec.peer_public_key))
-            .with_endpoint(endpoint)
-            .with_allowed_ips(allowed_networks(&self.spec));
-        peer.preshared_key = self.spec.preshared_key;
-        peer.keepalive = self.spec.persistent_keepalive;
-        peer
-    }
-
     /// Wait for the peer to answer, and say how long after `probed` it had,
     /// or say that it did not.
     ///
     /// A first initiation still unanswered after [`BRING_UP_RESEND`] is sent
-    /// again once: the peer is replaced with a fresh one, which has no
-    /// session to lose yet, and the probe asks it to initiate. That leaves the
-    /// device's socket and tasks as they are, and its timers at gotatun's
-    /// defaults.
+    /// again once: the engine drops its handshake state, which has no session
+    /// to lose yet, and initiates afresh. That leaves the engine's socket as
+    /// it is, and its timers at gotatun's defaults.
     ///
-    /// The time is this function's own measurement. gotatun's handshake age
-    /// advances only on its timer tick, a quarter of a second, so it cannot
-    /// tell a fast handshake from an instant one.
+    /// The time is this function's own measurement, taken at the first check
+    /// that finds the session established, so it reads high by at most one
+    /// poll interval and never low.
     async fn await_handshake(
         &self,
-        device: &Device<WgTransports>,
-        endpoint: SocketAddr,
-        probe: &adapter::OutboundTx,
+        stack: &WgStack,
+        status: &engine::EngineStatus,
         pump: &tokio::task::JoinHandle<()>,
         probed: std::time::Instant,
     ) -> Result<Duration, TunnelError> {
-        let peer_public_key = PublicKey::from(self.spec.peer_public_key);
         let resend_at = tokio::time::Instant::now() + BRING_UP_RESEND;
         let mut resent = false;
         let waited = tokio::time::timeout(self.spec.request_timeout, async {
             loop {
-                if last_handshake_age(device, &peer_public_key).await.is_some() {
+                if status.last_handshake_age().is_some() {
                     return Some(probed.elapsed());
                 }
                 if !resent && tokio::time::Instant::now() >= resend_at {
                     resent = true;
-                    let peer = self.peer(endpoint);
-                    let replaced = device
-                        .write(async |device| {
-                            device.remove_peer(&peer_public_key).await;
-                            device.add_peer(peer)
-                        })
-                        .await;
-                    if matches!(replaced, Ok(true)) {
-                        let _ = probe.try_send(handshake_probe(&self.spec));
-                    }
+                    status.restart(stack.shared());
                 }
                 if pump.is_finished() {
-                    // The stack died under us; there will never be a
+                    // The engine died under us; there will never be a
                     // handshake, so do not sit out the whole budget.
                     return None;
                 }
@@ -906,12 +852,6 @@ impl TunnelProvider for WireGuardTunnelProvider {
     }
     async fn retire(&self) {
         if let Some(tunnel) = self.tunnel.lock().await.take() {
-            // The device before the pump: stopping the pump closes the
-            // channels the device's tasks read, and a task that sees them
-            // close before it is cancelled reports the tunnel device deleted.
-            if let Some(device) = tunnel.device.lock().await.take() {
-                device.stop().await;
-            }
             tunnel.shutdown.notify_waiters();
             tunnel.pump.abort();
             if let Some(watch) = &tunnel.carrier_watch {
@@ -932,7 +872,7 @@ impl TunnelProvider for WireGuardTunnelProvider {
         let outcome = match self.dial_on(&tunnel, host, port).await {
             Ok(stream) => Ok(stream),
             Err(DialFailure::Destination(error)) => Err(error),
-            Err(DialFailure::Tunnel(first)) if matches!(tunnel.last_handshake_age().await, Some(age) if age < RECENT_HANDSHAKE) =>
+            Err(DialFailure::Tunnel(first)) if matches!(tunnel.last_handshake_age(), Some(age) if age < RECENT_HANDSHAKE) =>
             {
                 // The peer shook hands moments ago, so the tunnel is provably
                 // up and the silence is the destination's. No rebuild.
@@ -1071,6 +1011,31 @@ fn ipv4_header_checksum(header: &Ipv4Header) -> u16 {
 /// The header's own bytes, via a packet, so no zerocopy import is needed here.
 fn header_bytes(header: &Ipv4Header) -> Vec<u8> {
     Packet::copy_from(header).into_bytes().as_ref().to_vec()
+}
+
+/// How a tunnel's own OS socket binds: an ephemeral port on the wildcard
+/// address of `endpoint`'s family, never a dual-stack socket.
+///
+/// macOS picks an ephemeral port for a dual-stack socket without looking at
+/// the IPv4 sockets on the machine, so such a socket can share its port with
+/// another program's IPv4 socket. That socket is the more specific match and
+/// receives every IPv4 datagram for the port: the peer's answers never reach
+/// the tunnel, and its handshake times out. A socket of the endpoint's own
+/// family gets a port no other socket of that family holds. Only an
+/// IPv4-mapped IPv6 endpoint, which only a dual-stack socket can reach, keeps
+/// one.
+pub(crate) fn os_socket_params(endpoint: SocketAddr) -> gotatun::udp::UdpTransportFactoryParams {
+    let addr = match endpoint {
+        SocketAddr::V4(_) => Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => None,
+        SocketAddr::V6(_) => Some(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+    };
+    gotatun::udp::UdpTransportFactoryParams {
+        addr,
+        port: 0,
+        #[cfg(target_os = "linux")]
+        fwmark: None,
+    }
 }
 
 fn base64_of(key: &[u8; 32]) -> String {

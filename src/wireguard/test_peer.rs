@@ -13,7 +13,6 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -148,11 +147,16 @@ pub struct WireGuardTestPeer {
 /// The engine's transports, with a UDP factory that reports its port.
 type TestPeerTransports = (PortReportingUdpFactory, DeviceToStack, StackToDevice);
 
-/// Binds exactly as the engine's factory does, then records the port the
-/// socket landed on. gotatun keeps that port to itself.
+/// Binds as the engine's factory does, on IPv4 loopback, then records the
+/// address the socket landed on. gotatun keeps that address to itself.
+///
+/// gotatun's device asks for a dual-stack socket, and macOS can give one a
+/// port another program's IPv4 socket holds, which then takes every datagram
+/// a client sends the peer (see `os_socket_params`). An IPv4 loopback socket
+/// gets a port of its own.
 struct PortReportingUdpFactory {
     inner: TunnelUdpFactory,
-    bound_port: Arc<AtomicU16>,
+    bound: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 impl UdpTransportFactory for PortReportingUdpFactory {
@@ -163,11 +167,12 @@ impl UdpTransportFactory for PortReportingUdpFactory {
         &mut self,
         params: &UdpTransportFactoryParams,
     ) -> std::io::Result<(TunnelSocket, TunnelSocket)> {
-        let (send, recv) = self.inner.bind(params).await?;
-        self.bound_port.store(
-            send.local_addr()?.expect("bound UDP address").port(),
-            Ordering::Relaxed,
-        );
+        let params = UdpTransportFactoryParams {
+            addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..*params
+        };
+        let (send, recv) = self.inner.bind(&params).await?;
+        *self.bound.lock().expect("bound address") = send.local_addr()?;
         Ok((send, recv))
     }
 }
@@ -229,7 +234,7 @@ impl WireGuardTestPeer {
         // Port 0: the operating system picks the port as the socket binds, and
         // the factory reports it. Probing for a free port first and binding it
         // afterwards races every other test on the machine for that port.
-        let bound_port = Arc::new(AtomicU16::new(0));
+        let bound = Arc::new(Mutex::new(None));
         let device = DeviceBuilder::new()
             .with_udp(PortReportingUdpFactory {
                 inner: TunnelUdpFactory {
@@ -238,7 +243,7 @@ impl WireGuardTestPeer {
                     source: Arc::new(Mutex::new(None)),
                     datagram: None,
                 },
-                bound_port: Arc::clone(&bound_port),
+                bound: Arc::clone(&bound),
             })
             .with_ip_pair(to_stack, to_device)
             .with_listen_port(0)
@@ -247,9 +252,10 @@ impl WireGuardTestPeer {
             .build()
             .await
             .expect("the test peer's device binds");
-        let port = bound_port.load(Ordering::Relaxed);
-        assert_ne!(port, 0, "the test peer's device reports its bound port");
-        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let endpoint = bound
+            .lock()
+            .expect("bound address")
+            .expect("the test peer's device reports its bound address");
 
         let dns_queries = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -486,10 +492,21 @@ async fn serve_http(
     }
 }
 
+/// How many datagrams the relay socket queues, in multiples of what a carrier
+/// socket queues.
+///
+/// The relay reads one datagram at a time and logs it, so it drains slower
+/// than a tunnel engine, which takes whole batches. With a carrier-sized
+/// queue a burst from a tunnel nested inside this one overflows it and the
+/// nested tunnel's TCP retransmits, so a nested bench measured the relay
+/// rather than the tunnels.
+const RELAY_QUEUE_FACTOR: usize = 16;
+
 /// Relay UDP from `port` inside the tunnel to `target` on loopback, with one
 /// loopback socket per inside source so answers find their way back.
 async fn forward_udp(stack: WgStack, port: u16, target: SocketAddr, log: Arc<Mutex<ForwardLog>>) {
-    let Ok(inside) = stack.bind_transport_udp(port) else {
+    let packets = RELAY_QUEUE_FACTOR * crate::wireguard::phy::PACKET_QUEUE_DEPTH;
+    let Ok(inside) = stack.bind_udp_sized(port, packets, packets * usize::from(stack.mtu())) else {
         return;
     };
     let inside = Arc::new(inside);
@@ -517,8 +534,7 @@ async fn forward_udp(stack: WgStack, port: u16, target: SocketAddr, log: Arc<Mut
         let session = match sessions.get(&source) {
             Some(session) => Arc::clone(session),
             None => {
-                let Ok(session) = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await
-                else {
+                let Ok(session) = relay_session_socket() else {
                     continue;
                 };
                 if session.connect(target).await.is_err() {
@@ -541,6 +557,24 @@ async fn forward_udp(stack: WgStack, port: u16, target: SocketAddr, log: Arc<Mut
         };
         let _ = session.send(datagram).await;
     }
+}
+
+/// How much the relay's loopback sockets ask the kernel to queue: what a
+/// tunnel's own socket asks for.
+const RELAY_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+
+/// A loopback socket for one inside source's answers.
+///
+/// Its reader hands one datagram at a time to the stack, so a burst from the
+/// next peer queues in the kernel meanwhile. At the kernel's default queue
+/// that burst overflowed and was dropped, and the tunnel nested inside lost
+/// segments to the relay. The buffer is asked for, not required: a kernel
+/// that caps it still relays, with a shallower queue.
+fn relay_session_socket() -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(RELAY_SOCKET_BUFFER);
+    socket.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(socket)
 }
 
 /// Whether `datagram` has the shape of a WireGuard message: type 1 to 4,
