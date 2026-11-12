@@ -112,6 +112,18 @@ const SESSION_EXPIRY: Duration = Duration::from_secs(180 * 3);
 /// How often to look for the first handshake while bringing a tunnel up.
 const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// How long a bring-up waits on its first handshake initiation before it
+/// sends a fresh one. gotatun retries an unanswered initiation only after
+/// `REKEY_TIMEOUT`, five seconds, and a first initiation lost on the way, or
+/// sent while the server still holds a session for the same key elsewhere,
+/// would cost every bring-up that long. One early retry, with fresh
+/// handshake state, takes that down to this; later retries keep gotatun's
+/// own timers. gotatun as a responder counts handshakes per source address
+/// against a limit of 100 a second before it answers with a cookie, so one
+/// more initiation a second later stays far below it, and the fresh state
+/// stamps it later than the first, as the responder requires.
+const BRING_UP_RESEND: Duration = Duration::from_secs(1);
+
 /// WireGuard's `REKEY_AFTER_TIME`. A peer that completed a handshake more
 /// recently than this has proven, cryptographically, that it is alive, so a
 /// dial that answered nothing inside such a window is the *destination*
@@ -548,11 +560,6 @@ impl WireGuardTunnelProvider {
         );
 
         let peer_public_key = PublicKey::from(self.spec.peer_public_key);
-        let mut peer = Peer::new(peer_public_key)
-            .with_endpoint(endpoint)
-            .with_allowed_ips(allowed_networks(&self.spec));
-        peer.preshared_key = self.spec.preshared_key;
-        peer.keepalive = self.spec.persistent_keepalive;
 
         let builder = DeviceBuilder::new()
             // An ephemeral local port on an ordinary UDP socket. No listen
@@ -565,7 +572,7 @@ impl WireGuardTunnelProvider {
             })
             .with_ip_pair(to_stack, to_device)
             .with_private_key(StaticSecret::from(self.spec.private_key))
-            .with_peer(peer);
+            .with_peer(self.peer(endpoint));
         // The device spawns its tasks onto the runtime it is built on.
         let device = match &worker {
             None => builder.build().await.map_err(|error| error.to_string()),
@@ -597,7 +604,7 @@ impl WireGuardTunnelProvider {
         let _ = probe_channel.try_send(handshake_probe(&self.spec));
 
         let handshake_at = match self
-            .await_handshake(&device, &peer_public_key, &pump, probed)
+            .await_handshake(&device, endpoint, &probe_channel, &pump, probed)
             .await
         {
             Ok(handshake_at) => handshake_at,
@@ -648,8 +655,25 @@ impl WireGuardTunnelProvider {
         }
     }
 
+    /// The device's one peer: the spec's, at `endpoint`, on gotatun's own
+    /// timers.
+    fn peer(&self, endpoint: SocketAddr) -> Peer {
+        let mut peer = Peer::new(PublicKey::from(self.spec.peer_public_key))
+            .with_endpoint(endpoint)
+            .with_allowed_ips(allowed_networks(&self.spec));
+        peer.preshared_key = self.spec.preshared_key;
+        peer.keepalive = self.spec.persistent_keepalive;
+        peer
+    }
+
     /// Wait for the peer to answer, and say how long after `probed` it had,
     /// or say that it did not.
+    ///
+    /// A first initiation still unanswered after [`BRING_UP_RESEND`] is sent
+    /// again once: the peer is replaced with a fresh one, which has no
+    /// session to lose yet, and the probe asks it to initiate. That leaves the
+    /// device's socket and tasks as they are, and its timers at gotatun's
+    /// defaults.
     ///
     /// The time is this function's own measurement. gotatun's handshake age
     /// advances only on its timer tick, a quarter of a second, so it cannot
@@ -657,14 +681,31 @@ impl WireGuardTunnelProvider {
     async fn await_handshake(
         &self,
         device: &Device<WgTransports>,
-        peer_public_key: &PublicKey,
+        endpoint: SocketAddr,
+        probe: &adapter::OutboundTx,
         pump: &tokio::task::JoinHandle<()>,
         probed: std::time::Instant,
     ) -> Result<Duration, TunnelError> {
+        let peer_public_key = PublicKey::from(self.spec.peer_public_key);
+        let resend_at = tokio::time::Instant::now() + BRING_UP_RESEND;
+        let mut resent = false;
         let waited = tokio::time::timeout(self.spec.request_timeout, async {
             loop {
-                if last_handshake_age(device, peer_public_key).await.is_some() {
+                if last_handshake_age(device, &peer_public_key).await.is_some() {
                     return Some(probed.elapsed());
+                }
+                if !resent && tokio::time::Instant::now() >= resend_at {
+                    resent = true;
+                    let peer = self.peer(endpoint);
+                    let replaced = device
+                        .write(async |device| {
+                            device.remove_peer(&peer_public_key).await;
+                            device.add_peer(peer)
+                        })
+                        .await;
+                    if matches!(replaced, Ok(true)) {
+                        let _ = probe.try_send(handshake_probe(&self.spec));
+                    }
                 }
                 if pump.is_finished() {
                     // The stack died under us; there will never be a

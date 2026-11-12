@@ -1206,3 +1206,109 @@ async fn the_handshake_time_is_the_measured_round_trip() {
         handshake.handshake_at
     );
 }
+
+/// A loopback hop between a client and a peer that drops the client's first
+/// `dropped` handshake initiations, and records on the tokio clock when each
+/// initiation reached it.
+struct InitiationRelay {
+    address: SocketAddr,
+    initiations: Arc<Mutex<Vec<tokio::time::Instant>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl InitiationRelay {
+    async fn start(peer: SocketAddr, dropped: usize) -> Self {
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("the relay binds");
+        let address = socket.local_addr().expect("the relay's address");
+        let initiations = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&initiations);
+        let task = tokio::spawn(async move {
+            let mut client = None;
+            let mut buffer = vec![0u8; 65_536];
+            loop {
+                let Ok((read, from)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
+                let datagram = &buffer[..read];
+                if from != peer {
+                    client = Some(from);
+                    if datagram.first() == Some(&1) {
+                        let mut seen = seen.lock().expect("initiations");
+                        seen.push(tokio::time::Instant::now());
+                        if seen.len() <= dropped {
+                            continue;
+                        }
+                    }
+                    let _ = socket.send_to(datagram, peer).await;
+                    continue;
+                }
+                if let Some(client) = client {
+                    let _ = socket.send_to(datagram, client).await;
+                }
+            }
+        });
+        Self {
+            address,
+            initiations,
+            task,
+        }
+    }
+
+    fn initiations(&self) -> Vec<tokio::time::Instant> {
+        self.initiations.lock().expect("initiations").clone()
+    }
+}
+
+impl Drop for InitiationRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A first initiation lost on the way is sent again after the bring-up
+/// resend, not after gotatun's five-second rekey timeout, and the second one
+/// brings the tunnel up.
+///
+/// The paused clock fires the resend's own timer on time. gotatun's retry
+/// timer runs on the real clock, so a bring-up that waited for it would run
+/// out its request timeout here instead.
+#[tokio::test(start_paused = true)]
+async fn a_lost_first_initiation_is_sent_again_after_the_bring_up_resend() {
+    let peer = WireGuardTestPeer::start().await;
+    let relay = InitiationRelay::start(peer.endpoint(), 1).await;
+    let mut spec = peer.client_spec("proxy-lost-initiation");
+    spec.endpoint_host = relay.address.ip().to_string();
+    spec.endpoint_port = relay.address.port();
+    // Nothing but the bring-up probe may make the device initiate.
+    spec.persistent_keepalive = None;
+    let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver));
+
+    let started = tokio::time::Instant::now();
+    provider
+        .prepare()
+        .await
+        .expect("the second initiation is answered");
+
+    let initiations = relay.initiations();
+    assert_eq!(initiations.len(), 2, "{initiations:?}");
+    let resent = initiations[1] - started;
+    assert!(
+        resent >= super::BRING_UP_RESEND && resent < Duration::from_secs(5),
+        "the resend came {resent:?} into the bring-up"
+    );
+}
+
+/// Both the first peer and the one a resend puts in its place run on
+/// gotatun's own timers, so a tunnel that is up rekeys and retries as
+/// WireGuard specifies.
+#[tokio::test]
+async fn the_bring_up_peer_keeps_gotatuns_timers() {
+    let peer = WireGuardTestPeer::start().await;
+    let provider = WireGuardTunnelProvider::new(
+        peer.client_spec("proxy-timers"),
+        Arc::new(NoopTunnelObserver),
+    );
+    assert!(provider.peer(peer.endpoint()).danger_timer_params.is_none());
+}
