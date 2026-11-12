@@ -17,16 +17,23 @@
 //! * **All three address types.** IPv4, IPv6 and — the one that matters —
 //!   domain names, which are passed to the provider unresolved so they resolve
 //!   on the far side of the tunnel.
-//! * **A handshake budget.** A peer that opens a socket and says nothing is
-//!   dropped after the configured timeout instead of holding a task forever.
+//! * **A handshake budget.** A peer gets [`NEGOTIATION_TIMEOUT`] (or the
+//!   request timeout, if shorter) to authenticate and send its request, and
+//!   is dropped after that instead of holding a task.
+//! * **Handshakes apart from tunnels.** A connection takes tunnel capacity
+//!   only once it has authenticated. Until then it holds one of
+//!   [`MAX_FRONT_HANDSHAKES`] places, and when those are full a new
+//!   connection displaces the oldest unfinished one, so idle local clients
+//!   cannot keep the front's owner out.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
 use crate::error::TunnelError;
@@ -47,10 +54,20 @@ const REPLY_CONNECTION_REFUSED: u8 = 0x05;
 const REPLY_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REPLY_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
-/// Per-front budget shared by unauthenticated handshakes, dials and pumps.
+/// Per-front budget for authenticated connections: their dials and pumps.
 pub const MAX_FRONT_CONNECTIONS: usize = 256;
-/// Aggregate connection-task budget shared by all fronts in one registry.
+/// Aggregate budget for authenticated connections across all fronts in one
+/// registry.
 pub const MAX_REGISTRY_CONNECTIONS: usize = 1024;
+/// Per-front number of connections that may be negotiating at once. When it
+/// is full, a new connection displaces the oldest one still negotiating.
+pub const MAX_FRONT_HANDSHAKES: usize = 64;
+/// The most time a peer gets to finish method negotiation, authentication and
+/// its CONNECT request. The front's owner is a client on the same host and
+/// sends all three without waiting on anything but the front itself, so five
+/// seconds leaves wide room for a loaded host while an idle peer cannot hold
+/// a place for the whole request timeout.
+pub const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Ephemeral front credentials. The owner supplies cryptographically random
 /// tokens; they must never be persisted or embedded in a URL.
@@ -97,6 +114,32 @@ pub struct Socks5Front {
     credentials: Socks5Credentials,
     connections: Arc<Semaphore>,
     registry_connections: Arc<Semaphore>,
+    handshakes: Mutex<Handshakes>,
+    handshake_capacity: usize,
+}
+
+/// Connections still negotiating, keyed by admission order. Dropping an
+/// entry's sender ends that connection's negotiation.
+#[derive(Default)]
+struct Handshakes {
+    next: u64,
+    waiting: BTreeMap<u64, oneshot::Sender<()>>,
+}
+
+/// One connection's place among the handshakes; dropping it frees the place.
+struct HandshakePlace<'a> {
+    handshakes: &'a Mutex<Handshakes>,
+    id: u64,
+}
+
+impl Drop for HandshakePlace<'_> {
+    fn drop(&mut self) {
+        self.handshakes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiting
+            .remove(&self.id);
+    }
 }
 
 /// Why a single SOCKS5 conversation ended early. Never surfaced to an
@@ -151,7 +194,41 @@ impl Socks5Front {
             credentials,
             connections: Arc::new(Semaphore::new(MAX_FRONT_CONNECTIONS)),
             registry_connections,
+            handshakes: Mutex::new(Handshakes::default()),
+            handshake_capacity: MAX_FRONT_HANDSHAKES,
         }
+    }
+
+    /// Give a new connection a place among the handshakes, displacing the
+    /// oldest one when they are full. The receiver resolves if this
+    /// connection is itself displaced later.
+    fn admit_handshake(&self) -> (HandshakePlace<'_>, oneshot::Receiver<()>) {
+        let (displace, displaced) = oneshot::channel();
+        let mut handshakes = self
+            .handshakes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if handshakes.waiting.len() >= self.handshake_capacity {
+            handshakes.waiting.pop_first();
+        }
+        let id = handshakes.next;
+        handshakes.next += 1;
+        handshakes.waiting.insert(id, displace);
+        let place = HandshakePlace {
+            handshakes: &self.handshakes,
+            id,
+        };
+        (place, displaced)
+    }
+
+    /// Tunnel capacity for one authenticated connection, from this front's
+    /// budget and the registry's.
+    fn take_tunnel_slots(&self) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let local = Arc::clone(&self.connections).try_acquire_owned().ok()?;
+        let global = Arc::clone(&self.registry_connections)
+            .try_acquire_owned()
+            .ok()?;
+        Some((local, global))
     }
 
     /// Accept loop. Runs until `shutdown` is notified or the listener dies.
@@ -175,17 +252,8 @@ impl Socks5Front {
                         );
                         continue;
                     }
-                    let Ok(local_slot) = Arc::clone(&self.connections).try_acquire_owned() else {
-                        continue;
-                    };
-                    let Ok(global_slot) =
-                        Arc::clone(&self.registry_connections).try_acquire_owned()
-                    else {
-                        continue;
-                    };
                     let front = Arc::clone(&self);
                     connections.spawn(async move {
-                        let _slots = (local_slot, global_slot);
                         if let Err(failure) = front.handle_connection(stream).await {
                             tracing::debug!(
                                 proxy_config_id = front.proxy_config_id.as_str(),
@@ -211,15 +279,35 @@ impl Socks5Front {
         );
     }
 
-    async fn handle_connection(&self, mut stream: TcpStream) -> Result<(), Socks5Failure> {
+    async fn handle_connection<S>(&self, mut stream: S) -> Result<(), Socks5Failure>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         // The negotiation is bounded; the tunnelled conversation that follows
         // is not (an indexer response can legitimately take as long as the
         // request timeout the consumer's own client enforces).
-        let (host, port) =
-            match tokio::time::timeout(self.timeout, self.negotiate(&mut stream)).await {
-                Ok(result) => result?,
-                Err(_) => return Err(Socks5Failure::Protocol("peer did not finish the handshake")),
-            };
+        let (place, mut displaced) = self.admit_handshake();
+        let budget = self.timeout.min(NEGOTIATION_TIMEOUT);
+        let negotiated = tokio::select! {
+            biased;
+            _ = &mut displaced => {
+                return Err(Socks5Failure::Protocol("a newer connection displaced the handshake"));
+            }
+            negotiated = tokio::time::timeout(budget, self.negotiate(&mut stream)) => negotiated,
+        };
+        drop(place);
+        let (host, port) = match negotiated {
+            Ok(result) => result?,
+            Err(_) => return Err(Socks5Failure::Protocol("peer did not finish the handshake")),
+        };
+
+        // Only an authenticated connection takes tunnel capacity.
+        let Some(_slots) = self.take_tunnel_slots() else {
+            let _ = reply(&mut stream, REPLY_GENERAL_FAILURE).await;
+            return Err(Socks5Failure::Protocol(
+                "the front is at its connection limit",
+            ));
+        };
 
         let dialled = tokio::time::timeout(self.timeout, self.provider.dial(&host, port)).await;
         let upstream = match dialled {
@@ -251,11 +339,14 @@ impl Socks5Front {
             .tunnel_dial_failed(&self.proxy_config_id, &error.to_string());
     }
 
-    async fn pump(
+    async fn pump<S>(
         &self,
-        mut stream: TcpStream,
+        mut stream: S,
         mut upstream: Box<dyn TunnelStream>,
-    ) -> Result<(), Socks5Failure> {
+    ) -> Result<(), Socks5Failure>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         tokio::io::copy_bidirectional(&mut stream, &mut upstream)
             .await
             .map(|_| ())
@@ -264,7 +355,10 @@ impl Socks5Front {
 
     /// Method negotiation followed by the CONNECT request. Returns the
     /// destination the peer asked for, unresolved.
-    async fn negotiate(&self, stream: &mut TcpStream) -> Result<(String, u16), Socks5Failure> {
+    async fn negotiate<S>(&self, stream: &mut S) -> Result<(String, u16), Socks5Failure>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut greeting = [0u8; 2];
         stream.read_exact(&mut greeting).await?;
         if greeting[0] != SOCKS5_VERSION {
@@ -374,7 +468,10 @@ fn reply_code_for(error: &TunnelError) -> u8 {
 /// A SOCKS5 reply with a zeroed bound address. The client never uses BND.ADDR
 /// on a CONNECT, and there is no meaningful local address to report for a
 /// stream that lives inside an SSH channel.
-async fn reply(stream: &mut TcpStream, code: u8) -> std::io::Result<()> {
+async fn reply<S>(stream: &mut S, code: u8) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     stream
         .write_all(&[SOCKS5_VERSION, code, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
         .await
@@ -384,6 +481,7 @@ async fn reply(stream: &mut TcpStream, code: u8) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tokio::net::TcpStream;
 
     /// A provider that hands back one end of an in-memory duplex and records
     /// what it was asked to dial. No SSH, no sockets.
@@ -497,7 +595,11 @@ mod tests {
         (addr, shutdown)
     }
 
-    async fn greet(stream: &mut TcpStream) -> [u8; 2] {
+    fn test_credentials() -> Socks5Credentials {
+        Socks5Credentials::new("test-user".into(), "test-secret".into()).unwrap()
+    }
+
+    async fn greet<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> [u8; 2] {
         stream
             .write_all(&[SOCKS5_VERSION, 1, METHOD_PASSWORD])
             .await
@@ -514,7 +616,7 @@ mod tests {
         answer
     }
 
-    async fn read_reply(stream: &mut TcpStream) -> [u8; 10] {
+    async fn read_reply<S: AsyncRead + Unpin>(stream: &mut S) -> [u8; 10] {
         let mut reply = [0u8; 10];
         stream.read_exact(&mut reply).await.expect("reply");
         reply
@@ -736,8 +838,24 @@ mod tests {
         shutdown.notify_one();
     }
 
+    /// Greet, authenticate and CONNECT to an IPv4 literal; the reply code.
+    async fn connect_ipv4<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> u8 {
+        greet(stream).await;
+        stream
+            .write_all(&[5, 1, 0, 1, 10, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        read_reply(stream).await[1]
+    }
+
+    async fn wait_for_permits(semaphore: &Semaphore, permits: usize) {
+        while semaphore.available_permits() != permits {
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
-    async fn connection_limits_cover_handshakes_and_pumps_and_recover_on_stop() {
+    async fn tunnel_limits_cover_dials_and_pumps_and_recover_on_stop() {
         let provider = FakeProvider::new();
         let global = Arc::new(Semaphore::new(3));
         let local = Arc::new(Semaphore::new(2));
@@ -745,8 +863,8 @@ mod tests {
             provider.clone(),
             RecordingObserver::new(),
             "limited".into(),
-            Duration::from_secs(5),
-            Socks5Credentials::new("test-user".into(), "test-secret".into()).unwrap(),
+            Duration::from_secs(3600),
+            test_credentials(),
             global.clone(),
         );
         front.connections = local.clone();
@@ -755,13 +873,16 @@ mod tests {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let task = tokio::spawn(Arc::new(front).serve(listener, shutdown.clone()));
 
-        let mut pumping = TcpStream::connect(addr).await.unwrap();
-        greet(&mut pumping).await;
-        pumping
-            .write_all(&[5, 1, 0, 1, 10, 0, 0, 1, 0, 80])
-            .await
-            .unwrap();
-        assert_eq!(read_reply(&mut pumping).await[1], 0);
+        let mut pumping = Vec::new();
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            assert_eq!(connect_ipv4(&mut stream).await, REPLY_SUCCEEDED);
+            pumping.push(stream);
+        }
+        assert_eq!(local.available_permits(), 0);
+        assert_eq!(global.available_permits(), 1);
+
+        // An unfinished handshake takes no tunnel capacity.
         let mut handshake = TcpStream::connect(addr).await.unwrap();
         handshake.write_all(&[5, 1, 2]).await.unwrap();
         let mut response = [0; 2];
@@ -769,16 +890,12 @@ mod tests {
         assert_eq!(local.available_permits(), 0);
         assert_eq!(global.available_permits(), 1);
 
+        // An authenticated connection past this front's budget is refused.
         let mut excess = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(connect_ipv4(&mut excess).await, REPLY_GENERAL_FAILURE);
         assert_eq!(excess.read(&mut response).await.unwrap(), 0);
-        drop(handshake);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while local.available_permits() != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        drop(pumping.pop());
+        wait_for_permits(&local, 1).await;
 
         // A different front shares the registry budget.
         let other_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -787,8 +904,8 @@ mod tests {
             provider,
             RecordingObserver::new(),
             "other".into(),
-            Duration::from_secs(5),
-            Socks5Credentials::new("test-user".into(), "test-secret".into()).unwrap(),
+            Duration::from_secs(3600),
+            test_credentials(),
             global.clone(),
         ));
         let other_task =
@@ -796,62 +913,113 @@ mod tests {
         let mut held = Vec::new();
         for _ in 0..2 {
             let mut stream = TcpStream::connect(other_addr).await.unwrap();
-            stream.write_all(&[5, 1, 2]).await.unwrap();
-            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(connect_ipv4(&mut stream).await, REPLY_SUCCEEDED);
             held.push(stream);
         }
         assert_eq!(global.available_permits(), 0);
         let mut excess = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(connect_ipv4(&mut excess).await, REPLY_GENERAL_FAILURE);
         assert_eq!(excess.read(&mut response).await.unwrap(), 0);
+        wait_for_permits(&local, 1).await;
+
         task.abort();
         let _ = task.await;
         other_task.abort();
         let _ = other_task.await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while global.available_permits() != 3 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_for_permits(&global, 3).await;
         assert_eq!(local.available_permits(), 2);
-        assert_eq!(pumping.read(&mut response).await.unwrap(), 0);
+        assert_eq!(pumping[0].read(&mut response).await.unwrap(), 0);
+        assert_eq!(held[0].read(&mut response).await.unwrap(), 0);
     }
 
     #[tokio::test]
-    async fn incomplete_authentication_times_out_and_releases_capacity() {
-        let global = Arc::new(Semaphore::new(1));
+    async fn idle_unauthenticated_clients_cannot_take_tunnel_capacity() {
+        let provider = FakeProvider::new();
+        let global = Arc::new(Semaphore::new(2));
+        let local = Arc::new(Semaphore::new(2));
+        let mut front = Socks5Front::new(
+            provider.clone(),
+            RecordingObserver::new(),
+            "crowded".into(),
+            Duration::from_secs(3600),
+            test_credentials(),
+            global.clone(),
+        );
+        front.connections = local.clone();
+        front.handshake_capacity = 2;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn(Arc::new(front).serve(listener, shutdown.clone()));
+
+        // Fill the handshake places with clients that get as far as the
+        // method reply and then say nothing.
+        let mut idle = Vec::new();
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&[5, 1, 2]).await.unwrap();
+            let mut response = [0; 2];
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [5, 2]);
+            idle.push(stream);
+        }
+        // None of them holds tunnel capacity.
+        assert_eq!(local.available_permits(), 2);
+        assert_eq!(global.available_permits(), 2);
+
+        // A client with the credentials still gets its tunnel.
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        greet(&mut client).await;
+        client
+            .write_all(&[5, 1, 0, 1, 10, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[1], REPLY_SUCCEEDED);
+        client.write_all(b"ping").await.unwrap();
+        let mut answer = [0u8; 9];
+        client.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"echo:ping");
+        assert_eq!(local.available_permits(), 1);
+        assert_eq!(global.available_permits(), 1);
+
+        // The oldest idle handshake made room for it.
+        let mut byte = [0u8; 1];
+        assert_eq!(idle[0].read(&mut byte).await.unwrap(), 0);
+        shutdown.notify_one();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_handshake_is_dropped_after_the_negotiation_budget() {
+        // The request timeout is an hour; the handshake must not get it.
+        let request_timeout = Duration::from_secs(3600);
         let front = Arc::new(Socks5Front::new(
             FakeProvider::new(),
             RecordingObserver::new(),
             "slow".into(),
-            Duration::from_millis(25),
-            Socks5Credentials::new("test-user".into(), "test-secret".into()).unwrap(),
-            global.clone(),
+            request_timeout,
+            test_credentials(),
+            Arc::new(Semaphore::new(1)),
         ));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(front.serve(listener, Arc::new(tokio::sync::Notify::new())));
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream.write_all(&[5, 1, 2]).await.unwrap();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let began = tokio::time::Instant::now();
+        let task = tokio::spawn({
+            let front = Arc::clone(&front);
+            async move { front.handle_connection(server).await }
+        });
+        client.write_all(&[5, 1, 2]).await.unwrap();
         let mut response = [0; 2];
-        stream.read_exact(&mut response).await.unwrap();
-        assert_eq!(global.available_permits(), 0);
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut response))
-                .await
-                .unwrap()
-                .unwrap(),
-            0
-        );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while global.available_permits() != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        task.abort();
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [5, 2]);
+
+        // Silence from here. The front closes the pipe when its budget runs
+        // out; the clock is paused, so this reads virtual time only.
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        assert!(task.await.unwrap().is_err());
+        let waited = began.elapsed();
+        assert!(waited >= NEGOTIATION_TIMEOUT, "{waited:?}");
+        assert!(waited < request_timeout, "{waited:?}");
+        assert!(front.handshakes.lock().unwrap().waiting.is_empty());
     }
 
     #[test]
