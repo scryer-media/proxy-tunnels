@@ -68,6 +68,10 @@ pub const MAX_FRONT_HANDSHAKES: usize = 64;
 /// seconds leaves wide room for a loaded host while an idle peer cannot hold
 /// a place for the whole request timeout.
 pub const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bytes a client may send after its CONNECT request and before the reply.
+/// One full TLS record (16 KiB) covers any ClientHello or request head a
+/// client sends ahead of the reply.
+const MAX_EARLY_DATA: usize = 16 * 1024;
 
 /// Ephemeral front credentials. The owner supplies cryptographically random
 /// tokens; they must never be persisted or embedded in a URL.
@@ -309,8 +313,16 @@ impl Socks5Front {
             ));
         };
 
-        let dialled = tokio::time::timeout(self.timeout, self.provider.dial(&host, port)).await;
-        let upstream = match dialled {
+        // Watch the client while the tunnel dials, so a client that leaves
+        // drops the dial and its capacity with it. Bytes it sends early are
+        // kept, within a bound, and go to the tunnel first.
+        let mut early = Vec::new();
+        let dialled = tokio::select! {
+            biased;
+            failure = watch_client(&mut stream, &mut early) => return Err(failure),
+            dialled = tokio::time::timeout(self.timeout, self.provider.dial(&host, port)) => dialled,
+        };
+        let mut upstream = match dialled {
             Ok(Ok(upstream)) => upstream,
             Ok(Err(error)) => {
                 self.report_failure(&error);
@@ -331,6 +343,10 @@ impl Socks5Front {
 
         self.observer.tunnel_dial_succeeded(&self.proxy_config_id);
         reply(&mut stream, REPLY_SUCCEEDED).await?;
+        if !early.is_empty() {
+            upstream.write_all(&early).await?;
+        }
+        drop(early);
         self.pump(stream, upstream).await
     }
 
@@ -452,6 +468,30 @@ impl Socks5Front {
     }
 }
 
+/// Read from a client whose tunnel is still dialling. Returns only when the
+/// client closes, fails, or sends more than [`MAX_EARLY_DATA`]; anything it
+/// sends before that is appended to `early` for the tunnel.
+///
+/// A client may legitimately send its first bytes (a TLS ClientHello, an HTTP
+/// request head) before the CONNECT reply, so readable data is not a
+/// disconnect. Only end of stream or an error is.
+async fn watch_client<S>(stream: &mut S, early: &mut Vec<u8>) -> Socks5Failure
+where
+    S: AsyncRead + Unpin,
+{
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) => return Socks5Failure::Protocol("client left before the tunnel connected"),
+            Ok(read) if early.len() + read > MAX_EARLY_DATA => {
+                return Socks5Failure::Protocol("client sent too much before the CONNECT reply");
+            }
+            Ok(read) => early.extend_from_slice(&chunk[..read]),
+            Err(error) => return Socks5Failure::Io(error),
+        }
+    }
+}
+
 /// Map a dial failure onto the closest SOCKS5 reply code. reqwest reports every
 /// one of these as a connect error, which is what makes the proxy-hop
 /// classification in `transport_proxy` fire.
@@ -543,6 +583,66 @@ mod tests {
 
         fn describe(&self) -> String {
             "fake tunnel".to_string()
+        }
+    }
+
+    /// A provider whose dial never finishes. It says when a dial starts, and
+    /// the receiver it hands out resolves when that dial's future is dropped.
+    struct StuckProvider {
+        started: Arc<tokio::sync::Notify>,
+        on_drop: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    impl StuckProvider {
+        fn new() -> (Arc<Self>, Arc<tokio::sync::Notify>, oneshot::Receiver<()>) {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let (on_drop, dropped) = oneshot::channel();
+            let provider = Arc::new(Self {
+                started: Arc::clone(&started),
+                on_drop: Mutex::new(Some(on_drop)),
+            });
+            (provider, started, dropped)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TunnelProvider for StuckProvider {
+        async fn dial(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+            let _signal = self.on_drop.lock().expect("on_drop").take();
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        fn describe(&self) -> String {
+            "stuck tunnel".to_string()
+        }
+    }
+
+    /// A provider whose single dial waits for `gate`, then hands back the near
+    /// end of a pipe whose far end the test holds.
+    struct GatedProvider {
+        gate: Arc<tokio::sync::Notify>,
+        near: Mutex<Option<tokio::io::DuplexStream>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TunnelProvider for GatedProvider {
+        async fn dial(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+            self.gate.notified().await;
+            let near = self.near.lock().expect("near").take().expect("one dial");
+            Ok(Box::new(near))
+        }
+
+        fn describe(&self) -> String {
+            "gated tunnel".to_string()
         }
     }
 
@@ -1020,6 +1120,119 @@ mod tests {
         assert!(waited >= NEGOTIATION_TIMEOUT, "{waited:?}");
         assert!(waited < request_timeout, "{waited:?}");
         assert!(front.handshakes.lock().unwrap().waiting.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_leaves_during_the_dial_cancels_it_and_frees_its_slot() {
+        let (provider, started, dropped) = StuckProvider::new();
+        let local = Arc::new(Semaphore::new(1));
+        let mut front = Socks5Front::new(
+            provider,
+            RecordingObserver::new(),
+            "stuck".into(),
+            Duration::from_secs(3600),
+            test_credentials(),
+            Arc::new(Semaphore::new(1)),
+        );
+        front.connections = local.clone();
+        let front = Arc::new(front);
+        let (mut client, server) = tokio::io::duplex(1024);
+        let began = tokio::time::Instant::now();
+        let task = tokio::spawn({
+            let front = Arc::clone(&front);
+            async move { front.handle_connection(server).await }
+        });
+        greet(&mut client).await;
+        client
+            .write_all(&[5, 1, 0, 1, 10, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        started.notified().await;
+        assert_eq!(local.available_permits(), 0);
+
+        drop(client);
+        assert!(dropped.await.is_err(), "the dial future was dropped");
+        assert!(task.await.unwrap().is_err());
+        assert!(local.try_acquire().is_ok());
+        // The clock is paused and never moved: the client's leaving ended the
+        // dial, not the request timeout.
+        assert_eq!(began.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bytes_sent_before_the_reply_reach_the_tunnel_first() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        let provider = Arc::new(GatedProvider {
+            gate: Arc::clone(&gate),
+            near: Mutex::new(Some(near)),
+        });
+        let front = Arc::new(Socks5Front::new(
+            provider,
+            RecordingObserver::new(),
+            "early".into(),
+            Duration::from_secs(3600),
+            test_credentials(),
+            Arc::new(Semaphore::new(1)),
+        ));
+        // A small pipe: the early bytes below fit only if the front reads
+        // them while the dial is still waiting.
+        let (mut client, server) = tokio::io::duplex(64);
+        let task = tokio::spawn({
+            let front = Arc::clone(&front);
+            async move { front.handle_connection(server).await }
+        });
+        greet(&mut client).await;
+        client
+            .write_all(&[5, 1, 0, 1, 10, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        let early: Vec<u8> = (0..200u8).collect();
+        client.write_all(&early).await.unwrap();
+
+        gate.notify_one();
+        assert_eq!(read_reply(&mut client).await[1], REPLY_SUCCEEDED);
+        let mut arrived = vec![0u8; early.len()];
+        far.read_exact(&mut arrived).await.unwrap();
+        assert_eq!(arrived, early);
+
+        // The tunnel carries on as usual after the early bytes.
+        client.write_all(b"later").await.unwrap();
+        let mut later = [0u8; 5];
+        far.read_exact(&mut later).await.unwrap();
+        assert_eq!(&later, b"later");
+        drop(client);
+        drop(far);
+        let _ = task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn too_many_bytes_before_the_reply_end_the_connection_and_the_dial() {
+        let (provider, started, dropped) = StuckProvider::new();
+        let front = Arc::new(Socks5Front::new(
+            provider,
+            RecordingObserver::new(),
+            "flood".into(),
+            Duration::from_secs(3600),
+            test_credentials(),
+            Arc::new(Semaphore::new(1)),
+        ));
+        let (mut client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn({
+            let front = Arc::clone(&front);
+            async move { front.handle_connection(server).await }
+        });
+        greet(&mut client).await;
+        client
+            .write_all(&[5, 1, 0, 1, 10, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        started.notified().await;
+        // The front stops reading past its bound and closes the pipe, so the
+        // write may fail part way; what matters is what the front did.
+        let _ = client.write_all(&vec![0u8; MAX_EARLY_DATA + 1]).await;
+        assert!(dropped.await.is_err(), "the dial future was dropped");
+        assert!(task.await.unwrap().is_err());
     }
 
     #[test]
