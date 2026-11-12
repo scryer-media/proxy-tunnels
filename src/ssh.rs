@@ -53,13 +53,17 @@ pub struct TunnelHandshake {
     pub endpoint: String,
 }
 
+/// The host key this provider trusts, across its handshakes.
 #[derive(Default)]
 struct HostKeyState {
+    /// The fingerprint of the last server that authenticated us and that the
+    /// observer authorized. A handshake that fails before both never lands
+    /// here, so a server that refused us cannot become the pin.
     fingerprint: Option<String>,
     /// The handshake had no pin to check against, so this fingerprint is the
     /// one to persist. Stays true for the life of the provider so the health
     /// probe can report it; `reported` is what stops the observer being told
-    /// twice (a rekey calls `check_server_key` again).
+    /// twice (every reconnect on the provider commits the key again).
     newly_pinned: bool,
     reported: bool,
 }
@@ -149,11 +153,15 @@ impl SshTunnelProvider {
             ..client::Config::default()
         });
 
+        // The key this handshake's server presented. It is only a candidate
+        // until the server has authenticated us and the observer agreed.
+        let presented = Arc::new(Mutex::new(None));
         let handler = SshClientHandler {
             host: self.spec.host.clone(),
             port: self.spec.port,
             pinned: self.spec.pinned_host_key.clone(),
             state: Arc::clone(&self.host_key),
+            presented: Arc::clone(&presented),
         };
 
         let connected = tokio::time::timeout(self.spec.request_timeout, async {
@@ -214,12 +222,43 @@ impl SshTunnelProvider {
             });
         }
 
-        self.authorize_host_key()?;
+        let fingerprint = presented
+            .lock()
+            .expect("presented host key")
+            .take()
+            .ok_or_else(|| TunnelError::Engine("SSH server has no verified host key".into()))?;
+        self.observer
+            .authorize_host_key(&self.spec.proxy_config_id, &fingerprint)?;
 
         // Trust on first use, after authentication succeeds. This persists
         // continuity of identity; it does not independently verify first use.
         let pin = {
             let mut state = self.host_key.lock().expect("host key state");
+            // Connects on one provider are serialised by its session lock and
+            // the handler compared against this state, so a different key here
+            // means something else committed one meanwhile: still a mismatch.
+            let expected = self
+                .spec
+                .pinned_host_key
+                .clone()
+                .or_else(|| state.fingerprint.clone());
+            match expected {
+                Some(expected) if expected != fingerprint => {
+                    return Err(TunnelError::HostKeyMismatch {
+                        host: self.spec.host.clone(),
+                        port: self.spec.port,
+                        expected,
+                        actual: fingerprint,
+                    });
+                }
+                Some(_) => {
+                    if self.spec.pinned_host_key.is_some() {
+                        state.newly_pinned = false;
+                    }
+                }
+                None => state.newly_pinned = true,
+            }
+            state.fingerprint = Some(fingerprint);
             let pin = (state.newly_pinned && !state.reported)
                 .then(|| state.fingerprint.clone())
                 .flatten();
@@ -397,7 +436,12 @@ struct SshClientHandler {
     host: String,
     port: u16,
     pinned: Option<String>,
+    /// Read only: the handler compares against what earlier handshakes
+    /// committed, and never commits itself.
     state: Arc<Mutex<HostKeyState>>,
+    /// Where this handshake leaves the key it accepted, for `connect` to
+    /// commit once authentication succeeded.
+    presented: Arc<Mutex<Option<String>>>,
 }
 
 impl client::Handler for SshClientHandler {
@@ -408,33 +452,31 @@ impl client::Handler for SshClientHandler {
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         let actual = host_key_fingerprint(server_public_key);
-        let mut state = self.state.lock().expect("host key state");
         // The configured pin wins. Failing that, the fingerprint this provider
-        // already learned on an earlier handshake *is* the pin: a reconnect on
-        // the same provider must not accept a different key merely because the
-        // repository has not persisted the first one yet. That closes the
-        // window between first use and the flush that writes the pin.
-        let expected = self.pinned.clone().or_else(|| state.fingerprint.clone());
-        match expected.as_deref() {
-            Some(expected) if expected != actual => Err(TunnelError::HostKeyMismatch {
+        // already learned on an earlier authenticated handshake *is* the pin:
+        // a reconnect on the same provider must not accept a different key
+        // merely because the repository has not persisted the first one yet.
+        // That closes the window between first use and the flush that writes
+        // the pin.
+        let expected = self.pinned.clone().or_else(|| {
+            self.state
+                .lock()
+                .expect("host key state")
+                .fingerprint
+                .clone()
+        });
+        if let Some(expected) = expected
+            && expected != actual
+        {
+            return Err(TunnelError::HostKeyMismatch {
                 host: self.host.clone(),
                 port: self.port,
-                expected: expected.to_string(),
+                expected,
                 actual,
-            }),
-            Some(_) => {
-                state.fingerprint = Some(actual);
-                if self.pinned.is_some() {
-                    state.newly_pinned = false;
-                }
-                Ok(true)
-            }
-            None => {
-                state.fingerprint = Some(actual);
-                state.newly_pinned = true;
-                Ok(true)
-            }
+            });
         }
+        *self.presented.lock().expect("presented host key") = Some(actual);
+        Ok(true)
     }
 }
 
@@ -830,11 +872,13 @@ mod tests {
         use russh::client::Handler as _;
 
         let state = Arc::new(Mutex::new(HostKeyState::default()));
+        let presented = Arc::new(Mutex::new(None));
         let mut handler = SshClientHandler {
             host: "seedbox.test".to_string(),
             port: 22,
             pinned: None,
             state: Arc::clone(&state),
+            presented: Arc::clone(&presented),
         };
         let first = public_key_of(crate::test_support::HOST_ED25519_PEM);
         assert!(
@@ -844,10 +888,18 @@ mod tests {
                 .expect("first use is trusted")
         );
         assert_eq!(
-            state.lock().expect("state").fingerprint.as_deref(),
+            presented.lock().expect("presented").as_deref(),
             Some(crate::test_support::HOST_KEY_FINGERPRINT)
         );
-        assert!(state.lock().expect("state").newly_pinned);
+        // The handshake alone commits nothing: that waits for authentication.
+        assert_eq!(state.lock().expect("state").fingerprint, None);
+
+        // What `connect` commits once the server authenticated us.
+        {
+            let mut state = state.lock().expect("state");
+            state.fingerprint = presented.lock().expect("presented").take();
+            state.newly_pinned = true;
+        }
 
         // A reconnect on the same provider: the learned key is the pin now.
         let other = public_key_of(crate::test_support::OTHER_HOST_ED25519_PEM);
@@ -867,5 +919,123 @@ mod tests {
         );
         // Still the first-use learning, so the observer will be told once.
         assert!(state.lock().expect("state").newly_pinned);
+    }
+
+    /// Sends each connect to the next address in its list, so one provider
+    /// can meet a different server on each handshake.
+    struct Servers(Mutex<std::collections::VecDeque<std::net::SocketAddr>>);
+
+    #[async_trait::async_trait]
+    impl crate::endpoint::EndpointTransport for Servers {
+        async fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> Result<crate::endpoint::EndpointStream, TunnelError> {
+            let addr = self
+                .0
+                .lock()
+                .expect("servers")
+                .pop_front()
+                .expect("a server for this connect");
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let source = tcp.local_addr().ok();
+            Ok(crate::endpoint::EndpointStream {
+                stream: Box::new(tcp),
+                source,
+            })
+        }
+    }
+
+    fn provider_over(
+        servers: &[&SshServerDouble],
+        observer: Arc<RecordingObserver>,
+    ) -> SshTunnelProvider {
+        SshTunnelProvider::new(
+            crate::test_support::spec_for("proxy-tofu-order", "seedbox.test", 22),
+            observer,
+        )
+        .with_transport(Arc::new(Servers(Mutex::new(
+            servers.iter().map(|server| server.addr()).collect(),
+        ))))
+    }
+
+    /// A server that refused our credentials never proved itself, so its key
+    /// must not become the pin: the next server that does authenticate us,
+    /// with a different key, is the one learned.
+    #[tokio::test]
+    async fn a_server_that_refused_authentication_is_not_learned() {
+        let refusing = SshServerDouble::start(SshServerOptions {
+            authorized_key_pem: None,
+            ..SshServerOptions::default()
+        })
+        .await;
+        let accepting = SshServerDouble::start(SshServerOptions {
+            host_key_pem: crate::test_support::OTHER_HOST_ED25519_PEM,
+            ..SshServerOptions::default()
+        })
+        .await;
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = provider_over(&[&refusing, &accepting], Arc::clone(&observer));
+
+        let error = provider
+            .prepare()
+            .await
+            .expect_err("the first server refuses the key");
+        assert!(matches!(error, TunnelError::Auth { .. }), "{error}");
+        assert!(observer.pins.lock().expect("pins").is_empty());
+
+        provider
+            .prepare()
+            .await
+            .expect("the second server authenticates us and is learned");
+        assert_eq!(
+            observer.pins.lock().expect("pins").as_slice(),
+            [(
+                "proxy-tofu-order".to_string(),
+                crate::test_support::OTHER_HOST_KEY_FINGERPRINT.to_string()
+            )]
+        );
+        provider.shutdown().await;
+    }
+
+    /// Once a server authenticated us, its key is the pin for the provider:
+    /// a later handshake with a different key is refused.
+    #[tokio::test]
+    async fn a_key_change_after_an_authenticated_first_use_is_refused() {
+        let first = SshServerDouble::start(SshServerOptions::default()).await;
+        let changed = SshServerDouble::start(SshServerOptions {
+            host_key_pem: crate::test_support::OTHER_HOST_ED25519_PEM,
+            ..SshServerOptions::default()
+        })
+        .await;
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = provider_over(&[&first, &changed], Arc::clone(&observer));
+
+        provider
+            .prepare()
+            .await
+            .expect("the first server is learned");
+        provider.retire().await;
+        let error = provider
+            .prepare()
+            .await
+            .expect_err("a changed key must not connect");
+        let TunnelError::HostKeyMismatch {
+            expected, actual, ..
+        } = &error
+        else {
+            panic!("expected a host key mismatch, got {error}");
+        };
+        assert_eq!(expected, crate::test_support::HOST_KEY_FINGERPRINT);
+        assert_eq!(actual, crate::test_support::OTHER_HOST_KEY_FINGERPRINT);
+        assert_eq!(
+            observer.pins.lock().expect("pins").as_slice(),
+            [(
+                "proxy-tofu-order".to_string(),
+                crate::test_support::HOST_KEY_FINGERPRINT.to_string()
+            )]
+        );
+        provider.shutdown().await;
     }
 }
