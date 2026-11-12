@@ -194,7 +194,7 @@ impl Engine {
             };
             timer.as_mut().reset(wake_at);
 
-            tokio::select! {
+            let received = tokio::select! {
                 biased;
                 () = &mut stopped => break,
                 received = self.recv.recv_many_from(&mut recv_batch, &mut pool, &mut datagrams) => {
@@ -202,26 +202,40 @@ impl Engine {
                         tracing::debug!(%error, "the tunnel's UDP socket failed");
                         break;
                     }
-                    // Whatever else the socket already holds is taken now
-                    // too, up to what one pass hands the stack.
-                    while datagrams.len() < PACKET_QUEUE_DEPTH {
-                        let before = datagrams.len();
-                        let read = poll_now(self.recv.recv_many_from(
-                            &mut recv_batch,
-                            &mut pool,
-                            &mut datagrams,
-                        ));
-                        if !matches!(read, Some(Ok(()))) || datagrams.len() == before {
-                            break;
-                        }
-                    }
+                    true
                 }
-                () = &mut woken => {}
-                () = &mut timer => {}
-                () = tokio::task::yield_now(), if immediate => {}
-            }
-            for (datagram, source) in datagrams.drain(..) {
-                self.receive(datagram, source, &mut inbound, &mut wire);
+                () = &mut woken => false,
+                () = &mut timer => false,
+                () = tokio::task::yield_now(), if immediate => false,
+            };
+            // Decrypt what was read, then read again: whatever arrived while
+            // those were decrypted joins the same pass, up to what one pass
+            // hands the stack. Each pass costs a stack poll, an ACK and a
+            // wake of every reader it fed, so the fuller the pass the less
+            // each datagram costs.
+            let mut taken = 0;
+            loop {
+                taken += datagrams.len();
+                for (datagram, source) in datagrams.drain(..) {
+                    self.receive(datagram, source, &mut inbound, &mut wire);
+                }
+                if !received || taken >= PACKET_QUEUE_DEPTH {
+                    break;
+                }
+                let read = match self
+                    .recv
+                    .recv_queued(&mut recv_batch, &mut pool, &mut datagrams)
+                {
+                    Some(read) => Some(read),
+                    None => poll_now(self.recv.recv_many_from(
+                        &mut recv_batch,
+                        &mut pool,
+                        &mut datagrams,
+                    )),
+                };
+                if !matches!(read, Some(Ok(()))) || datagrams.is_empty() {
+                    break;
+                }
             }
         }
 

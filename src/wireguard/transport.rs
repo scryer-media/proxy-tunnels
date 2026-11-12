@@ -404,6 +404,58 @@ impl BoundSocket {
         packets.extend(spare.drain(..received).map(|packet| (packet, peer)));
         Ok(())
     }
+
+    /// Read what the socket holds now, up to [`BOUND_BATCH`] datagrams,
+    /// whatever readiness was last seen; `None` when this socket cannot.
+    ///
+    /// A read that found the queue empty cleared the readiness, and only the
+    /// runtime's next look at the socket raises it again, so datagrams that
+    /// land meanwhile wait for that look. This asks the kernel itself, with
+    /// one `recvmmsg`. Each datagram that arrives raises readiness again
+    /// whether or not this read takes it, so nothing is missed: at worst the
+    /// next wait returns at once and its read finds nothing.
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    fn recv_queued(
+        &self,
+        pool: &mut gotatun::packet::PacketBufPool,
+        spare: &mut Vec<gotatun::packet::Packet>,
+        packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
+    ) -> Option<std::io::Result<()>> {
+        let peer = self.connected()?;
+        while spare.len() < BOUND_BATCH {
+            spare.push(pool.get());
+        }
+        Some(match mmsg::recv(&self.socket, spare) {
+            Ok(received) => {
+                packets.extend(spare.drain(..received).map(|packet| (packet, peer)));
+                Ok(())
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock || is_peer_refusal(&error) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        })
+    }
+
+    #[cfg(not(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    )))]
+    fn recv_queued(
+        &self,
+        _pool: &mut gotatun::packet::PacketBufPool,
+        _spare: &mut Vec<gotatun::packet::Packet>,
+        _packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
+    ) -> Option<std::io::Result<()>> {
+        None
+    }
 }
 
 /// The receive side's own state, kept by the task that reads the socket from
@@ -608,6 +660,24 @@ mod mmsg {
             buffer.truncate(header.len as usize);
         }
         Ok(received)
+    }
+}
+
+impl TunnelSocket {
+    /// Read what the socket holds now without waiting, asking the kernel
+    /// even when the last read found the queue empty; `None` when this
+    /// socket only knows what its last readiness said. Errors only when
+    /// the socket failed.
+    pub(crate) fn recv_queued(
+        &mut self,
+        batch: &mut RecvBatch,
+        pool: &mut gotatun::packet::PacketBufPool,
+        packets: &mut Vec<(gotatun::packet::Packet, std::net::SocketAddr)>,
+    ) -> Option<std::io::Result<()>> {
+        match self {
+            Self::Bound(socket) => socket.recv_queued(pool, &mut batch.spare, packets),
+            Self::System(_) | Self::Datagram(_) => None,
+        }
     }
 }
 
@@ -871,6 +941,92 @@ mod tests {
         assert_eq!(packets.len(), 1);
         assert_eq!(&packets[0].0[..], b"three");
         assert_eq!(packets[0].1, second.local_addr().unwrap());
+    }
+
+    /// Block until the kernel holds a datagram for `socket`, without reading
+    /// it and without touching what the runtime knows of the socket.
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    fn wait_until_queued(socket: &tokio::net::UdpSocket) {
+        use std::os::fd::AsRawFd;
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        unsafe extern "C" {
+            fn poll(fds: *mut PollFd, count: u64, timeout: i32) -> i32;
+        }
+        const POLLIN: i16 = 1;
+        let mut entry = PollFd {
+            fd: socket.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pollfd, for the duration of the call; a negative
+        // timeout waits for the condition itself.
+        let ready = unsafe { poll(&mut entry, 1, -1) };
+        assert_eq!(ready, 1, "poll: {}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    #[tokio::test]
+    async fn a_queued_read_takes_what_landed_after_the_queue_ran_dry() {
+        let peer = loopback();
+        let socket = Arc::new(bound_to(peer.local_addr().unwrap()));
+        let ours = socket.socket.local_addr().unwrap();
+        let mut tunnel = TunnelSocket::Bound(Arc::clone(&socket));
+        let mut batch = RecvBatch::default();
+        let mut pool = PacketBufPool::new(4 * BOUND_BATCH);
+        let mut packets = Vec::new();
+
+        // This read finds the queue short, so it leaves the socket marked
+        // not readable.
+        peer.send_to(b"one", ours).unwrap();
+        socket
+            .recv_many(&mut batch, &mut pool, &mut packets)
+            .await
+            .unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0].0[..], b"one");
+        packets.clear();
+
+        // Nothing queued: the read finds nothing and is not an error.
+        assert!(matches!(
+            tunnel.recv_queued(&mut batch, &mut pool, &mut packets),
+            Some(Ok(()))
+        ));
+        assert!(packets.is_empty());
+
+        // A datagram lands; the queued read takes it at once, with no wait
+        // for the runtime to see the socket readable again.
+        peer.send_to(b"two", ours).unwrap();
+        wait_until_queued(&socket.socket);
+        assert!(matches!(
+            tunnel.recv_queued(&mut batch, &mut pool, &mut packets),
+            Some(Ok(()))
+        ));
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0].0[..], b"two");
+        assert_eq!(packets[0].1, peer.local_addr().unwrap());
+
+        // The waiting read still works after it: a datagram that lands next
+        // is delivered, not lost behind readiness the queued read consumed.
+        packets.clear();
+        peer.send_to(b"three", ours).unwrap();
+        gotatun::udp::UdpRecv::recv_many_from(&mut tunnel, &mut batch, &mut pool, &mut packets)
+            .await
+            .unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0].0[..], b"three");
     }
 
     #[tokio::test]
