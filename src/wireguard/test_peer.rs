@@ -486,10 +486,21 @@ async fn serve_http(
     }
 }
 
+/// How many datagrams the relay socket queues, in multiples of what a carrier
+/// socket queues.
+///
+/// The relay reads one datagram at a time and logs it, so it drains slower
+/// than a tunnel engine, which takes whole batches. With a carrier-sized
+/// queue a burst from a tunnel nested inside this one overflows it and the
+/// nested tunnel's TCP retransmits, so a nested bench measured the relay
+/// rather than the tunnels.
+const RELAY_QUEUE_FACTOR: usize = 16;
+
 /// Relay UDP from `port` inside the tunnel to `target` on loopback, with one
 /// loopback socket per inside source so answers find their way back.
 async fn forward_udp(stack: WgStack, port: u16, target: SocketAddr, log: Arc<Mutex<ForwardLog>>) {
-    let Ok(inside) = stack.bind_transport_udp(port) else {
+    let packets = RELAY_QUEUE_FACTOR * crate::wireguard::phy::PACKET_QUEUE_DEPTH;
+    let Ok(inside) = stack.bind_udp_sized(port, packets, packets * usize::from(stack.mtu())) else {
         return;
     };
     let inside = Arc::new(inside);

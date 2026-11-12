@@ -706,7 +706,7 @@ impl WgStack {
         self.bind_udp_sized(port, PACKET_QUEUE_DEPTH, PACKET_QUEUE_DEPTH * mtu)
     }
 
-    fn bind_udp_sized(
+    pub(crate) fn bind_udp_sized(
         &self,
         port: u16,
         packets: usize,
