@@ -1714,6 +1714,85 @@ mod link_tests {
         server.await.unwrap();
     }
 
+    /// Accept one connection on the far stack, send `payload` on it, wait
+    /// until the near side acknowledged every byte, then end it with a FIN
+    /// (`reset == false`) or an RST (`reset == true`). Returns the near
+    /// stream, holding the payload, once its socket has seen the end.
+    async fn ended_after(pair: &Pair, payload: &[u8], reset: bool) -> WgTcpStream {
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let sent = payload.to_vec();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            stream.write_all(&sent).await.unwrap();
+            while stream.socket_state().1 != 0 {
+                tokio::task::yield_now().await;
+            }
+            if reset {
+                stream.abort();
+            } else {
+                stream.shutdown().await.unwrap();
+            }
+            stream
+        });
+        let stream = pair
+            .near
+            .connect(
+                SocketAddr::from(([10, 9, 0, 2], PORT)),
+                // Far above any run; the test runner bounds the test.
+                Duration::from_secs(3600),
+            )
+            .await
+            .unwrap();
+        // Keep the far stream alive until the near side saw the end, so its
+        // drop cannot add a FIN or an RST of its own.
+        let far = server.await.unwrap();
+        let ended = if reset {
+            tcp::State::Closed
+        } else {
+            tcp::State::CloseWait
+        };
+        while stream.socket_state().0 != ended {
+            tokio::task::yield_now().await;
+        }
+        drop(far);
+        stream
+    }
+
+    /// A FIN after the payload: the reader gets every byte, then a clean end
+    /// of stream.
+    #[tokio::test]
+    async fn a_fin_after_the_payload_is_the_end_of_the_stream() {
+        let pair = pair();
+        let payload = pattern(3000);
+        let mut stream = ended_after(&pair, &payload, false).await;
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        assert!(received == payload, "every byte, in order");
+        let mut more = [0u8; 16];
+        assert_eq!(stream.read(&mut more).await.unwrap(), 0, "still the end");
+    }
+
+    /// An RST after the payload: smoltcp keeps the bytes that arrived before
+    /// it, so the reader gets those, and then an error. Never an end of
+    /// stream, which would pass a cut-off response as a whole one.
+    #[tokio::test]
+    async fn a_reset_after_the_payload_is_an_error_not_the_end_of_the_stream() {
+        let pair = pair();
+        let payload = pattern(3000);
+        let mut stream = ended_after(&pair, &payload, true).await;
+        let mut received = vec![0u8; payload.len()];
+        stream.read_exact(&mut received).await.unwrap();
+        assert!(received == payload, "the bytes that came before the reset");
+        let mut more = [0u8; 16];
+        let error = stream
+            .read(&mut more)
+            .await
+            .expect_err("a reset is not the end of the stream");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        let again = stream.read(&mut more).await.expect_err("still reset");
+        assert_eq!(again.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
     #[test]
     fn only_a_narrow_window_needs_a_wake() {
         use crate::wireguard::tcp::window_was_narrow;
