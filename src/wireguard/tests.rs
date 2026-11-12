@@ -582,6 +582,52 @@ async fn a_dropped_stream_does_not_leak_its_socket_slot() {
     }
 }
 
+/// macOS can give a dual-stack socket a port another program's IPv4 socket
+/// holds, and that socket then takes every IPv4 datagram for the port. A
+/// tunnel to an IPv4 endpoint whose socket landed there never hears its
+/// peer's answers, so its socket is an IPv4 one, whose port no other IPv4
+/// socket holds; an IPv6 endpoint gets an IPv6-only one.
+#[tokio::test]
+async fn a_tunnel_socket_binds_in_its_endpoints_family_never_dual_stack() {
+    use gotatun::udp::{UdpSend as _, UdpTransportFactory as _};
+
+    let mut factory = crate::wireguard::transport::TunnelUdpFactory {
+        tuning: false,
+        bound: None,
+        source: Arc::new(Mutex::new(None)),
+        datagram: None,
+    };
+    let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51820);
+    let (send, _recv) = factory
+        .bind(&crate::wireguard::os_socket_params(endpoint))
+        .await
+        .expect("bind");
+    let local = send.local_addr().expect("local address").expect("bound");
+    assert_eq!(local.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED), "{local}");
+
+    let v6 = "[2001:db8::1]:51820".parse().expect("v6 endpoint");
+    assert_eq!(
+        crate::wireguard::os_socket_params(v6).addr,
+        Some(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+        "an IPv6 endpoint binds an IPv6-only socket"
+    );
+    let mapped = "[::ffff:192.0.2.1]:51820".parse().expect("mapped endpoint");
+    assert_eq!(
+        crate::wireguard::os_socket_params(mapped).addr,
+        None,
+        "only a dual-stack socket reaches an IPv4-mapped endpoint"
+    );
+}
+
+/// The test peer's socket is an IPv4 loopback socket, for the same reason:
+/// a dual-stack one could share its port with another program's IPv4
+/// socket, which would take everything a client sends the peer.
+#[tokio::test]
+async fn the_test_peer_answers_on_an_ipv4_loopback_socket() {
+    let peer = WireGuardTestPeer::start().await;
+    assert_eq!(peer.endpoint().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+}
+
 #[tokio::test]
 async fn a_listener_inside_the_tunnel_accepts_a_peer_and_carries_bytes_both_ways() {
     let peer = WireGuardTestPeer::start().await;
