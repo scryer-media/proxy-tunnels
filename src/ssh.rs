@@ -164,53 +164,46 @@ impl SshTunnelProvider {
             presented: Arc::clone(&presented),
         };
 
-        let connected = tokio::time::timeout(self.spec.request_timeout, async {
-            let endpoint = self
-                .transport
-                .connect(&self.spec.host, self.spec.port)
-                .await?;
-            let handle = client::connect_stream(config, endpoint.stream, handler).await?;
-            *self.source.lock().expect("SSH source") = endpoint.source;
-            Ok::<_, TunnelError>(handle)
-        })
-        .await
-        .map_err(|_| TunnelError::Connect {
-            host: self.spec.host.clone(),
-            port: self.spec.port,
-            detail: "the server did not complete the handshake in time".to_string(),
-        })?;
-
-        let mut handle = match connected {
-            Ok(handle) => handle,
-            // A host-key mismatch is raised by our own handler and must keep
-            // its identity all the way to the operator.
-            Err(error @ TunnelError::HostKeyMismatch { .. }) => return Err(error),
-            Err(error) => {
-                return Err(TunnelError::Connect {
-                    host: self.spec.host.clone(),
-                    port: self.spec.port,
-                    detail: error.to_string(),
-                });
+        // One deadline covers the dial, the key exchange and authentication,
+        // so a server that stalls at any of them releases the session lock
+        // when the request timeout runs out.
+        let handle = tokio::time::timeout(self.spec.request_timeout, async {
+            let connected = async {
+                let endpoint = self
+                    .transport
+                    .connect(&self.spec.host, self.spec.port)
+                    .await?;
+                let handle = client::connect_stream(config, endpoint.stream, handler).await?;
+                *self.source.lock().expect("SSH source") = endpoint.source;
+                Ok::<_, TunnelError>(handle)
             }
-        };
+            .await;
+            let mut handle = match connected {
+                Ok(handle) => handle,
+                // A host-key mismatch is raised by our own handler and must
+                // keep its identity all the way to the operator.
+                Err(error @ TunnelError::HostKeyMismatch { .. }) => return Err(error),
+                Err(error) => {
+                    return Err(TunnelError::Connect {
+                        host: self.spec.host.clone(),
+                        port: self.spec.port,
+                        detail: error.to_string(),
+                    });
+                }
+            };
 
-        let mut detail = String::new();
-        let mut authenticated = false;
-        {
-            // `hash_alg` is only meaningful for RSA keys, which this build does
-            // not accept.
+            // `hash_alg` is only meaningful for RSA keys, which this build
+            // does not accept.
             let credential = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(private_key), None);
-            match handle
+            let detail = match handle
                 .authenticate_publickey(self.spec.username.clone(), credential)
                 .await
             {
-                Ok(result) if result.success() => authenticated = true,
-                Ok(_) => detail = "the server rejected the private key".to_string(),
-                Err(error) => detail = error.to_string(),
-            }
-        }
-        if !authenticated {
-            return Err(TunnelError::Auth {
+                Ok(result) if result.success() => return Ok(handle),
+                Ok(_) => "the server rejected the private key".to_string(),
+                Err(error) => error.to_string(),
+            };
+            Err(TunnelError::Auth {
                 username: self.spec.username.clone(),
                 host: self.spec.host.clone(),
                 port: self.spec.port,
@@ -219,8 +212,15 @@ impl SshTunnelProvider {
                 } else {
                     detail
                 },
-            });
-        }
+            })
+        })
+        .await
+        .map_err(|_| TunnelError::Connect {
+            host: self.spec.host.clone(),
+            port: self.spec.port,
+            detail: "the server did not complete the handshake and authentication in time"
+                .to_string(),
+        })??;
 
         let fingerprint = presented
             .lock()
@@ -994,6 +994,115 @@ mod tests {
             [(
                 "proxy-tofu-order".to_string(),
                 crate::test_support::OTHER_HOST_KEY_FINGERPRINT.to_string()
+            )]
+        );
+        provider.shutdown().await;
+    }
+
+    /// In-memory SSH servers, one per connect, in order: each completes key
+    /// exchange, then either accepts the key or never answers the
+    /// authentication request. A withheld request is announced on `asked`.
+    struct ScriptedServers {
+        answers: Mutex<std::collections::VecDeque<bool>>,
+        asked: Arc<tokio::sync::Notify>,
+    }
+
+    struct ScriptedHandler {
+        answer: bool,
+        asked: Arc<tokio::sync::Notify>,
+    }
+
+    impl russh::server::Handler for ScriptedHandler {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _public_key: &russh::keys::PublicKey,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            if self.answer {
+                return Ok(russh::server::Auth::Accept);
+            }
+            self.asked.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::endpoint::EndpointTransport for ScriptedServers {
+        async fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> Result<crate::endpoint::EndpointStream, TunnelError> {
+            let answer = self
+                .answers
+                .lock()
+                .expect("answers")
+                .pop_front()
+                .expect("a server for this connect");
+            let host_key =
+                russh::keys::decode_secret_key(crate::test_support::HOST_ED25519_PEM, None)
+                    .expect("test host key parses");
+            let config = Arc::new(russh::server::Config {
+                keys: vec![host_key],
+                inactivity_timeout: None,
+                ..russh::server::Config::default()
+            });
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let handler = ScriptedHandler {
+                answer,
+                asked: Arc::clone(&self.asked),
+            };
+            tokio::spawn(async move {
+                if let Ok(session) = russh::server::run_stream(config, server, handler).await {
+                    let _ = session.await;
+                }
+            });
+            Ok(crate::endpoint::EndpointStream {
+                stream: Box::new(client),
+                source: None,
+            })
+        }
+    }
+
+    /// A server that completes key exchange and then withholds its answer to
+    /// authentication cannot hold the connect past the request timeout: the
+    /// connect ends with a connect error, the session lock is free, and the
+    /// next connect, to a server that answers, works.
+    ///
+    /// The servers are in memory and the clock is paused, so the timeout is
+    /// the only timer that can end the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_withheld_authentication_reply_ends_at_the_request_timeout() {
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = SshTunnelProvider::new(
+            crate::test_support::spec_for("proxy-withheld-auth", "seedbox.test", 22),
+            Arc::clone(&observer) as Arc<dyn TunnelObserver>,
+        )
+        .with_transport(Arc::new(ScriptedServers {
+            answers: Mutex::new([false, true].into_iter().collect()),
+            asked: Arc::clone(&asked),
+        }));
+
+        let (first, ()) = tokio::join!(provider.prepare(), asked.notified());
+        let error = first.expect_err("a withheld authentication reply must not connect");
+        assert!(
+            matches!(&error, TunnelError::Connect { detail, .. } if detail.contains("in time")),
+            "{error}"
+        );
+        assert!(observer.pins.lock().expect("pins").is_empty());
+
+        provider
+            .prepare()
+            .await
+            .expect("the next connect reaches the server that answers");
+        assert_eq!(
+            observer.pins.lock().expect("pins").as_slice(),
+            [(
+                "proxy-withheld-auth".to_string(),
+                crate::test_support::HOST_KEY_FINGERPRINT.to_string()
             )]
         );
         provider.shutdown().await;

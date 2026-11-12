@@ -1345,3 +1345,125 @@ async fn a_lost_first_initiation_is_sent_again_after_the_bring_up_resend() {
         "the resend came {resent:?} into the bring-up"
     );
 }
+
+/// A dial's resolution and its connect share one request timeout: a name
+/// that takes a while to resolve leaves its silent address only what is
+/// left, so the dial gives up when the budget runs out, not a whole timeout
+/// after the answer came.
+///
+/// The peer holds every packet it receives for a few seconds, so the lookup
+/// takes that long; the address it answers is inside the tunnel but not the
+/// peer's, so its SYNs are dropped. The clock is paused: the delay and the
+/// timeouts run on the tokio clock, and the budget is compared on it.
+#[tokio::test(start_paused = true)]
+async fn resolution_and_connect_share_one_dial_budget() {
+    let mut options = WireGuardTestPeerOptions::default();
+    options.names.insert(
+        "silent.tunnel.test".to_string(),
+        vec![IpAddr::V4(Ipv4Addr::new(10, 63, 0, 9))],
+    );
+    let peer =
+        WireGuardTestPeer::start_for_downloads(options, None, Duration::from_secs(3), false).await;
+    let mut spec = peer.client_spec("proxy-shared-budget");
+    spec.request_timeout = Duration::from_secs(8);
+    let budget = spec.request_timeout;
+    let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver));
+    provider.prepare().await.expect("the tunnel comes up");
+
+    let started = tokio::time::Instant::now();
+    let error = provider
+        .dial("silent.tunnel.test", peer.http_port())
+        .await
+        .err()
+        .expect("a silent address must not connect");
+    let finished = tokio::time::Instant::now();
+    assert!(
+        matches!(&error, TunnelError::Dial { detail, .. } if detail.contains("in time")),
+        "{error}"
+    );
+    assert_eq!(peer.dns_queries(), vec!["silent.tunnel.test".to_string()]);
+    assert!(
+        finished <= started + budget,
+        "the dial ran past its budget on the paused clock"
+    );
+}
+
+/// Binds every tunnel socket on IPv4 loopback and records the peer it was
+/// bound for. A peer outside IPv4 is then unreachable from that socket: its
+/// packets go nowhere, so that address never answers.
+#[derive(Default)]
+struct LoopbackUdpFactory(Mutex<Vec<SocketAddr>>);
+
+impl crate::endpoint::UdpSocketFactory for LoopbackUdpFactory {
+    fn bind(&self, peer: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+        self.0.lock().expect("peers").push(peer);
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        socket.set_nonblocking(true)?;
+        Ok(socket)
+    }
+}
+
+/// An endpoint name whose first address never answers still brings the
+/// tunnel up on its second, inside one request timeout, and the second
+/// address still has to prove the configured peer key.
+///
+/// The clock is paused, so the first address's wait runs out on the tokio
+/// clock.
+#[tokio::test(start_paused = true)]
+async fn a_dead_first_endpoint_address_falls_through_to_the_next() {
+    let peer = WireGuardTestPeer::start().await;
+    let mut spec = peer.client_spec("proxy-endpoint-fallback");
+    let live = peer.endpoint();
+    let dead = SocketAddr::new(IpAddr::from(std::net::Ipv6Addr::LOCALHOST), live.port());
+    spec.endpoint_host = "vpn.endpoint.test".to_string();
+    let resolver = Arc::new(crate::endpoint::RecordingResolver {
+        answer: vec![dead.ip(), live.ip()],
+        asked: Default::default(),
+    });
+    let factory = Arc::new(LoopbackUdpFactory::default());
+    let provider = WireGuardTunnelProvider::new(spec.clone(), Arc::new(NoopTunnelObserver))
+        .with_endpoint_resolver(resolver.clone())
+        .with_udp_factory(factory.clone());
+
+    provider
+        .prepare()
+        .await
+        .expect("the second address brings the tunnel up");
+    assert_eq!(*factory.0.lock().expect("peers"), vec![dead, live]);
+    let mut stream = provider
+        .dial(&TEST_PEER_ADDRESS.to_string(), peer.http_port())
+        .await
+        .expect("dial");
+    let response = http_get_through(&mut stream, "origin.tunnel.test").await;
+    assert!(response.ends_with("through the tunnel"), "{response}");
+    provider.shutdown().await;
+
+    // The same two addresses with a peer key the live peer does not hold:
+    // neither address can complete a handshake, so nothing comes up.
+    spec.peer_public_key = public_key_bytes(&public_key_of(&test_key(200)));
+    let factory = Arc::new(LoopbackUdpFactory::default());
+    let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver))
+        .with_endpoint_resolver(resolver)
+        .with_udp_factory(factory.clone());
+    let error = provider
+        .prepare()
+        .await
+        .expect_err("a wrong peer key must not come up on any address");
+    assert!(
+        matches!(&error, TunnelError::WireGuardConnect { .. }),
+        "{error}"
+    );
+    assert_eq!(*factory.0.lock().expect("peers"), vec![dead, live]);
+}
+
+/// Each address still to try gets an even share of what is left, so a
+/// silent one cannot spend the time of those after it.
+#[tokio::test(start_paused = true)]
+async fn each_address_left_gets_an_even_share_of_the_budget() {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(9);
+    assert_eq!(super::share_of(deadline, 3), Duration::from_secs(3));
+    assert_eq!(super::share_of(deadline, 1), Duration::from_secs(9));
+    assert_eq!(super::share_of(deadline, 0), Duration::from_secs(9));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(super::share_of(deadline, 2), Duration::ZERO);
+}
