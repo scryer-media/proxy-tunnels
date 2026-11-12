@@ -10,7 +10,7 @@
 //! so a blocked reader costs nothing until its bytes arrive.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -22,7 +22,7 @@ use smoltcp::wire::IpEndpoint;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::TunnelError;
-use crate::wireguard::stack::StackShared;
+use crate::wireguard::stack::{MAX_LISTEN_BACKLOG, StackInner, StackShared};
 
 /// A TCP connection to something on the far side of the tunnel.
 pub struct WgTcpStream {
@@ -245,6 +245,11 @@ impl AsyncRead for WgTcpStream {
         context: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // A buffer with no room reads nothing, at once: there is nothing to
+        // wait for, and smoltcp would report the empty read as no data.
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let this = self.get_mut();
         let handle = this.handle;
         let fin_seen = &mut this.fin_seen;
@@ -388,40 +393,93 @@ impl AsyncWrite for WgTcpStream {
 ///
 /// smoltcp has no listen backlog: a listening socket *becomes* the
 /// connection. A backlog here is therefore a small pool of sockets all
-/// listening on the same port, replenished as each one is taken. Each accepted
-/// connection claims one of the tunnel's socket slots, exactly like a dial, so
-/// a flood of inbound peers cannot grow the tunnel's memory past its cap; one
-/// that arrives while the tunnel is full is reset and the listener moves on.
+/// listening on the same port. Every socket in the pool holds one of the
+/// tunnel's socket slots, as a dialled connection does, so neither a large
+/// backlog nor a flood of inbound peers can grow the tunnel's memory past its
+/// cap. An accepted connection keeps the slot its socket held, and the
+/// listener claims a new slot for the socket that takes its place. On a full
+/// tunnel that replacement waits: the pool runs short and refills as slots
+/// free, and a connection that arrives while no socket listens is refused.
 ///
 /// The listener lives and dies with its stack: once the stack stops, every
 /// pending and later [`WgTcpListener::accept`] fails.
 pub struct WgTcpListener {
     shared: Arc<StackShared>,
     local: SocketAddr,
+    /// The pool. Each socket in it holds one socket slot.
     listening: Vec<SocketHandle>,
+    /// How many sockets the pool keeps listening while the tunnel has room.
+    backlog: usize,
 }
 
 impl WgTcpListener {
-    /// Listen on `port` on every tunnel address. `local` is the address the
-    /// listener reports, which is the tunnel's first address and `port`.
+    /// Listen on `port` (`0` for a free ephemeral one) on every tunnel
+    /// address with `backlog` sockets, held between 1 and
+    /// [`MAX_LISTEN_BACKLOG`]. The listener reports `address` and the port.
+    ///
+    /// Every socket's slot is claimed before any socket exists, so a backlog
+    /// the tunnel cannot hold fails whole and allocates nothing. The port is
+    /// taken and its sockets made under one hold of the stack's lock, so two
+    /// listeners can never both take one port.
     pub(crate) fn bind(
         shared: Arc<StackShared>,
-        local: SocketAddr,
+        address: IpAddr,
+        port: u16,
         backlog: usize,
     ) -> Result<Self, TunnelError> {
         if shared.is_stopped() {
-            return Err(TunnelError::Engine("the tunnel has stopped".to_string()));
+            return Err(stopped());
         }
-        let mut listener = Self {
+        let backlog = backlog.clamp(1, MAX_LISTEN_BACKLOG);
+        let mut slots = Vec::with_capacity(backlog);
+        for _ in 0..backlog {
+            slots.push(shared.claim_socket()?);
+        }
+        #[cfg(test)]
+        shared.run_before_listen();
+        let (port, listening) = shared.with_stack(|stack| {
+            let port = stack.take_listen_port(port)?;
+            let mut listening = Vec::with_capacity(backlog);
+            for _ in 0..backlog {
+                match listen_on(stack, port) {
+                    Ok(handle) => listening.push(handle),
+                    Err(error) => {
+                        for handle in listening {
+                            stack.discard(handle);
+                        }
+                        stack.release_listen_port(port);
+                        return Err(error);
+                    }
+                }
+            }
+            Ok((port, listening))
+        })?;
+        for slot in slots {
+            slot.keep();
+        }
+        Ok(Self {
             shared,
-            local,
-            listening: Vec::with_capacity(backlog.max(1)),
-        };
-        for _ in 0..backlog.max(1) {
-            let handle = listen_one(&listener.shared, local.port())?;
-            listener.listening.push(handle);
+            local: SocketAddr::new(address, port),
+            listening,
+            backlog,
+        })
+    }
+
+    /// Bring the pool back to its backlog, as far as the tunnel has room.
+    fn refill(&mut self) {
+        let port = self.local.port();
+        while self.listening.len() < self.backlog {
+            let Ok(slot) = self.shared.claim_socket() else {
+                return;
+            };
+            match self.shared.with_stack(|stack| listen_on(stack, port)) {
+                Ok(handle) => {
+                    slot.keep();
+                    self.listening.push(handle);
+                }
+                Err(_) => return,
+            }
         }
-        Ok(listener)
     }
 
     /// The tunnel address and port this listener accepts on.
@@ -434,102 +492,109 @@ impl WgTcpListener {
     /// Fails once the tunnel's stack has stopped: no packet will ever reach
     /// the listener again, so waiting would be waiting forever.
     pub async fn accept(&mut self) -> Result<WgTcpStream, TunnelError> {
+        let port = self.local.port();
         loop {
-            let port = self.local.port();
-            let ready = std::future::poll_fn(|context| {
-                self.shared.peek_stack(|stack| {
-                    if self.shared.is_stopped() {
-                        return Poll::Ready(Err(TunnelError::Engine(
-                            "the tunnel has stopped".to_string(),
-                        )));
-                    }
-                    for (index, handle) in self.listening.iter().enumerate() {
-                        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(*handle);
-                        // `is_active` would also report a half-open
-                        // `SynReceived`, and handing that to a reader would
-                        // look like an immediate end of stream. Wait for the
-                        // handshake to finish.
-                        if socket.may_send() || socket.may_recv() {
-                            let peer = socket.remote_endpoint();
-                            return Poll::Ready(Ok((index, peer)));
-                        }
-                        if socket.state() == tcp::State::Closed {
-                            // A connection that was reset before it was taken
-                            // leaves its socket closed; put it back to work.
-                            let _ = socket.listen(port);
-                        }
-                        socket.register_recv_waker(context.waker());
-                        socket.register_send_waker(context.waker());
-                    }
-                    Poll::Pending
-                })
-            })
-            .await;
-
-            let (index, peer) = ready?;
-            let handle = self.listening.swap_remove(index);
-            match listen_one(&self.shared, port) {
-                Ok(fresh) => self.listening.push(fresh),
-                Err(error) => {
-                    self.shared.with_stack(|stack| {
-                        stack.sockets_mut().get_mut::<tcp::Socket>(handle).abort();
-                        stack.discard(handle);
-                    });
-                    return Err(error);
-                }
+            if self.shared.is_stopped() {
+                return Err(stopped());
             }
-
-            let peer = peer
-                .map(|endpoint| SocketAddr::new(endpoint.addr.into(), endpoint.port))
-                .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-            match self.shared.claim_socket() {
-                Ok(slot) => {
-                    slot.keep();
-                    return Ok(WgTcpStream::from_accepted(
-                        Arc::clone(&self.shared),
-                        handle,
-                        peer,
-                    ));
-                }
-                Err(_) => {
-                    // The tunnel is full. Reset this one, keep listening.
-                    self.shared.with_stack(|stack| {
-                        stack.sockets_mut().get_mut::<tcp::Socket>(handle).abort();
-                        stack.retire(handle, false);
-                    });
-                }
+            let notify = self.shared.slot_freed();
+            let freed = notify.notified();
+            tokio::pin!(freed);
+            // Registered before the claim, so a slot freed in between still
+            // wakes this accept.
+            freed.as_mut().enable();
+            self.refill();
+            if !self.listening.is_empty() {
+                break;
+            }
+            // Nothing listens until the tunnel has room for a socket again.
+            tokio::select! {
+                () = freed => {}
+                () = self.shared.wait_stopped() => {}
             }
         }
+
+        let ready = std::future::poll_fn(|context| {
+            self.shared.peek_stack(|stack| {
+                if self.shared.is_stopped() {
+                    return Poll::Ready(Err(stopped()));
+                }
+                for (index, handle) in self.listening.iter().enumerate() {
+                    let socket = stack.sockets_mut().get_mut::<tcp::Socket>(*handle);
+                    // `is_active` would also report a half-open
+                    // `SynReceived`, and handing that to a reader would
+                    // look like an immediate end of stream. Wait for the
+                    // handshake to finish.
+                    if socket.may_send() || socket.may_recv() {
+                        let peer = socket.remote_endpoint();
+                        return Poll::Ready(Ok((index, peer)));
+                    }
+                    if socket.state() == tcp::State::Closed {
+                        // A connection that was reset before it was taken
+                        // leaves its socket closed; put it back to work.
+                        let _ = socket.listen(port);
+                    }
+                    socket.register_recv_waker(context.waker());
+                    socket.register_send_waker(context.waker());
+                }
+                Poll::Pending
+            })
+        })
+        .await;
+
+        let (index, peer) = ready?;
+        // The socket's slot passes to the stream; the one that takes its
+        // place in the pool claims its own.
+        let handle = self.listening.swap_remove(index);
+        self.refill();
+
+        let peer = peer
+            .map(|endpoint| SocketAddr::new(endpoint.addr.into(), endpoint.port))
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        Ok(WgTcpStream::from_accepted(
+            Arc::clone(&self.shared),
+            handle,
+            peer,
+        ))
     }
 }
 
 impl Drop for WgTcpListener {
     fn drop(&mut self) {
         let handles = std::mem::take(&mut self.listening);
+        let released = handles.len();
+        let port = self.local.port();
         self.shared.with_stack(|stack| {
             for handle in handles {
                 stack.sockets_mut().get_mut::<tcp::Socket>(handle).abort();
                 stack.discard(handle);
             }
+            stack.release_listen_port(port);
         });
+        for _ in 0..released {
+            self.shared.release_socket();
+        }
     }
 }
 
-fn listen_one(shared: &Arc<StackShared>, port: u16) -> Result<SocketHandle, TunnelError> {
-    shared.with_stack(|stack| {
-        let handle = stack.add_tcp_socket();
-        match stack
-            .sockets_mut()
-            .get_mut::<tcp::Socket>(handle)
-            .listen(port)
-        {
-            Ok(()) => Ok(handle),
-            Err(error) => {
-                stack.discard(handle);
-                Err(TunnelError::Engine(format!(
-                    "the tunnel could not listen on port {port}: {error:?}"
-                )))
-            }
+fn stopped() -> TunnelError {
+    TunnelError::Engine("the tunnel has stopped".to_string())
+}
+
+/// Add one socket listening on `port`.
+fn listen_on(stack: &mut StackInner, port: u16) -> Result<SocketHandle, TunnelError> {
+    let handle = stack.add_tcp_socket();
+    match stack
+        .sockets_mut()
+        .get_mut::<tcp::Socket>(handle)
+        .listen(port)
+    {
+        Ok(()) => Ok(handle),
+        Err(error) => {
+            stack.discard(handle);
+            Err(TunnelError::Engine(format!(
+                "the tunnel could not listen on port {port}: {error:?}"
+            )))
         }
-    })
+    }
 }
