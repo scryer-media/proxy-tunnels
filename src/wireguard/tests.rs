@@ -1299,16 +1299,3 @@ async fn a_lost_first_initiation_is_sent_again_after_the_bring_up_resend() {
         "the resend came {resent:?} into the bring-up"
     );
 }
-
-/// Both the first peer and the one a resend puts in its place run on
-/// gotatun's own timers, so a tunnel that is up rekeys and retries as
-/// WireGuard specifies.
-#[tokio::test]
-async fn the_bring_up_peer_keeps_gotatuns_timers() {
-    let peer = WireGuardTestPeer::start().await;
-    let provider = WireGuardTunnelProvider::new(
-        peer.client_spec("proxy-timers"),
-        Arc::new(NoopTunnelObserver),
-    );
-    assert!(provider.peer(peer.endpoint()).danger_timer_params.is_none());
-}

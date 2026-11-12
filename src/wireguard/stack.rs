@@ -53,8 +53,9 @@ use smoltcp::wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr as SmolCidr
 use tokio::sync::Notify;
 
 use crate::error::{SlotFreed, TunnelError};
-use crate::wireguard::adapter::{InboundRx, OutboundTx, PACKET_QUEUE_DEPTH};
-use crate::wireguard::phy::WgPhy;
+#[cfg(any(test, feature = "test-support"))]
+use crate::wireguard::adapter::{InboundRx, OutboundTx};
+use crate::wireguard::phy::{Outbound, PACKET_QUEUE_DEPTH, WgPhy};
 use crate::wireguard::spec::IpCidr;
 use crate::wireguard::tcp::{WgTcpListener, WgTcpStream};
 use crate::wireguard::udp::WgUdpSocket;
@@ -184,6 +185,18 @@ impl StackShared {
         &self.config
     }
 
+    /// Resolves at the next [`Self::wake`], or at once for a wake that came
+    /// since the last one was taken.
+    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.wake.notified()
+    }
+
+    /// Marks the stack stopped when dropped, however the task holding it
+    /// ends, including by abort.
+    pub(crate) fn stop_on_exit(self: &Arc<Self>) -> StopOnExit {
+        StopOnExit(Arc::clone(self))
+    }
+
     /// Claim one of the stack's socket slots.
     pub(crate) fn claim_socket(&self) -> Result<SocketSlot<'_>, TunnelError> {
         let cap = self.config.max_sockets;
@@ -258,7 +271,7 @@ impl StackShared {
 }
 
 /// Marks the stack stopped however the pump ends, including by abort.
-struct StopOnExit(Arc<StackShared>);
+pub(crate) struct StopOnExit(Arc<StackShared>);
 
 impl Drop for StopOnExit {
     fn drop(&mut self) {
@@ -391,6 +404,27 @@ impl StackInner {
         Some((self.sockets.get_mut::<dns::Socket>(handle), handle))
     }
 
+    /// One pass for the engine: hand the interface every packet in
+    /// `inbound`, poll once, and move every packet the poll composed to
+    /// `outbound`. Returns how long the engine may sleep.
+    pub(crate) fn pass(
+        &mut self,
+        inbound: &mut Vec<Packet<Ip>>,
+        outbound: &mut Vec<Packet<Ip>>,
+    ) -> Option<Duration> {
+        for packet in inbound.drain(..) {
+            self.phy.push_inbound(packet);
+        }
+        let delay = self.poll();
+        self.phy.take_outbound(outbound);
+        delay
+    }
+
+    /// Packets the link discarded in each direction.
+    pub(crate) fn drop_counts(&self) -> (u64, u64) {
+        self.phy.drop_counts()
+    }
+
     /// One poll of the whole stack. Returns how long the pump may sleep.
     fn poll(&mut self) -> Option<Duration> {
         let now = self.now();
@@ -456,11 +490,13 @@ pub struct WgStack {
 }
 
 impl WgStack {
-    /// Build the interface and start its pump on `runtime`.
+    /// Build the interface and start its pump on `runtime`, joined to a
+    /// gotatun device by the adapter channels.
     ///
     /// Returns the stack and the pump's join handle; dropping the handle's
     /// owner (or notifying `shutdown`) stops the stack, which closes the
     /// adapter channels, which stops the gotatun device.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn start(
         config: StackConfig,
         inbound: InboundRx,
@@ -468,6 +504,23 @@ impl WgStack {
         shutdown: Arc<Notify>,
         runtime: &tokio::runtime::Handle,
     ) -> (WgStack, tokio::task::JoinHandle<()>) {
+        let stack = Self::build(config, Outbound::Channel(outbound));
+        let pump = runtime.spawn(pump(Arc::clone(&stack.shared), inbound, shutdown));
+        (stack, pump)
+    }
+
+    /// Build the interface with nothing driving it yet. Its composed packets
+    /// wait in a queue for the engine that drives it to take.
+    pub(crate) fn build_for_engine(config: StackConfig) -> WgStack {
+        Self::build(config, Outbound::queue())
+    }
+
+    /// The state the engine driving this stack shares with its sockets.
+    pub(crate) fn shared(&self) -> &Arc<StackShared> {
+        &self.shared
+    }
+
+    fn build(config: StackConfig, outbound: Outbound) -> WgStack {
         let mut phy = WgPhy::new(outbound, config.mtu);
         let started = std::time::Instant::now();
 
@@ -563,8 +616,7 @@ impl WgStack {
             stopped_notify: Notify::new(),
         });
 
-        let pump = runtime.spawn(pump(Arc::clone(&shared), inbound, shutdown));
-        (WgStack { shared }, pump)
+        WgStack { shared }
     }
 
     /// Open a TCP connection to `remote` through the tunnel.
@@ -651,11 +703,7 @@ impl WgStack {
     /// dropped by a buffer meant for a handful of queries.
     pub fn bind_transport_udp(&self, port: u16) -> Result<WgUdpSocket, TunnelError> {
         let mtu = usize::from(self.shared.config().mtu);
-        self.bind_udp_sized(
-            port,
-            crate::wireguard::adapter::PACKET_QUEUE_DEPTH,
-            crate::wireguard::adapter::PACKET_QUEUE_DEPTH * mtu,
-        )
+        self.bind_udp_sized(port, PACKET_QUEUE_DEPTH, PACKET_QUEUE_DEPTH * mtu)
     }
 
     fn bind_udp_sized(
@@ -879,12 +927,13 @@ impl Drop for QueryGuard<'_> {
     }
 }
 
-/// The one task that drives smoltcp.
+/// The one task that drives smoltcp for a gotatun device.
 ///
 /// It never busy-loops: after each poll it parks on whichever of the four
 /// things can possibly need it next. Each pass first takes every packet the
 /// device has already handed over, so a burst costs one poll rather than one
 /// per packet, and the one timer is moved rather than rebuilt.
+#[cfg(any(test, feature = "test-support"))]
 async fn pump(shared: Arc<StackShared>, mut inbound: InboundRx, shutdown: Arc<Notify>) {
     let _stop = StopOnExit(Arc::clone(&shared));
     let proxy_config_id = shared.config().proxy_config_id.clone();

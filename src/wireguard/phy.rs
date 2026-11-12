@@ -16,15 +16,65 @@ use gotatun::packet::{Ip, Packet, PacketBufPool};
 use smoltcp::phy::{self, ChecksumCapabilities, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
-use crate::wireguard::adapter::{OutboundTx, PACKET_QUEUE_DEPTH};
+#[cfg(any(test, feature = "test-support"))]
+use crate::wireguard::adapter::OutboundTx;
+
+/// How many packets may wait in either direction of the link before the
+/// producer feels back-pressure.
+///
+/// A tunnel is a link, and links have queues. This one is deliberately small:
+/// it is one bandwidth-delay product's worth of a slow link, which is enough
+/// that a burst is absorbed and small enough that a stalled reader turns into
+/// loss (which TCP handles) rather than unbounded memory (which it does not).
+pub(crate) const PACKET_QUEUE_DEPTH: usize = 512;
+
+/// Where the packets smoltcp composes go.
+pub(crate) enum Outbound {
+    /// Held for the engine that drives this stack, which takes them after
+    /// each poll and encrypts them on the same pass.
+    Queue(VecDeque<Packet<Ip>>),
+    /// Sent to a gotatun device's tunnel channel.
+    #[cfg(any(test, feature = "test-support"))]
+    Channel(OutboundTx),
+}
+
+impl Outbound {
+    /// An empty queue, for an engine that drains it after every poll.
+    pub(crate) fn queue() -> Self {
+        Self::Queue(VecDeque::with_capacity(PACKET_QUEUE_DEPTH))
+    }
+
+    fn is_full(&self) -> bool {
+        match self {
+            Self::Queue(queue) => queue.len() >= PACKET_QUEUE_DEPTH,
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Channel(channel) => channel.capacity() == 0,
+        }
+    }
+
+    /// Hand on one packet; false when it had to be dropped.
+    fn push(&mut self, packet: Packet<Ip>) -> bool {
+        match self {
+            Self::Queue(queue) => {
+                if queue.len() >= PACKET_QUEUE_DEPTH {
+                    return false;
+                }
+                queue.push_back(packet);
+                true
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Channel(channel) => channel.try_send(packet).is_ok(),
+        }
+    }
+}
 
 /// The smoltcp side of the link.
 pub(crate) struct WgPhy {
     /// Decrypted packets waiting to be handed to the interface. Filled by the
-    /// stack pump from the inbound channel, drained by `receive`.
+    /// stack pump, drained by `receive`.
     inbound: VecDeque<Packet<Ip>>,
     /// Where composed packets go to be encrypted.
-    outbound: OutboundTx,
+    outbound: Outbound,
     /// Buffers for outbound packets. Sized to the in-flight depth of the
     /// outbound channel so a saturated link recycles rather than allocates.
     pool: PacketBufPool,
@@ -39,7 +89,7 @@ pub(crate) struct WgPhy {
 }
 
 impl WgPhy {
-    pub(crate) fn new(outbound: OutboundTx, mtu: u16) -> Self {
+    pub(crate) fn new(outbound: Outbound, mtu: u16) -> Self {
         Self {
             inbound: VecDeque::with_capacity(PACKET_QUEUE_DEPTH),
             outbound,
@@ -61,6 +111,16 @@ impl WgPhy {
             self.overrun += 1;
         }
         self.inbound.push_back(packet);
+    }
+
+    /// Move every composed packet waiting in the outbound queue to the end of
+    /// `into`, oldest first. Nothing moves for a device channel.
+    pub(crate) fn take_outbound(&mut self, into: &mut Vec<Packet<Ip>>) {
+        match &mut self.outbound {
+            Outbound::Queue(queue) => into.extend(queue.drain(..)),
+            #[cfg(any(test, feature = "test-support"))]
+            Outbound::Channel(_) => {}
+        }
     }
 
     /// Packets discarded in each direction, for tracing on teardown.
@@ -90,10 +150,10 @@ impl phy::Device for WgPhy {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        // The outbound channel is bounded; refusing a token while it is full
+        // The outbound link is bounded; refusing a token while it is full
         // is how back-pressure reaches smoltcp, which will simply retry on
         // the next poll and leave the segment in the socket's send buffer.
-        if self.outbound.capacity() == 0 {
+        if self.outbound.is_full() {
             return None;
         }
         Some(WgTxToken { device: self })
@@ -139,7 +199,7 @@ impl phy::TxToken for WgTxToken<'_> {
 
         match packet.try_into_ip() {
             Ok(packet) => {
-                if self.device.outbound.try_send(packet).is_err() {
+                if !self.device.outbound.push(packet) {
                     // Full, or the device is gone. Either way this packet is
                     // lost, which is a link doing what links do.
                     self.device.dropped += 1;
@@ -180,7 +240,7 @@ mod tests {
     #[tokio::test]
     async fn the_capabilities_describe_a_point_to_point_ip_link() {
         let (_to_stack, _to_device, _inbound, outbound) = ip_channels(1280);
-        let phy = WgPhy::new(outbound, 1280);
+        let phy = WgPhy::new(Outbound::Channel(outbound), 1280);
         let capabilities = phy.capabilities();
         assert_eq!(capabilities.medium, Medium::Ip);
         assert_eq!(capabilities.max_transmission_unit, 1280);
@@ -189,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn transmit_composes_into_the_outbound_channel() {
         let (_to_stack, mut to_device, _inbound, outbound) = ip_channels(1280);
-        let mut phy = WgPhy::new(outbound, 1280);
+        let mut phy = WgPhy::new(Outbound::Channel(outbound), 1280);
 
         let bytes = Packet::<[u8]>::from(packet(b"hello")).as_ref().to_vec();
         let token = phy.transmit(Instant::from_micros(0)).expect("a tx token");
@@ -209,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn receive_hands_the_interface_the_decrypted_bytes() {
         let (_to_stack, _to_device, _inbound, outbound) = ip_channels(1280);
-        let mut phy = WgPhy::new(outbound, 1280);
+        let mut phy = WgPhy::new(Outbound::Channel(outbound), 1280);
         assert!(phy.receive(Instant::from_micros(0)).is_none());
 
         let expected = Packet::<[u8]>::from(packet(b"inbound")).as_ref().to_vec();
@@ -227,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_inbound_queue_drops_the_oldest_rather_than_growing() {
         let (_to_stack, _to_device, _inbound, outbound) = ip_channels(1280);
-        let mut phy = WgPhy::new(outbound, 1280);
+        let mut phy = WgPhy::new(Outbound::Channel(outbound), 1280);
         for _ in 0..PACKET_QUEUE_DEPTH + 4 {
             phy.push_inbound(packet(b"flood"));
         }
@@ -239,7 +299,7 @@ mod tests {
     async fn a_congested_link_refuses_a_transmit_token_instead_of_buffering() {
         let (_to_stack, _to_device, _inbound, outbound) = ip_channels(1280);
         let bytes = Packet::<[u8]>::from(packet(b"x")).as_ref().to_vec();
-        let mut phy = WgPhy::new(outbound, 1280);
+        let mut phy = WgPhy::new(Outbound::Channel(outbound), 1280);
 
         // Fill the outbound channel without anyone draining it.
         for _ in 0..PACKET_QUEUE_DEPTH {
@@ -255,5 +315,44 @@ mod tests {
             (0, 0),
             "nothing was dropped, only deferred"
         );
+    }
+
+    #[test]
+    fn transmit_composes_into_the_engine_queue_in_order() {
+        let mut phy = WgPhy::new(Outbound::queue(), 1280);
+        let first = Packet::<[u8]>::from(packet(b"first")).as_ref().to_vec();
+        let second = Packet::<[u8]>::from(packet(b"second")).as_ref().to_vec();
+        for bytes in [&first, &second] {
+            let token = phy.transmit(Instant::from_micros(0)).expect("a tx token");
+            token.consume(bytes.len(), |buffer| buffer.copy_from_slice(bytes));
+        }
+
+        let mut taken = Vec::new();
+        phy.take_outbound(&mut taken);
+        let taken: Vec<Vec<u8>> = taken
+            .into_iter()
+            .map(|packet| Packet::<[u8]>::from(packet).as_ref().to_vec())
+            .collect();
+        assert_eq!(taken, vec![first, second]);
+        let mut again = Vec::new();
+        phy.take_outbound(&mut again);
+        assert!(again.is_empty(), "each packet is taken exactly once");
+        assert_eq!(phy.drop_counts(), (0, 0));
+    }
+
+    #[test]
+    fn a_full_engine_queue_refuses_a_transmit_token_until_it_is_taken() {
+        let mut phy = WgPhy::new(Outbound::queue(), 1280);
+        let bytes = Packet::<[u8]>::from(packet(b"x")).as_ref().to_vec();
+        for _ in 0..PACKET_QUEUE_DEPTH {
+            let token = phy.transmit(Instant::from_micros(0)).expect("a tx token");
+            token.consume(bytes.len(), |buffer| buffer.copy_from_slice(&bytes));
+        }
+        assert!(phy.transmit(Instant::from_micros(0)).is_none());
+
+        let mut taken = Vec::new();
+        phy.take_outbound(&mut taken);
+        assert_eq!(taken.len(), PACKET_QUEUE_DEPTH);
+        assert!(phy.transmit(Instant::from_micros(0)).is_some());
     }
 }
