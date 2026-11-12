@@ -38,6 +38,7 @@
 //! other one has been, which is longer than any TIME-WAIT this stack can
 //! produce.
 
+use std::collections::HashSet;
 use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -176,6 +177,11 @@ pub(crate) struct StackShared {
     stopped_notify: Notify,
     #[cfg(test)]
     pub(crate) counts: StackCounts,
+    /// Run by a new listener after its slots are claimed and before it
+    /// takes its port, so a test can bring two listeners to that point
+    /// together.
+    #[cfg(test)]
+    pub(crate) before_listen: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// How often the stack's lock was taken and its pump woken.
@@ -225,6 +231,18 @@ impl StackShared {
         self.counts.lock();
         let mut inner = self.inner.lock().expect("tunnel stack lock poisoned");
         f(&mut inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_before_listen(&self) {
+        let hook = self
+            .before_listen
+            .lock()
+            .expect("listen hook lock poisoned")
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Ask the pump for a poll.
@@ -387,6 +405,9 @@ pub(crate) struct StackInner {
     closing: Vec<Closing>,
     open_sockets: Arc<SocketSlots>,
     tcp_buffer_bytes: usize,
+    /// The ports listeners on this stack hold, each for as long as its
+    /// listener lives, whether or not a socket is listening on it now.
+    listen_ports: HashSet<u16>,
 }
 
 impl StackInner {
@@ -442,6 +463,39 @@ impl StackInner {
             port + 1
         };
         port
+    }
+
+    /// Take `port` for a new listener, or with `0` a free port in the
+    /// ephemeral range, starting from a random one. Checking and taking
+    /// happen under the one lock, so two listeners never hold one port.
+    pub(crate) fn take_listen_port(&mut self, port: u16) -> Result<u16, TunnelError> {
+        let port = if port != 0 {
+            if self.listen_ports.contains(&port) {
+                return Err(TunnelError::Engine(format!(
+                    "the tunnel already listens on port {port}"
+                )));
+            }
+            port
+        } else {
+            let span = u64::from(EPHEMERAL_LAST - EPHEMERAL_FIRST) + 1;
+            let start = std::hash::BuildHasher::hash_one(
+                &std::collections::hash_map::RandomState::new(),
+                std::time::Instant::now(),
+            ) % span;
+            (0..span)
+                .map(|step| EPHEMERAL_FIRST + ((start + step) % span) as u16)
+                .find(|port| !self.listen_ports.contains(port))
+                .ok_or_else(|| {
+                    TunnelError::Engine("the tunnel has no free port left to listen on".to_string())
+                })?
+        };
+        self.listen_ports.insert(port);
+        Ok(port)
+    }
+
+    /// Give back a port a listener held.
+    pub(crate) fn release_listen_port(&mut self, port: u16) {
+        self.listen_ports.remove(&port);
     }
 
     /// Hand a closed socket back for reclamation.
@@ -672,6 +726,7 @@ impl WgStack {
                     + (seed % u64::from(EPHEMERAL_LAST - EPHEMERAL_FIRST + 1)) as u16,
                 closing: Vec::new(),
                 open_sockets: Arc::clone(&open_sockets),
+                listen_ports: HashSet::new(),
             }),
             wake: Notify::new(),
             open_sockets,
@@ -681,6 +736,8 @@ impl WgStack {
             stopped_notify: Notify::new(),
             #[cfg(test)]
             counts: StackCounts::default(),
+            #[cfg(test)]
+            before_listen: Mutex::new(None),
         });
 
         WgStack { shared }
@@ -711,15 +768,6 @@ impl WgStack {
     /// so a backlog the tunnel has no room for fails with
     /// [`TunnelError::AtCapacity`] and listens on nothing.
     pub fn listen(&self, port: u16, backlog: usize) -> Result<WgTcpListener, TunnelError> {
-        let port = if port == 0 {
-            self.free_listen_port()?
-        } else if self.listening_on(port) {
-            return Err(TunnelError::Engine(format!(
-                "the tunnel already listens on port {port}"
-            )));
-        } else {
-            port
-        };
         let address = self
             .shared
             .config()
@@ -727,39 +775,13 @@ impl WgStack {
             .first()
             .map(|cidr| cidr.address)
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-        WgTcpListener::bind(
-            Arc::clone(&self.shared),
-            SocketAddr::new(address, port),
-            backlog,
-        )
+        WgTcpListener::bind(Arc::clone(&self.shared), address, port, backlog)
     }
 
-    /// Whether a listener on this stack already holds `port`.
+    /// Whether a listener on this stack holds `port`.
     pub(crate) fn listening_on(&self, port: u16) -> bool {
-        self.shared.peek_stack(|stack| {
-            stack.sockets.iter().any(|(_, socket)| match socket {
-                smoltcp::socket::Socket::Tcp(socket) => {
-                    socket.is_listening() && socket.listen_endpoint().port == port
-                }
-                _ => false,
-            })
-        })
-    }
-
-    /// A port in the ephemeral range no listener on this stack holds, starting
-    /// from a random one.
-    fn free_listen_port(&self) -> Result<u16, TunnelError> {
-        let span = u64::from(EPHEMERAL_LAST - EPHEMERAL_FIRST) + 1;
-        let start = std::hash::BuildHasher::hash_one(
-            &std::collections::hash_map::RandomState::new(),
-            std::time::Instant::now(),
-        ) % span;
-        (0..span)
-            .map(|step| EPHEMERAL_FIRST + ((start + step) % span) as u16)
-            .find(|port| !self.listening_on(*port))
-            .ok_or_else(|| {
-                TunnelError::Engine("the tunnel has no free port left to listen on".to_string())
-            })
+        self.shared
+            .peek_stack(|stack| stack.listen_ports.contains(&port))
     }
 
     /// Bind a UDP socket inside the tunnel. `0` picks an ephemeral port.
@@ -1590,6 +1612,54 @@ mod resource_tests {
         assert_eq!((open_slots(&stack), socket_count(&stack)), (0, 0));
     }
 
+    /// Run `listen(port, 2)` on two threads that both reach the point where
+    /// a listener takes its port before either goes on.
+    fn listen_together(stack: &WgStack, port: u16) -> [Result<WgTcpListener, TunnelError>; 2] {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let at = Arc::clone(&barrier);
+        *stack.shared.before_listen.lock().unwrap() = Some(Arc::new(move || {
+            at.wait();
+        }));
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(|| stack.listen(port, 2));
+            let second = scope.spawn(|| stack.listen(port, 2));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        *stack.shared.before_listen.lock().unwrap() = None;
+        results
+    }
+
+    /// Two listeners asking for one port at the same moment: one gets it,
+    /// the other is refused, and accepted connections are never split
+    /// between two listeners.
+    #[test]
+    fn two_listeners_racing_for_one_port_get_one_listener() {
+        let stack = capped_engine_stack(DEFAULT_MAX_SOCKETS);
+        let [first, second] = listen_together(&stack, 7000);
+        let (listener, refused) = match (first, second) {
+            (Ok(listener), Err(refused)) | (Err(refused), Ok(listener)) => (listener, refused),
+            (Ok(_), Ok(_)) => panic!("two listeners took port 7000"),
+            (Err(first), Err(second)) => panic!("both refused: {first}; {second}"),
+        };
+        assert_eq!(listener.local_addr().port(), 7000);
+        assert!(
+            matches!(&refused, TunnelError::Engine(detail) if detail.contains("already listens on port 7000")),
+            "{refused}"
+        );
+        assert_eq!(open_slots(&stack), 2, "the refused listener holds nothing");
+        assert_eq!(socket_count(&stack), 2);
+    }
+
+    /// Two listeners asking for any port at the same moment get two
+    /// different ports.
+    #[test]
+    fn two_listeners_racing_for_any_port_get_different_ports() {
+        let stack = capped_engine_stack(DEFAULT_MAX_SOCKETS);
+        let [first, second] = listen_together(&stack, 0);
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_ne!(first.local_addr().port(), second.local_addr().port());
+    }
+
     /// What one poll of a stack holding `count` idle established TCP
     /// connections costs, on this machine. Two stacks are wired back to back,
     /// one dials the other `count` times, and once every connection is up the
@@ -1970,6 +2040,10 @@ mod link_tests {
         assert_eq!(open_slots(&pair.far), MIN_MAX_SOCKETS);
         assert_eq!(socket_count(&pair.far), MIN_MAX_SOCKETS);
         assert_eq!(listening_count(&pair.far), 0);
+        assert!(
+            pair.far.listening_on(PORT),
+            "a listener holds its port while no socket listens on it"
+        );
 
         let waiting = tokio::spawn(async move {
             let accepted = listener.accept().await;

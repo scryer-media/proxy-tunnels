@@ -10,7 +10,7 @@
 //! so a blocked reader costs nothing until its bytes arrive.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -408,15 +408,18 @@ pub struct WgTcpListener {
 }
 
 impl WgTcpListener {
-    /// Listen on `port` on every tunnel address with `backlog` sockets, held
-    /// between 1 and [`MAX_LISTEN_BACKLOG`]. `local` is the address the
-    /// listener reports, which is the tunnel's first address and `port`.
+    /// Listen on `port` (`0` for a free ephemeral one) on every tunnel
+    /// address with `backlog` sockets, held between 1 and
+    /// [`MAX_LISTEN_BACKLOG`]. The listener reports `address` and the port.
     ///
     /// Every socket's slot is claimed before any socket exists, so a backlog
-    /// the tunnel cannot hold fails whole and allocates nothing.
+    /// the tunnel cannot hold fails whole and allocates nothing. The port is
+    /// taken and its sockets made under one hold of the stack's lock, so two
+    /// listeners can never both take one port.
     pub(crate) fn bind(
         shared: Arc<StackShared>,
-        local: SocketAddr,
+        address: IpAddr,
+        port: u16,
         backlog: usize,
     ) -> Result<Self, TunnelError> {
         if shared.is_stopped() {
@@ -427,8 +430,10 @@ impl WgTcpListener {
         for _ in 0..backlog {
             slots.push(shared.claim_socket()?);
         }
-        let port = local.port();
-        let listening = shared.with_stack(|stack| {
+        #[cfg(test)]
+        shared.run_before_listen();
+        let (port, listening) = shared.with_stack(|stack| {
+            let port = stack.take_listen_port(port)?;
             let mut listening = Vec::with_capacity(backlog);
             for _ in 0..backlog {
                 match listen_on(stack, port) {
@@ -437,18 +442,19 @@ impl WgTcpListener {
                         for handle in listening {
                             stack.discard(handle);
                         }
+                        stack.release_listen_port(port);
                         return Err(error);
                     }
                 }
             }
-            Ok(listening)
+            Ok((port, listening))
         })?;
         for slot in slots {
             slot.keep();
         }
         Ok(Self {
             shared,
-            local,
+            local: SocketAddr::new(address, port),
             listening,
             backlog,
         })
@@ -552,11 +558,13 @@ impl Drop for WgTcpListener {
     fn drop(&mut self) {
         let handles = std::mem::take(&mut self.listening);
         let released = handles.len();
+        let port = self.local.port();
         self.shared.with_stack(|stack| {
             for handle in handles {
                 stack.sockets_mut().get_mut::<tcp::Socket>(handle).abort();
                 stack.discard(handle);
             }
+            stack.release_listen_port(port);
         });
         for _ in 0..released {
             self.shared.release_socket();
