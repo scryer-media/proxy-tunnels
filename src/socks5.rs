@@ -407,9 +407,11 @@ impl Socks5Front {
         let password_len = stream.read_u8().await? as usize;
         let mut password = vec![0u8; password_len];
         stream.read_exact(&mut password).await?;
-        if username != self.credentials.username.as_bytes()
-            || password != self.credentials.password.as_bytes()
-        {
+        // Both values are always compared, and `&` rather than `&&` keeps a
+        // wrong username from skipping the password comparison.
+        let username_matches = credential_matches(self.credentials.username.as_bytes(), &username);
+        let password_matches = credential_matches(self.credentials.password.as_bytes(), &password);
+        if !(username_matches & password_matches) {
             stream.write_all(&[1, 1]).await?;
             return Err(Socks5Failure::Protocol("authentication failed"));
         }
@@ -466,6 +468,32 @@ impl Socks5Front {
         stream.read_exact(&mut port).await?;
         Ok((host, u16::from_be_bytes(port)))
     }
+}
+
+/// Whether a supplied credential equals the expected one, in time that does
+/// not depend on where, or whether, they differ.
+///
+/// RFC 1929 caps each value at 255 bytes, so both are copied into zeroed
+/// buffers of 256 bytes and every byte is compared. The lengths are compared
+/// too, folded into the same result, so a shorter value padded with zeros
+/// cannot match and a length mismatch does not end the comparison early.
+fn credential_matches(expected: &[u8], supplied: &[u8]) -> bool {
+    const WIDTH: usize = 256;
+    // Neither length is secret here: the expected one is checked at
+    // construction and the supplied one came off the wire.
+    if expected.len() >= WIDTH || supplied.len() >= WIDTH {
+        return false;
+    }
+    let mut want = [0u8; WIDTH];
+    let mut got = [0u8; WIDTH];
+    want[..expected.len()].copy_from_slice(expected);
+    got[..supplied.len()].copy_from_slice(supplied);
+    // Both lengths are below 256, so the XOR fits in a byte.
+    let mut difference = (expected.len() ^ supplied.len()) as u8;
+    for (want, got) in want.iter().zip(got.iter()) {
+        difference |= want ^ got;
+    }
+    std::hint::black_box(difference) == 0
 }
 
 /// Read from a client whose tunnel is still dialling. Returns only when the
@@ -1233,6 +1261,41 @@ mod tests {
         let _ = client.write_all(&vec![0u8; MAX_EARLY_DATA + 1]).await;
         assert!(dropped.await.is_err(), "the dial future was dropped");
         assert!(task.await.unwrap().is_err());
+    }
+
+    #[test]
+    fn credentials_match_only_when_equal_in_content_and_length() {
+        assert!(credential_matches(b"test-secret", b"test-secret"));
+        assert!(credential_matches(&[0xff; 255], &[0xff; 255]));
+        assert!(!credential_matches(b"test-secret", b"test-secreT"));
+        assert!(!credential_matches(b"test-secret", b"Test-secret"));
+        // A prefix, an extension, and padding that only zeros could hide.
+        assert!(!credential_matches(b"test-secret", b"test-secre"));
+        assert!(!credential_matches(b"test-secret", b"test-secretX"));
+        assert!(!credential_matches(b"secret", b"secret\0"));
+        assert!(!credential_matches(b"secret", b""));
+        assert!(!credential_matches(&[0xff; 255], &[0xff; 254]));
+    }
+
+    #[tokio::test]
+    async fn a_right_username_with_a_near_miss_password_is_refused() {
+        let provider = FakeProvider::new();
+        let (addr, shutdown) = start_front(provider.clone(), RecordingObserver::new()).await;
+        for auth in [
+            b"\x01\x09test-user\x0atest-secre".as_slice(),
+            b"\x01\x09test-user\x0ctest-secretX".as_slice(),
+            b"\x01\x0atest-userX\x0btest-secret".as_slice(),
+        ] {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&[5, 1, 2]).await.unwrap();
+            let mut response = [0; 2];
+            stream.read_exact(&mut response).await.unwrap();
+            stream.write_all(auth).await.unwrap();
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [1, 1]);
+        }
+        assert!(provider.dialled().is_empty());
+        shutdown.notify_one();
     }
 
     #[test]
