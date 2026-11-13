@@ -168,6 +168,9 @@ pub(crate) struct Engine {
     initiated: Option<std::time::Instant>,
     /// The round trip the last answered initiation measured.
     round_trip: Option<Duration>,
+    /// Whether the current [`Tunn`] took in a cookie reply: the peer is
+    /// under load and answers only an initiation that carries the cookie.
+    cookie: bool,
 }
 
 impl Engine {
@@ -195,7 +198,31 @@ impl Engine {
             send_buf: Default::default(),
             initiated: None,
             round_trip: None,
+            cookie: false,
         }
+    }
+
+    /// Initiate afresh, as [`EngineStatus::restart`] asks.
+    ///
+    /// Without a cookie in hand the handshake state is dropped and a new
+    /// [`Tunn`] initiates, as if the engine had just been built. A peer that
+    /// answered with a cookie is under load and answers only an initiation
+    /// that carries it, and the cookie lives in the [`Tunn`]: dropping that
+    /// would earn another cookie, and the answer would wait for gotatun's own
+    /// retry. So with a cookie the current [`Tunn`] sends a new initiation
+    /// instead, with a new ephemeral key, a later timestamp and the cookie.
+    fn restart(&mut self, wire: &mut Vec<(Packet, SocketAddr)>) {
+        if self.cookie
+            && let Some(initiation) = self.tunn.format_handshake_initiation(true)
+        {
+            let initiation = WgKind::HandshakeInit(initiation);
+            self.note_sent(&initiation);
+            wire.push((initiation.into(), self.config.endpoint));
+            return;
+        }
+        self.tunn = fresh_tunn(&self.config, &self.index_table, &self.rate_limiter);
+        self.cookie = false;
+        self.initiate(wire);
     }
 
     /// Note an outgoing handshake initiation, whose response measures the
@@ -225,8 +252,7 @@ impl Engine {
         self.initiate(&mut wire);
         loop {
             if self.status.restart.swap(false, Ordering::AcqRel) {
-                self.tunn = fresh_tunn(&self.config, &self.index_table, &self.rate_limiter);
-                self.initiate(&mut wire);
+                self.restart(&mut wire);
             }
             let now = tokio::time::Instant::now();
             if now >= next_tick {
@@ -386,7 +412,11 @@ impl Engine {
         };
         let handshake = matches!(message, WgKind::HandshakeInit(_) | WgKind::HandshakeResp(_));
         let response = matches!(message, WgKind::HandshakeResp(_));
+        let cookie = matches!(message, WgKind::CookieReply(_));
         match self.tunn.handle_incoming_packet(message) {
+            // gotatun answers an accepted cookie reply with `Done`, and one
+            // it could not open with `Err`.
+            TunnResult::Done if cookie => self.cookie = true,
             TunnResult::Done | TunnResult::Err(_) => {}
             TunnResult::WriteToNetwork(answer) => {
                 if handshake {

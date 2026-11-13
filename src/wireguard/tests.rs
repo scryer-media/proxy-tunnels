@@ -1253,9 +1253,27 @@ async fn the_handshake_time_is_the_measured_round_trip() {
     );
 }
 
-/// A loopback hop between a client and a peer that drops the client's first
-/// `dropped` handshake initiations, and records on the tokio clock when each
-/// initiation reached it.
+/// Which of the client's datagrams an [`InitiationRelay`] passes to the peer.
+enum RelayPasses {
+    /// Everything after the first `n` handshake initiations.
+    AfterInitiations(usize),
+    /// Nothing that reaches the relay before this long after it started,
+    /// as a server that drops everything for a while after a cold handshake.
+    From(Duration),
+    /// Only an initiation that carries the cookie of a responder under
+    /// load; any other initiation is answered with a cookie reply, as that
+    /// responder answers it. Everything else passes.
+    UnderLoad(gotatun::noise::rate_limiter::RateLimiter),
+}
+
+/// A loopback hop between a client and a peer that passes the client's
+/// datagrams as `passes` says, and records on the tokio clock when each
+/// handshake initiation reached it.
+///
+/// While an initiation it passed waits for the peer's answer, the relay
+/// holds the paused clock still (a running blocking task stops it from
+/// advancing), so the answer arrives at the moment it was sent on the tokio
+/// clock however long the peer took on the real one.
 struct InitiationRelay {
     address: SocketAddr,
     initiations: Arc<Mutex<Vec<tokio::time::Instant>>>,
@@ -1264,12 +1282,21 @@ struct InitiationRelay {
 
 impl InitiationRelay {
     async fn start(peer: SocketAddr, dropped: usize) -> Self {
+        Self::start_passing(peer, RelayPasses::AfterInitiations(dropped)).await
+    }
+
+    async fn start_passing(peer: SocketAddr, passes: RelayPasses) -> Self {
         let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("the relay binds");
         let address = socket.local_addr().expect("the relay's address");
         let initiations = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&initiations);
+        let opened = tokio::time::Instant::now();
+        // Rung once for each datagram the peer sends back; dropped with the
+        // task, which frees any hold still waiting.
+        let (answered, answers) = std::sync::mpsc::channel::<()>();
+        let answers = Arc::new(Mutex::new(answers));
         let task = tokio::spawn(async move {
             let mut client = None;
             let mut buffer = vec![0u8; 65_536];
@@ -1280,18 +1307,44 @@ impl InitiationRelay {
                 let datagram = &buffer[..read];
                 if from != peer {
                     client = Some(from);
-                    if datagram.first() == Some(&1) {
+                    let initiation = datagram.first() == Some(&1);
+                    let mut count = 0;
+                    if initiation {
                         let mut seen = seen.lock().expect("initiations");
                         seen.push(tokio::time::Instant::now());
-                        if seen.len() <= dropped {
-                            continue;
+                        count = seen.len();
+                    }
+                    let pass = match &passes {
+                        RelayPasses::AfterInitiations(dropped) => !initiation || count > *dropped,
+                        RelayPasses::From(after) => tokio::time::Instant::now() >= opened + *after,
+                        RelayPasses::UnderLoad(limiter) => {
+                            let packet = gotatun::packet::Packet::copy_from(datagram);
+                            match limiter.verify_packet(from, packet) {
+                                Ok(_) => true,
+                                Err(gotatun::noise::TunnResult::WriteToNetwork(cookie)) => {
+                                    let cookie: gotatun::packet::Packet = cookie.into();
+                                    let _ = socket.send_to(&cookie[..], from).await;
+                                    false
+                                }
+                                Err(_) => false,
+                            }
                         }
+                    };
+                    if !pass {
+                        continue;
+                    }
+                    if initiation {
+                        let answers = Arc::clone(&answers);
+                        tokio::task::spawn_blocking(move || {
+                            let _ = answers.lock().expect("answers").recv();
+                        });
                     }
                     let _ = socket.send_to(datagram, peer).await;
                     continue;
                 }
                 if let Some(client) = client {
                     let _ = socket.send_to(datagram, client).await;
+                    let _ = answered.send(());
                 }
             }
         });
@@ -1341,8 +1394,128 @@ async fn a_lost_first_initiation_is_sent_again_after_the_bring_up_resend() {
     assert_eq!(initiations.len(), 2, "{initiations:?}");
     let resent = initiations[1] - started;
     assert!(
-        resent >= super::BRING_UP_RESEND && resent < Duration::from_secs(5),
+        resent >= super::BRING_UP_RESENDS[0] && resent < super::BRING_UP_RESENDS[1],
         "the resend came {resent:?} into the bring-up"
+    );
+}
+
+/// A client spec that reaches `peer` through `relay`, with nothing but the
+/// bring-up probe to make the device initiate.
+fn relayed_spec(
+    peer: &WireGuardTestPeer,
+    relay: &InitiationRelay,
+    id: &str,
+) -> crate::wireguard::WireGuardSpec {
+    let mut spec = peer.client_spec(id);
+    spec.endpoint_host = relay.address.ip().to_string();
+    spec.endpoint_port = relay.address.port();
+    spec.persistent_keepalive = None;
+    spec
+}
+
+/// A path that passes nothing for `dark` after the bring-up starts: the
+/// bring-up's own initiations, when each reached the relay, and how many
+/// early resends it made, with whether it came up.
+async fn bring_up_through_a_dark_window(
+    dark: Duration,
+) -> (Vec<Duration>, usize, Result<(), TunnelError>) {
+    let peer = WireGuardTestPeer::start().await;
+    let relay = InitiationRelay::start_passing(peer.endpoint(), RelayPasses::From(dark)).await;
+    let mut spec = relayed_spec(&peer, &relay, "proxy-dark-window");
+    spec.request_timeout = Duration::from_secs(12);
+    let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver));
+
+    let made_before = super::BRING_UP_RESENDS_MADE.with(std::cell::Cell::get);
+    let started = tokio::time::Instant::now();
+    let outcome = provider.prepare().await;
+    let made = super::BRING_UP_RESENDS_MADE.with(std::cell::Cell::get) - made_before;
+    let at = relay
+        .initiations()
+        .into_iter()
+        .map(|reached| reached - started)
+        .collect();
+    (at, made, outcome)
+}
+
+/// A path dark for half a second loses only the first initiation; the
+/// resend at 1 s is answered and nothing more is sent.
+#[tokio::test(start_paused = true)]
+async fn a_path_dark_for_half_a_second_comes_up_on_the_one_second_resend() {
+    let (at, made, outcome) = bring_up_through_a_dark_window(Duration::from_millis(500)).await;
+    outcome.expect("the resend at 1 s is answered");
+    assert_eq!(made, 1);
+    assert_eq!(at.len(), 2, "{at:?}");
+    assert!(at[0] < Duration::from_millis(500), "{at:?}");
+    assert!(
+        at[1] >= super::BRING_UP_RESENDS[0] && at[1] < super::BRING_UP_RESENDS[1],
+        "{at:?}"
+    );
+}
+
+/// A path dark for 2.5 s, as a cold server is after its first handshake,
+/// loses the first initiation and the one at 1 s; the resend at 4.5 s is
+/// answered, before gotatun's own retry would come.
+#[tokio::test(start_paused = true)]
+async fn a_path_dark_past_the_first_resend_comes_up_on_the_second() {
+    let (at, made, outcome) = bring_up_through_a_dark_window(Duration::from_millis(2500)).await;
+    outcome.expect("the resend at 4.5 s is answered");
+    assert_eq!(made, 2);
+    assert_eq!(at.len(), 3, "{at:?}");
+    assert!(
+        at[1] >= super::BRING_UP_RESENDS[0] && at[1] < Duration::from_millis(2500),
+        "{at:?}"
+    );
+    assert!(
+        at[2] >= super::BRING_UP_RESENDS[1] && at[2] < Duration::from_secs(5),
+        "{at:?}"
+    );
+}
+
+/// A path still dark at 4.5 s loses all three early initiations, and the
+/// bring-up makes no fourth: from then on only gotatun's own retry, every
+/// five seconds, initiates.
+#[tokio::test(start_paused = true)]
+async fn a_path_dark_past_both_resends_gets_no_further_early_initiation() {
+    let (at, made, _outcome) = bring_up_through_a_dark_window(Duration::from_millis(4800)).await;
+    assert_eq!(made, 2, "two early resends, never a third");
+    assert!(at.len() >= 3, "{at:?}");
+    assert!(at[0] < super::BRING_UP_RESENDS[0], "{at:?}");
+    assert!(
+        at[1] >= super::BRING_UP_RESENDS[0] && at[1] < super::BRING_UP_RESENDS[1],
+        "{at:?}"
+    );
+    assert!(at[2] >= super::BRING_UP_RESENDS[1], "{at:?}");
+}
+
+/// A responder under load answers the first initiation with a cookie. The
+/// resend at 1 s keeps that cookie, so it is answered, rather than dropping
+/// it with the handshake state and earning another cookie.
+#[tokio::test(start_paused = true)]
+async fn a_resend_after_a_cookie_reply_carries_the_cookie_and_is_answered() {
+    let peer = WireGuardTestPeer::start().await;
+    let responder_key = gotatun::x25519::PublicKey::from(peer.public_key());
+    // A limit of none: every initiation must carry a valid cookie.
+    let limiter = gotatun::noise::rate_limiter::RateLimiter::new(&responder_key, 0);
+    let relay =
+        InitiationRelay::start_passing(peer.endpoint(), RelayPasses::UnderLoad(limiter)).await;
+    let mut spec = relayed_spec(&peer, &relay, "proxy-cookie");
+    spec.request_timeout = Duration::from_secs(12);
+    let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver));
+
+    let started = tokio::time::Instant::now();
+    provider
+        .prepare()
+        .await
+        .expect("the resend carries the cookie and is answered");
+    let at: Vec<_> = relay
+        .initiations()
+        .into_iter()
+        .map(|reached| reached - started)
+        .collect();
+    assert_eq!(at.len(), 2, "{at:?}");
+    assert!(
+        at[1] >= super::BRING_UP_RESENDS[0] && at[1] < super::BRING_UP_RESENDS[1],
+        "{at:?}"
     );
 }
 
@@ -1381,7 +1554,15 @@ async fn resolution_and_connect_share_one_dial_budget() {
         matches!(&error, TunnelError::Dial { detail, .. } if detail.contains("in time")),
         "{error}"
     );
-    assert_eq!(peer.dns_queries(), vec!["silent.tunnel.test".to_string()]);
+    // The answer is held 3 s, so the lookup starts a fresh query each second
+    // it waits, up to its limit, every one for the same name.
+    let queries = peer.dns_queries();
+    assert!(
+        !queries.is_empty()
+            && queries.len() <= super::stack::DNS_LIVE_QUERIES
+            && queries.iter().all(|name| name == "silent.tunnel.test"),
+        "{queries:?}"
+    );
     assert!(
         finished <= started + budget,
         "the dial ran past its budget on the paused clock"

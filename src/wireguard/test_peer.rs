@@ -621,7 +621,7 @@ async fn serve_dns(
 /// Hand-rolled because smoltcp's `DnsRepr` only emits *queries*; a resolver has
 /// to write answer records, which means writing the wire format directly.
 /// Returns the queried name and the response bytes.
-fn build_dns_answer(
+pub(crate) fn build_dns_answer(
     query: &[u8],
     names: &HashMap<String, Vec<IpAddr>>,
 ) -> Option<(String, Vec<u8>)> {

@@ -175,9 +175,11 @@ pub struct WireGuardSpec {
     /// Budget for bringing the tunnel up, and for a single dial through it.
     pub request_timeout: Duration,
     /// How many sockets the tunnel may have open at once: every TCP
-    /// connection, dialled or accepted, and every UDP socket. Each TCP socket
-    /// holds 128 KiB of buffers, so 1024 sockets is 128 MiB at worst for one
-    /// tunnel. [`crate::wireguard::DEFAULT_MAX_SOCKETS`] unless the caller
+    /// connection, dialled or accepted, and every UDP socket. A TCP socket at
+    /// the plain default sizes holds 128 KiB of buffers, so 1024 sockets is
+    /// 128 MiB; a socket given sizes of its own holds those, so the memory is
+    /// this count times the sizes callers chose.
+    /// [`crate::wireguard::DEFAULT_MAX_SOCKETS`] unless the caller
     /// sizes it; the tunnel holds it between
     /// [`crate::wireguard::MIN_MAX_SOCKETS`] and
     /// [`crate::wireguard::MAX_MAX_SOCKETS`] when it comes up.

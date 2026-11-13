@@ -116,17 +116,40 @@ const SESSION_EXPIRY: Duration = Duration::from_secs(180 * 3);
 /// How often to look for the first handshake while bringing a tunnel up.
 const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// How long a bring-up waits on its first handshake initiation before it
-/// sends a fresh one. gotatun retries an unanswered initiation only after
-/// `REKEY_TIMEOUT`, five seconds, and a first initiation lost on the way, or
-/// sent while the server still holds a session for the same key elsewhere,
-/// would cost every bring-up that long. One early retry, with fresh
-/// handshake state, takes that down to this; later retries keep gotatun's
-/// own timers. gotatun as a responder counts handshakes per source address
-/// against a limit of 100 a second before it answers with a cookie, so one
-/// more initiation a second later stays far below it, and the fresh state
-/// stamps it later than the first, as the responder requires.
-const BRING_UP_RESEND: Duration = Duration::from_secs(1);
+/// When, after its first handshake initiation, a bring-up that is still
+/// unanswered sends a fresh one. gotatun retries an unanswered initiation
+/// only after `REKEY_TIMEOUT`, five seconds plus up to a third of a second,
+/// so each early resend saves a bring-up that wait. Later retries keep
+/// gotatun's own timers.
+///
+/// - 1 s: a first initiation lost on the way, or sent while the server still
+///   holds a session for the same key elsewhere, is sent again here.
+/// - 4.5 s: a server that has not seen the key for a while can drop
+///   everything through the tunnel for about four seconds after its first
+///   handshake. A tunnel carried through such a server loses the first
+///   initiation and the one at 1 s; without this resend it waits for
+///   gotatun's retry at about 6 s after the one at 1 s. This one comes just
+///   after that window and before gotatun's own retry would.
+///
+/// That is three initiations in the first 4.5 s, then gotatun's own every
+/// five. gotatun as a responder counts handshakes per source address against
+/// a limit of 100 a second before it answers with a cookie (its
+/// `noise/rate_limiter.rs`, counts cleared every second), so three in 4.5 s
+/// stay far below it. A responder that does answer with a cookie is under
+/// load for its own reasons; the engine keeps that cookie across a resend
+/// ([`engine::Engine`]'s restart), so the next initiation carries it and is
+/// answered rather than refused again. A responder takes only an initiation
+/// stamped later than the last it accepted from the key; each resend is
+/// stamped from the clock when it is made, so it is later.
+const BRING_UP_RESENDS: [Duration; 2] = [Duration::from_secs(1), Duration::from_millis(4500)];
+
+#[cfg(test)]
+thread_local! {
+    /// How many early resends bring-ups on this thread have made. A test on
+    /// a current-thread runtime reads it to count its own.
+    pub(crate) static BRING_UP_RESENDS_MADE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// WireGuard's `REKEY_AFTER_TIME`. A peer that completed a handshake more
 /// recently than this has proven, cryptographically, that it is alive, so a
@@ -315,10 +338,13 @@ impl WireGuardTunnelProvider {
         }
     }
 
-    /// Opt into 1 MiB TCP buffers in each direction and a larger UDP receive
-    /// buffer for concurrent bulk downloads. At the 256-socket limit, TCP
-    /// buffers alone can consume 512 MiB. Ordinary providers retain 64 KiB
-    /// buffers and the operating system's UDP defaults.
+    /// Opt into 1 MiB TCP buffers in each direction by default and a larger
+    /// UDP receive buffer for concurrent bulk downloads. At the 256-socket
+    /// limit, default-sized TCP buffers alone can consume 512 MiB. Ordinary
+    /// providers retain 64 KiB buffers and the operating system's UDP
+    /// defaults. A dial or listener that names its own sizes
+    /// ([`Self::dial_with`], [`Self::listen_with`]) holds those instead, on
+    /// either kind of tunnel; its caller bounds that memory.
     ///
     /// A tuned tunnel also runs its device and stack on a thread of its own,
     /// so its packets pass between its tasks without waking the caller's
@@ -714,10 +740,10 @@ impl WireGuardTunnelProvider {
     /// Wait for the peer to answer, and say how long after `probed` it had,
     /// or say that it did not.
     ///
-    /// A first initiation still unanswered after [`BRING_UP_RESEND`] is sent
-    /// again once: the engine drops its handshake state, which has no session
-    /// to lose yet, and initiates afresh. That leaves the engine's socket as
-    /// it is, and its timers at gotatun's defaults.
+    /// An initiation still unanswered at each of [`BRING_UP_RESENDS`] is sent
+    /// again: the engine drops its handshake state, which has no session to
+    /// lose yet, and initiates afresh. That leaves the engine's socket as it
+    /// is, and its timers at gotatun's defaults.
     ///
     /// The time is this function's own measurement, taken at the first check
     /// that finds the session established, so it reads high by at most one
@@ -730,16 +756,19 @@ impl WireGuardTunnelProvider {
         probed: std::time::Instant,
         deadline: tokio::time::Instant,
     ) -> Result<Duration, TunnelError> {
-        let resend_at = tokio::time::Instant::now() + BRING_UP_RESEND;
-        let mut resent = false;
+        let started = tokio::time::Instant::now();
+        let mut resends = BRING_UP_RESENDS.iter().map(|after| started + *after);
+        let mut next_resend = resends.next();
         let waited = tokio::time::timeout_at(deadline, async {
             loop {
                 if status.last_handshake_age().is_some() {
                     return Some(probed.elapsed());
                 }
-                if !resent && tokio::time::Instant::now() >= resend_at {
-                    resent = true;
+                if next_resend.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                    next_resend = resends.next();
                     status.restart(stack.shared());
+                    #[cfg(test)]
+                    BRING_UP_RESENDS_MADE.with(|made| made.set(made.get() + 1));
                 }
                 if pump.is_finished() {
                     // The engine died under us; there will never be a
