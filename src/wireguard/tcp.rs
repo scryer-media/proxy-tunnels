@@ -406,8 +406,8 @@ impl AsyncWrite for WgTcpStream {
 /// connection. A backlog here is therefore a small pool of sockets all
 /// listening on the same port. Every socket in the pool holds one of the
 /// tunnel's socket slots, as a dialled connection does, so neither a large
-/// backlog nor a flood of inbound peers can grow the tunnel's memory past its
-/// cap. An accepted connection keeps the slot its socket held, and the
+/// backlog nor a flood of inbound peers can open more sockets than the cap,
+/// each holding the sizes the listener was given. An accepted connection keeps the slot its socket held, and the
 /// listener claims a new slot for the socket that takes its place. On a full
 /// tunnel that replacement waits: the pool runs short and refills as slots
 /// free, and a connection that arrives while no socket listens is refused.

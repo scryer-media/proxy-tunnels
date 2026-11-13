@@ -1030,7 +1030,9 @@ impl UdpTransportFactory for TunnelUdpFactory {
                 socket2::SockRef::from(&socket).set_mark(mark)?;
             }
             if self.tuning {
-                let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(4 * 1024 * 1024);
+                let socket = socket2::SockRef::from(&socket);
+                let _ = socket.set_recv_buffer_size(TUNED_RECEIVE_BUFFER_BYTES);
+                report_receive_buffer(&socket, TUNED_RECEIVE_BUFFER_BYTES);
             }
             socket.set_nonblocking(true)?;
             *self.source.lock().expect("WireGuard source") = socket
@@ -1044,7 +1046,7 @@ impl UdpTransportFactory for TunnelUdpFactory {
             return Ok((socket.clone(), socket));
         }
         let (send, recv) = if self.tuning {
-            bind_with_buffer(params, 4 * 1024 * 1024).await?
+            bind_with_buffer(params, TUNED_RECEIVE_BUFFER_BYTES).await?
         } else {
             UdpSocketFactory::default().bind(params).await?
         };
@@ -1056,22 +1058,56 @@ impl UdpTransportFactory for TunnelUdpFactory {
     }
 }
 
+/// The receive buffer a tuned tunnel asks for on its OS UDP socket. The
+/// kernel may grant less: Linux holds a request to `net.core.rmem_max`,
+/// macOS refuses one past `kern.ipc.maxsockbuf`, and Windows takes it as
+/// asked. What was granted is logged at debug when the socket is bound.
+const TUNED_RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
 async fn bind_with_buffer(
     params: &UdpTransportFactoryParams,
     bytes: usize,
 ) -> std::io::Result<(UdpSocket, UdpSocket)> {
-    match (UdpSocketFactory {
+    let (send, recv) = match (UdpSocketFactory {
         recv_buffer_size: Some(bytes),
         send_buffer_size: None,
     })
     .bind(params)
     .await
     {
-        Ok(pair) => Ok(pair),
+        Ok(pair) => pair,
         Err(_) => {
             // Some kernels reject oversized requests rather than clamp them.
             tracing::debug!("retrying tunnel UDP socket with OS buffer defaults");
-            UdpSocketFactory::default().bind(params).await
+            UdpSocketFactory::default().bind(params).await?
+        }
+    };
+    report_receive_buffer(&socket2::SockRef::from(recv.socket()), bytes);
+    Ok((send, recv))
+}
+
+/// Logs, at debug, the receive buffer the kernel granted a tunnel's UDP
+/// socket next to the one asked for, and returns the granted size. It is
+/// the size the kernel reports: Linux reports twice what it was set to,
+/// the other half being its bookkeeping allowance, so a request held to a
+/// `net.core.rmem_max` of 212992 reads back as 425984.
+fn report_receive_buffer(socket: &socket2::SockRef<'_>, asked: usize) -> Option<usize> {
+    match socket.recv_buffer_size() {
+        Ok(granted) => {
+            tracing::debug!(
+                asked,
+                granted,
+                "the tunnel UDP socket's receive buffer, as the kernel reports it"
+            );
+            Some(granted)
+        }
+        Err(error) => {
+            tracing::debug!(
+                asked,
+                %error,
+                "the tunnel UDP socket's receive buffer could not be read back"
+            );
+            None
         }
     }
 }
@@ -1091,6 +1127,28 @@ mod tests {
         };
         let (_, socket) = bind_with_buffer(&params, i32::MAX as usize).await.unwrap();
         assert!(socket.socket().local_addr().unwrap().ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn a_tuned_socket_reads_back_the_receive_buffer_it_was_granted() {
+        let params = UdpTransportFactoryParams {
+            addr: Some("127.0.0.1".parse().unwrap()),
+            port: 0,
+            #[cfg(target_os = "linux")]
+            fwmark: None,
+        };
+        let asked = 1024 * 1024;
+        let (_, socket) = bind_with_buffer(&params, asked).await.unwrap();
+        let socket = socket2::SockRef::from(socket.socket());
+        let granted = report_receive_buffer(&socket, asked).unwrap();
+        assert_eq!(granted, socket.recv_buffer_size().unwrap());
+        assert!(granted > 0);
+        // Linux doubles what it holds the request to; Windows takes it as
+        // asked.
+        #[cfg(target_os = "linux")]
+        assert!(granted <= 2 * asked, "{granted}");
+        #[cfg(windows)]
+        assert_eq!(granted, asked);
     }
 
     fn loopback() -> std::net::UdpSocket {

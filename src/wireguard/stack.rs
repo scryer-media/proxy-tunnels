@@ -64,17 +64,20 @@ use crate::wireguard::udp::{UdpQueue, WgUdpSocket};
 /// How many sockets one tunnel may have open at once when its spec asks for
 /// no other number.
 ///
-/// Each TCP socket costs 128 KiB of buffers, so the cap bounds a tunnel's
-/// memory: 256 sockets is 32 MiB at worst, 1024 is 128 MiB. A dial past it
-/// fails with [`TunnelError::AtCapacity`], which says the tunnel is full
-/// rather than broken, so a caller can wait or go elsewhere.
+/// A TCP socket at the plain default sizes holds 128 KiB of buffers, so 256
+/// sockets is 32 MiB and 1024 is 128 MiB; on a download-tuned tunnel each
+/// holds 2 MiB. A socket given sizes of its own ([`TcpBuffers`]) holds those,
+/// so a tunnel's memory is its socket count times the sizes its callers
+/// chose: the caller bounds it, not this cap. A dial past the cap fails with
+/// [`TunnelError::AtCapacity`], which says the tunnel is full rather than
+/// broken, so a caller can wait or go elsewhere.
 pub const DEFAULT_MAX_SOCKETS: usize = 256;
 
 /// The fewest sockets a tunnel may be capped at.
 pub const MIN_MAX_SOCKETS: usize = 16;
 
-/// The most sockets a tunnel may be capped at: 512 MiB of TCP buffers at
-/// worst.
+/// The most sockets a tunnel may be capped at: 512 MiB of TCP buffers at the
+/// plain default sizes.
 pub const MAX_MAX_SOCKETS: usize = 4096;
 
 /// The cap a tunnel asking for `asked` sockets runs with: `asked`, held
@@ -104,8 +107,12 @@ pub const MAX_LISTEN_BACKLOG: usize = 64;
 const TCP_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Send and receive buffer per TCP socket, each way, on a tunnel built with
-/// download tuning: the most a socket may hold, [`MAX_TCP_BUFFER_BYTES`].
-const TUNED_TCP_BUFFER_BYTES: usize = MAX_TCP_BUFFER_BYTES;
+/// download tuning.
+///
+/// 1 MiB is a full 16-bit window with a shift of 5, and keeps a few
+/// connections busy across a long round trip. It is a default, not a bound:
+/// a caller that wants more or less asks for it with [`TcpBuffers`].
+const TUNED_TCP_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// The smallest receive or send buffer a TCP socket may be given.
 ///
@@ -114,12 +121,20 @@ const TUNED_TCP_BUFFER_BYTES: usize = MAX_TCP_BUFFER_BYTES;
 /// filled.
 pub const MIN_TCP_BUFFER_BYTES: usize = 16 * 1024;
 
-/// The largest receive or send buffer a TCP socket may be given: what a
-/// download-tuned tunnel gives every socket.
+/// The largest receive or send buffer a TCP socket may be given: the largest
+/// window TCP can advertise, 65,535 bytes shifted by the largest window
+/// scale, 14 (RFC 7323 section 2.3), which is 1,073,725,440 bytes.
 ///
-/// Holding asked sizes to this keeps the memory bound the socket cap gives
-/// a tunnel: no socket ever holds more than a tuned tunnel's sockets do.
-pub const MAX_TCP_BUFFER_BYTES: usize = 1024 * 1024;
+/// smoltcp derives a socket's window scale from its receive capacity, one
+/// step per bit past 16, and refuses a capacity above 1 GiB; a capacity of
+/// exactly 1 GiB would take a shift of 15, which RFC 7323 does not allow.
+/// Every capacity up to this one takes a shift of 14 or less.
+///
+/// This bound only keeps the window arithmetic valid. It does not bound
+/// memory: a socket's buffers are allocated at their full size when the
+/// socket is made, so the caller that chooses the sizes, times the sockets
+/// open, bounds what a tunnel holds.
+pub const MAX_TCP_BUFFER_BYTES: usize = (u16::MAX as usize) << 14;
 
 /// The receive and send buffer sizes of one TCP socket inside a tunnel.
 ///
@@ -130,8 +145,9 @@ pub const MAX_TCP_BUFFER_BYTES: usize = 1024 * 1024;
 /// the first, one that mostly uploads the second.
 ///
 /// Both are held between [`MIN_TCP_BUFFER_BYTES`] and
-/// [`MAX_TCP_BUFFER_BYTES`]: they are caller input, and a socket's buffers
-/// are memory the tunnel holds for as long as the socket lives.
+/// [`MAX_TCP_BUFFER_BYTES`]. Within those the caller decides: a socket's
+/// buffers are memory the tunnel holds for as long as the socket lives, so
+/// the sizes asked for, times the sockets open, are what a tunnel costs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TcpBuffers {
     receive: usize,
@@ -193,9 +209,28 @@ const TRANSPORT_RECEIVE_PASSES: usize = 8;
 const UDP_PACKETS: usize = 32;
 const UDP_BUFFER_BYTES: usize = 64 * 1024;
 
-/// How many DNS queries may be in flight at once on the one shared resolver
-/// socket.
+/// How many lookups may be in flight at once on the one shared resolver
+/// socket. Each holds up to [`DNS_LIVE_QUERIES`] queries on it, so the socket
+/// never holds more than the product; its query list is made that long up
+/// front.
 const DNS_QUERY_SLOTS: usize = 8;
+
+/// The most queries one unanswered lookup keeps in flight: the first, and a
+/// fresh one each [`DNS_FRESH_QUERY_AFTER`] until there are this many.
+///
+/// smoltcp resends a query 1, 3 and 7 s after it first went out, then gives
+/// the server up 10 s after it first went out. A server that has just
+/// handshaked a key it had not seen for a while can drop everything through
+/// the tunnel for about four seconds, so a lookup asked at once would be
+/// answered only by the resend at 7 s. Four queries started a second apart
+/// put one datagram on the wire every second for those 10 s (0, 1, 3, 7;
+/// 1, 2, 4, 8; 2, 3, 5, 9; 3, 4, 6, 10), so the first one sent after the
+/// dark spell is answered. A lookup never answered sends up to 16 datagrams
+/// to a server in those 10 s, where one query sent 4.
+pub(super) const DNS_LIVE_QUERIES: usize = 4;
+
+/// How long a lookup waits on its queries before it starts a fresh one.
+const DNS_FRESH_QUERY_AFTER: Duration = Duration::from_secs(1);
 
 /// Ephemeral port range (RFC 6335).
 const EPHEMERAL_FIRST: u16 = 49152;
@@ -484,11 +519,22 @@ pub(crate) struct StackInner {
     /// The ports listeners on this stack hold, each for as long as its
     /// listener lives, whether or not a socket is listening on it now.
     listen_ports: HashSet<u16>,
+    /// Set by a test whose stack must run its protocol timers (DNS and TCP
+    /// retransmits) on the paused tokio clock: when this stack's clock read
+    /// zero on that clock.
+    #[cfg(test)]
+    tokio_started: Option<tokio::time::Instant>,
 }
 
 impl StackInner {
     /// smoltcp's clock: microseconds since this stack started.
     pub(crate) fn now(&self) -> Instant {
+        #[cfg(test)]
+        let elapsed = match self.tokio_started {
+            Some(started) => started.elapsed(),
+            None => self.started.elapsed(),
+        };
+        #[cfg(not(test))]
         let elapsed = self.started.elapsed();
         Instant::from_micros(i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
     }
@@ -788,7 +834,9 @@ impl WgStack {
                 .copied()
                 .map(IpAddress::from)
                 .collect();
-            let slots: Vec<Option<dns::DnsQuery>> = (0..DNS_QUERY_SLOTS).map(|_| None).collect();
+            let slots: Vec<Option<dns::DnsQuery>> = (0..DNS_QUERY_SLOTS * DNS_LIVE_QUERIES)
+                .map(|_| None)
+                .collect();
             sockets.add(dns::Socket::new(&servers, slots))
         });
 
@@ -806,6 +854,8 @@ impl WgStack {
                 closing: Vec::new(),
                 open_sockets: Arc::clone(&open_sockets),
                 listen_ports: HashSet::new(),
+                #[cfg(test)]
+                tokio_started: None,
             }),
             wake: Notify::new(),
             open_sockets,
@@ -1060,14 +1110,7 @@ impl WgStack {
             .await
             .map_err(|_| resolve_failure(host, "timed out waiting for a tunnel DNS slot"))?
             .map_err(|_| resolve_failure(host, "the tunnel resolver stopped"))?;
-        let started = shared.with_stack(|stack| {
-            let dns_handle = stack.dns.expect("a resolver is configured");
-            let (sockets, context) = stack.socket_and_context();
-            sockets
-                .get_mut::<dns::Socket>(dns_handle)
-                .start_query(context, host, kind)
-        });
-        let handle = started.map_err(|error| {
+        let handle = start_query(&shared, host, kind).map_err(|error| {
             resolve_failure(
                 host,
                 match error {
@@ -1080,51 +1123,77 @@ impl WgStack {
             )
         })?;
 
-        let mut query = QueryGuard {
+        // Every query of this lookup still in flight. Whichever settles
+        // first, answer or failure, settles the lookup. The first query is
+        // the one that times out first, so a lookup nobody answers fails when
+        // and as one query did; a later query only adds chances to be
+        // answered.
+        let mut queries = QueryGuard {
             shared: &shared,
-            handle: Some(handle),
+            handles: vec![handle],
         };
-        let answered = tokio::time::timeout_at(
-            deadline,
-            poll_fn(|context| {
-                shared.peek_stack(|stack| {
-                    let (socket, _) = stack.dns_socket().expect("a resolver is configured");
-                    match socket.get_query_result(handle) {
-                        Ok(addresses) => Poll::Ready(Ok(addresses)),
-                        Err(dns::GetQueryResultError::Pending) => {
-                            socket.register_query_waker(handle, context.waker());
-                            Poll::Pending
-                        }
-                        Err(dns::GetQueryResultError::Failed) => Poll::Ready(Err(())),
+        let mut fresh_at = tokio::time::Instant::now() + DNS_FRESH_QUERY_AFTER;
+        let answered = tokio::time::timeout_at(deadline, async {
+            loop {
+                let room = queries.handles.len() < DNS_LIVE_QUERIES;
+                let fresh = async {
+                    if room {
+                        tokio::time::sleep_until(fresh_at).await;
+                    } else {
+                        std::future::pending::<()>().await;
                     }
-                })
-            }),
-        )
+                };
+                tokio::select! {
+                    biased;
+                    settled = poll_fn(|context| queries.poll_settled(context)) => {
+                        return settled;
+                    }
+                    () = fresh => {
+                        fresh_at += DNS_FRESH_QUERY_AFTER;
+                        // The first query took the name as it is, so another
+                        // fails only for want of a slot, and then the queries
+                        // in flight carry on alone.
+                        if let Ok(handle) = start_query(&shared, host, kind) {
+                            queries.handles.push(handle);
+                        }
+                    }
+                }
+            }
+        })
         .await;
 
-        // Whether it answered, failed or timed out, the slot is either already
-        // free (smoltcp frees it when it hands back a result) or ours to
-        // cancel.
+        // Whether it answered, failed or timed out, every query left in
+        // flight is cancelled when `queries` drops; a settled one smoltcp has
+        // already freed.
         let outcome = match answered {
-            Ok(Ok(addresses)) => {
-                query.handle = None;
-                Ok(addresses.into_iter().map(IpAddr::from).collect())
-            }
-            Ok(Err(())) => {
-                query.handle = None;
-                Err(resolve_failure(
-                    host,
-                    "the tunnel's DNS server does not know this name",
-                ))
-            }
+            Ok(Ok(addresses)) => Ok(addresses),
+            Ok(Err(())) => Err(resolve_failure(
+                host,
+                "the tunnel's DNS server does not know this name",
+            )),
             Err(_) => Err(resolve_failure(
                 host,
                 "the tunnel's DNS server did not answer in time",
             )),
         };
-        drop(query);
+        drop(queries);
         outcome
     }
+}
+
+/// Start one query for `host` on the stack's resolver socket.
+fn start_query(
+    shared: &StackShared,
+    host: &str,
+    kind: DnsQueryType,
+) -> Result<dns::QueryHandle, dns::StartQueryError> {
+    shared.with_stack(|stack| {
+        let dns_handle = stack.dns.expect("a resolver is configured");
+        let (sockets, context) = stack.socket_and_context();
+        sockets
+            .get_mut::<dns::Socket>(dns_handle)
+            .start_query(context, host, kind)
+    })
 }
 
 /// A name that could not be resolved through the tunnel.
@@ -1140,21 +1209,54 @@ fn resolve_failure(host: &str, detail: &str) -> TunnelError {
     }
 }
 
-/// Cancels an in-flight DNS query if it is abandoned, so a timed-out lookup
-/// does not hold one of the resolver's slots until the process exits.
+/// The queries of one lookup still in flight. Cancels every one left when it
+/// drops, so a lookup that settled, timed out or was abandoned does not hold
+/// the resolver's slots until the process exits.
 struct QueryGuard<'a> {
     shared: &'a Arc<StackShared>,
-    handle: Option<dns::QueryHandle>,
+    handles: Vec<dns::QueryHandle>,
+}
+
+impl QueryGuard<'_> {
+    /// The first of the queries to settle, answered or failed, oldest first
+    /// when several have. smoltcp frees a settled query's slot as it hands
+    /// the result back, so that handle leaves the list.
+    fn poll_settled(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Vec<IpAddr>, ()>> {
+        let handles = &mut self.handles;
+        self.shared.peek_stack(|stack| {
+            let (socket, _) = stack.dns_socket().expect("a resolver is configured");
+            for index in 0..handles.len() {
+                let handle = handles[index];
+                let settled = match socket.get_query_result(handle) {
+                    Ok(addresses) => Ok(addresses.into_iter().map(IpAddr::from).collect()),
+                    Err(dns::GetQueryResultError::Pending) => {
+                        socket.register_query_waker(handle, context.waker());
+                        continue;
+                    }
+                    Err(dns::GetQueryResultError::Failed) => Err(()),
+                };
+                handles.remove(index);
+                return Poll::Ready(settled);
+            }
+            Poll::Pending
+        })
+    }
 }
 
 impl Drop for QueryGuard<'_> {
     fn drop(&mut self) {
-        let Some(handle) = self.handle.take() else {
+        if self.handles.is_empty() {
             return;
-        };
+        }
+        let handles = std::mem::take(&mut self.handles);
         self.shared.with_stack(|stack| {
             if let Some((socket, _)) = stack.dns_socket() {
-                socket.cancel_query(handle);
+                for handle in handles {
+                    socket.cancel_query(handle);
+                }
             }
         });
     }
@@ -1908,21 +2010,29 @@ mod link_tests {
 
     /// Two stacks back to back, the far one capped at `far_cap` sockets.
     fn pair_with_far_cap(far_cap: usize) -> Pair {
+        pair_of(
+            config("10.9.0.1/24"),
+            StackConfig {
+                max_sockets: far_cap,
+                ..config("10.9.0.2/24")
+            },
+        )
+    }
+
+    /// Two stacks back to back, built from `near` and `far`.
+    fn pair_of(near: StackConfig, far: StackConfig) -> Pair {
         let runtime = tokio::runtime::Handle::current();
         let (near_in, near_out, near_inbound, near_outbound) = ip_channels(1420);
         let (far_in, far_out, far_inbound, far_outbound) = ip_channels(1420);
         let (near, near_pump) = WgStack::start(
-            config("10.9.0.1/24"),
+            near,
             near_inbound,
             near_outbound,
             Arc::new(Notify::new()),
             &runtime,
         );
         let (far, far_pump) = WgStack::start(
-            StackConfig {
-                max_sockets: far_cap,
-                ..config("10.9.0.2/24")
-            },
+            far,
             far_inbound,
             far_outbound,
             Arc::new(Notify::new()),
@@ -2349,6 +2459,86 @@ mod link_tests {
         );
         let inside = TcpBuffers::new(200 * KIB + 3, 64 * KIB);
         assert_eq!((inside.receive(), inside.send()), (200 * KIB + 3, 64 * KIB));
+        let large = TcpBuffers::new(4 * 1024 * KIB, 64 * 1024 * KIB + 1);
+        assert_eq!(
+            (large.receive(), large.send()),
+            (4 * 1024 * KIB, 64 * 1024 * KIB + 1)
+        );
+    }
+
+    /// The ceiling is the largest window TCP can advertise, 65,535 << 14,
+    /// and it sits just under the 1 GiB smoltcp refuses. The defaults are
+    /// their own numbers, not the ceiling.
+    #[test]
+    fn the_ceiling_is_the_largest_advertisable_window_and_defaults_stay_put() {
+        assert_eq!(MAX_TCP_BUFFER_BYTES, 1_073_725_440);
+        const { assert!(MAX_TCP_BUFFER_BYTES < 1 << 30) };
+        assert_eq!(
+            TcpBuffers::default_for(true),
+            TcpBuffers::new(1024 * KIB, 1024 * KIB)
+        );
+        assert_eq!(
+            TcpBuffers::default_for(false),
+            TcpBuffers::new(64 * KIB, 64 * KIB)
+        );
+        assert_eq!(MIN_TCP_BUFFER_BYTES, 16 * KIB);
+    }
+
+    /// Sizes past the tuned default's 1 MiB are kept on a dial and on a
+    /// listener, and each handshake offers the window scale of its own
+    /// receive buffer: 4 MiB takes 23 bits, so 7; 16 MiB takes 25, so 9.
+    #[tokio::test]
+    async fn sizes_past_one_mib_are_kept_on_dial_and_listen() {
+        let pair = pair();
+        let listened = TcpBuffers::new(16 * 1024 * KIB, 2 * 1024 * KIB);
+        let mut listener = pair.far.listen_with(PORT, 1, listened).unwrap();
+        let dialled_with = TcpBuffers::new(4 * 1024 * KIB, 64 * KIB);
+        let (accepted, dialled) = tokio::join!(
+            listener.accept(),
+            pair.near.connect_with(FAR, FOREVER, dialled_with)
+        );
+        let (accepted, dialled) = (accepted.unwrap(), dialled.unwrap());
+        assert_eq!(dialled.buffer_capacities(), (4 * 1024 * KIB, 64 * KIB));
+        assert_eq!(
+            accepted.buffer_capacities(),
+            (16 * 1024 * KIB, 2 * 1024 * KIB)
+        );
+
+        let dial_syn = syn_from(&pair, accepted.peer_addr().port(), false);
+        assert_eq!(
+            (dial_syn.window, dial_syn.window_scale),
+            (u16::MAX, Some(7))
+        );
+        let answer = syn_from(&pair, PORT, true);
+        assert_eq!((answer.window, answer.window_scale), (u16::MAX, Some(9)));
+    }
+
+    /// A dial at the ceiling offers the largest legal window scale, 14, and
+    /// a full 16-bit window: the socket is made (smoltcp does not refuse it)
+    /// and the handshake stays inside RFC 7323. The buffer's pages are never
+    /// written here, so the operating system commits them lazily.
+    #[tokio::test]
+    async fn a_dial_at_the_ceiling_offers_the_largest_legal_window_scale() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, dialled) = tokio::join!(
+            listener.accept(),
+            pair.near.connect_with(
+                FAR,
+                FOREVER,
+                TcpBuffers::new(MAX_TCP_BUFFER_BYTES, MIN_TCP_BUFFER_BYTES)
+            )
+        );
+        let (accepted, dialled) = (accepted.unwrap(), dialled.unwrap());
+        assert_eq!(
+            dialled.buffer_capacities(),
+            (MAX_TCP_BUFFER_BYTES, MIN_TCP_BUFFER_BYTES)
+        );
+        let dial_syn = syn_from(&pair, accepted.peer_addr().port(), false);
+        assert_eq!(
+            (dial_syn.window, dial_syn.window_scale),
+            (u16::MAX, Some(14))
+        );
     }
 
     /// Sized sockets carry a body each way at once, every byte in order, and
@@ -2433,6 +2623,200 @@ mod link_tests {
         assert_eq!(socket_count(&pair.near), sockets_before - 1);
         assert_eq!(open_slots(&pair.near), 0);
         drop(accepted);
+    }
+
+    const RESOLVED: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 9, 0, 77);
+
+    /// A resolver on the far stack that drops every query reaching it
+    /// before `dark` has passed (forever with `None`), and with
+    /// `only_first` answers only the transaction it saw first. It records
+    /// when each query reached it, on the tokio clock, and its transaction.
+    struct DarkResolver {
+        queries: Arc<std::sync::Mutex<Vec<(Duration, u16)>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl DarkResolver {
+        fn start(far: &WgStack, dark: Option<Duration>, only_first: bool) -> Self {
+            let socket = far.bind_udp(53).unwrap();
+            let names = std::collections::HashMap::from([(
+                "dark.test".to_string(),
+                vec![std::net::IpAddr::V4(RESOLVED)],
+            )]);
+            let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&queries);
+            let opened = tokio::time::Instant::now();
+            let task = tokio::spawn(async move {
+                let mut buffer = vec![0u8; 1500];
+                loop {
+                    let Ok((read, from)) = socket.recv_from(&mut buffer).await else {
+                        return;
+                    };
+                    let query = &buffer[..read];
+                    let txid = u16::from_be_bytes([query[0], query[1]]);
+                    let at = tokio::time::Instant::now() - opened;
+                    let first = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push((at, txid));
+                        seen[0].1
+                    };
+                    if dark.is_none_or(|dark| at < dark) || (only_first && txid != first) {
+                        continue;
+                    }
+                    let (_, answer) =
+                        crate::wireguard::test_peer::build_dns_answer(query, &names).unwrap();
+                    let _ = socket.send_to(&answer, from).await;
+                }
+            });
+            Self { queries, task }
+        }
+
+        fn queries(&self) -> Vec<(Duration, u16)> {
+            self.queries.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for DarkResolver {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Two stacks back to back, the near one resolving through a resolver
+    /// on the far one, both running their protocol timers on the paused
+    /// tokio clock.
+    fn resolving_pair() -> Pair {
+        let pair = pair_of(
+            StackConfig {
+                dns_servers: vec![FAR.ip()],
+                ..config("10.9.0.1/24")
+            },
+            config("10.9.0.2/24"),
+        );
+        for stack in [&pair.near, &pair.far] {
+            stack.shared.with_stack(|inner| {
+                inner.tokio_started = Some(tokio::time::Instant::now() - inner.started.elapsed());
+            });
+        }
+        pair
+    }
+
+    /// A lookup that has ended left none of its queries behind: smoltcp has
+    /// no resend due on a stack that holds only its resolver, and every
+    /// lookup slot is free.
+    fn no_query_is_left_behind(stack: &WgStack) {
+        let resend_due = stack.shared.with_stack(|inner| {
+            let now = inner.now();
+            inner.iface.poll_delay(now, &inner.sockets)
+        });
+        assert_eq!(resend_due, None);
+        assert_eq!(stack.shared.dns_slots.available_permits(), DNS_QUERY_SLOTS);
+    }
+
+    /// A lookup through a path that drops everything for `dark`: how long
+    /// it took on the tokio clock, and what the resolver saw.
+    async fn resolve_through_a_dark_spell(
+        dark: Option<Duration>,
+        only_first: bool,
+        budget: Duration,
+    ) -> (
+        Result<Vec<std::net::IpAddr>, TunnelError>,
+        Duration,
+        Vec<(Duration, u16)>,
+    ) {
+        let pair = resolving_pair();
+        let resolver = DarkResolver::start(&pair.far, dark, only_first);
+        let started = tokio::time::Instant::now();
+        let resolved = pair.near.resolve("dark.test", budget).await;
+        let took = tokio::time::Instant::now() - started;
+        no_query_is_left_behind(&pair.near);
+        (resolved, took, resolver.queries())
+    }
+
+    async fn answered_within_a_second_of(dark: Duration) -> Vec<(Duration, u16)> {
+        let (resolved, took, queries) =
+            resolve_through_a_dark_spell(Some(dark), false, Duration::from_secs(30)).await;
+        assert_eq!(resolved.unwrap(), vec![std::net::IpAddr::V4(RESOLVED)]);
+        assert!(
+            took >= dark && took <= dark + Duration::from_secs(1),
+            "answered {took:?} into a lookup dark for {dark:?}: {queries:?}"
+        );
+        queries
+    }
+
+    /// A path dark for half a second: the resend or the fresh query at 1 s
+    /// is answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_dark_for_half_a_second_is_answered_at_one_second() {
+        answered_within_a_second_of(Duration::from_millis(500)).await;
+    }
+
+    /// A path dark for 2.5 s: a query goes out every second, so one is
+    /// answered by 3.5 s, not on smoltcp's resend at 7 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_dark_for_two_and_a_half_seconds_is_answered_within_a_second() {
+        answered_within_a_second_of(Duration::from_millis(2500)).await;
+    }
+
+    /// A path dark for 4.2 s, as a cold server is: the queries already in
+    /// flight keep one datagram a second on the wire, so one is answered
+    /// by 5.2 s, and the lookup never held more than its four queries.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_dark_for_four_seconds_is_answered_within_a_second() {
+        let queries = answered_within_a_second_of(Duration::from_millis(4200)).await;
+        let mut transactions: Vec<u16> = queries.iter().map(|(_, txid)| *txid).collect();
+        transactions.sort_unstable();
+        transactions.dedup();
+        assert!(transactions.len() <= DNS_LIVE_QUERIES, "{queries:?}");
+    }
+
+    /// An answer to the first query, arriving after later ones went out, is
+    /// taken: the earlier queries stay able to answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_answer_to_an_older_query_is_taken() {
+        let dark = Duration::from_millis(2500);
+        let (resolved, took, queries) =
+            resolve_through_a_dark_spell(Some(dark), true, Duration::from_secs(30)).await;
+        assert_eq!(resolved.unwrap(), vec![std::net::IpAddr::V4(RESOLVED)]);
+        let first = queries[0].1;
+        assert!(
+            queries.iter().any(|(_, txid)| *txid != first),
+            "later queries went out: {queries:?}"
+        );
+        // The first query's own resend at 3 s is the one answered.
+        assert_eq!(took, Duration::from_secs(3), "{queries:?}");
+    }
+
+    /// A lookup nobody answers ends at its budget, with the error a single
+    /// query gave.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_lookup_ends_at_its_budget_as_before() {
+        let budget = Duration::from_secs(6);
+        let (resolved, took, _) = resolve_through_a_dark_spell(None, false, budget).await;
+        let error = resolved.unwrap_err();
+        assert!(
+            error.to_string().contains("did not answer in time"),
+            "{error}"
+        );
+        assert_eq!(took, budget);
+    }
+
+    /// A lookup nobody answers with a budget past smoltcp's ten seconds a
+    /// server ends when its first query is given up, as a single query
+    /// was: that query last went out at 7 s and smoltcp looks at it again
+    /// only when its next resend is due, 8 s later, and finds its server's
+    /// time up. Before then it sent 16 queries where one sent 4.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_lookup_past_smoltcps_server_timeout_fails_as_before() {
+        let (resolved, took, queries) =
+            resolve_through_a_dark_spell(None, false, Duration::from_secs(60)).await;
+        let error = resolved.unwrap_err();
+        assert!(
+            error.to_string().contains("does not know this name"),
+            "{error}"
+        );
+        assert_eq!(took, Duration::from_secs(15), "{queries:?}");
+        assert_eq!(queries.len(), 16, "{queries:?}");
     }
 
     #[test]
