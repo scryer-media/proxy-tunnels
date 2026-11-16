@@ -552,12 +552,16 @@ impl StackInner {
     }
 
     /// A TCP socket with `buffers`, or with the stack's default sizes.
+    ///
+    /// Nagle is off, as on the crate's OS sockets: a small write leaves at
+    /// once instead of waiting for the peer to acknowledge the one before it.
     pub(crate) fn add_tcp_socket(&mut self, buffers: Option<TcpBuffers>) -> SocketHandle {
         let buffers = buffers.unwrap_or(self.tcp_buffers);
-        let socket = tcp::Socket::new(
+        let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; buffers.receive()]),
             tcp::SocketBuffer::new(vec![0u8; buffers.send()]),
         );
+        socket.set_nagle_enabled(false);
         self.sockets.add(socket)
     }
 
@@ -2623,6 +2627,29 @@ mod link_tests {
         assert_eq!(socket_count(&pair.near), sockets_before - 1);
         assert_eq!(open_slots(&pair.near), 0);
         drop(accepted);
+    }
+
+    /// Every tunnel TCP socket, dialled or accepted, has Nagle off, so a
+    /// small write never waits for an earlier one to be acknowledged.
+    #[tokio::test]
+    async fn a_tunnel_tcp_socket_has_nagle_off_on_both_ends() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let accepted = accepted.unwrap();
+        for stack in [&pair.near, &pair.far] {
+            stack.shared.with_stack(|inner| {
+                let mut seen = 0;
+                for (_, socket) in inner.sockets.iter() {
+                    if let smoltcp::socket::Socket::Tcp(socket) = socket {
+                        seen += 1;
+                        assert!(!socket.nagle_enabled());
+                    }
+                }
+                assert!(seen > 0, "the stack holds this connection's socket");
+            });
+        }
+        drop((accepted, dialled));
     }
 
     const RESOLVED: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 9, 0, 77);
