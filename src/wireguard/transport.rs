@@ -955,7 +955,15 @@ impl gotatun::udp::UdpRecv for TunnelSocket {
         pool: &mut gotatun::packet::PacketBufPool,
     ) -> std::io::Result<(gotatun::packet::Packet, std::net::SocketAddr)> {
         match self {
-            Self::System(socket) => socket.recv_from(pool).await,
+            // Windows reports a refused datagram on a later read even on a
+            // socket that is not connected. gotatun ends its receive task
+            // for good on any read error, so the refusal is skipped here.
+            Self::System(socket) => loop {
+                match socket.recv_from(pool).await {
+                    Err(error) if is_peer_refusal(&error) => {}
+                    read => return read,
+                }
+            },
             // Exactly one datagram is read; the rest stay queued on the
             // socket for the next call.
             Self::Bound(socket) => socket.recv_one(pool).await,
@@ -985,7 +993,13 @@ impl gotatun::udp::UdpRecv for TunnelSocket {
         match self {
             Self::System(socket) => {
                 let system = buffer.system.get_or_insert_with(Default::default);
-                socket.recv_many_from(system, pool, packets).await
+                // As in `recv_from`: a refusal is one lost datagram, read on.
+                loop {
+                    match socket.recv_many_from(system, pool, packets).await {
+                        Err(error) if is_peer_refusal(&error) => {}
+                        read => return read,
+                    }
+                }
             }
             Self::Bound(socket) => socket.recv_many(buffer, pool, packets).await,
             Self::Datagram(_) => {
@@ -1116,6 +1130,7 @@ fn report_receive_buffer(socket: &socket2::SockRef<'_>, asked: usize) -> Option<
 mod tests {
     use super::*;
     use gotatun::packet::{Packet, PacketBufPool};
+    use gotatun::udp::UdpRecv as _;
 
     #[tokio::test]
     async fn oversized_receive_buffer_keeps_tunnel_available() {
@@ -1127,6 +1142,45 @@ mod tests {
         };
         let (_, socket) = bind_with_buffer(&params, i32::MAX as usize).await.unwrap();
         assert!(socket.socket().local_addr().unwrap().ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn an_unconnected_socket_reads_on_after_a_refused_datagram() {
+        // A datagram to a closed port earns a refusal. Windows reports it on
+        // the sender's next read although the socket is not connected; the
+        // datagram that follows must still be read, by either receive.
+        let params = UdpTransportFactoryParams {
+            addr: Some("127.0.0.1".parse().unwrap()),
+            port: 0,
+            #[cfg(target_os = "linux")]
+            fwmark: None,
+        };
+        let (_, socket) = UdpSocketFactory::default().bind(&params).await.unwrap();
+        let here = socket.socket().local_addr().unwrap();
+        let mut socket = TunnelSocket::System(socket);
+        let sender = loopback();
+        let mut pool = PacketBufPool::new(8);
+        let mut batch = RecvBatch::default();
+        for many in [true, false] {
+            let closed = loopback().local_addr().unwrap();
+            let TunnelSocket::System(system) = &socket else {
+                unreachable!()
+            };
+            system.socket().send_to(b"refused", closed).await.unwrap();
+            sender.send_to(b"kept", here).unwrap();
+            let (packet, source) = if many {
+                let mut packets = Vec::new();
+                socket
+                    .recv_many_from(&mut batch, &mut pool, &mut packets)
+                    .await
+                    .unwrap();
+                packets.remove(0)
+            } else {
+                socket.recv_from(&mut pool).await.unwrap()
+            };
+            assert_eq!(&packet[..], b"kept");
+            assert_eq!(source, sender.local_addr().unwrap());
+        }
     }
 
     #[tokio::test]
