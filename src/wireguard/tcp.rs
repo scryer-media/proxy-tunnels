@@ -195,6 +195,27 @@ impl WgTcpStream {
         self.peer
     }
 
+    /// Hand the tunnel `token`, to be dropped the moment this stream's
+    /// socket leaves the tunnel's stack and both its buffers are freed.
+    ///
+    /// Dropping the stream does not free the socket: the tunnel keeps it
+    /// until the close finishes, or until a linger of ten seconds runs out
+    /// if the far side never finishes it. The token is dropped then, or
+    /// when the tunnel stops, or when the stack is dropped, whichever comes
+    /// first, and never while the buffers still exist. A caller that
+    /// budgets socket memory puts its permit here and hands the bytes back
+    /// exactly when they are gone. A stream given a second token holds both.
+    ///
+    /// The token is dropped on whichever thread frees the socket (the
+    /// tunnel's engine, or a task opening a socket), with the tunnel's stack
+    /// lock held. Its drop must therefore be quick and must not call into
+    /// this tunnel; waking a task or giving back to a counter is fine.
+    pub fn hold_until_freed<T: Send + 'static>(&self, token: T) {
+        let handle = self.handle;
+        self.shared
+            .peek_stack(|stack| stack.hold_until_freed(handle, Box::new(token)));
+    }
+
     fn close_half(&mut self) {
         if self.shut_down {
             return;
@@ -217,7 +238,17 @@ impl Drop for WgTcpStream {
         // Every stream holds one of the stack's socket slots, dialled or
         // accepted; reclaiming the socket frees it.
         let handle = self.handle;
-        self.shared.with_stack(|stack| stack.retire(handle, true));
+        let shared = &self.shared;
+        shared.with_stack(|stack| {
+            stack.retire(handle, true);
+            // A stopped stack is never polled again, and stopping closed
+            // this socket, so it is freed now rather than when the last
+            // handle on the stack goes. Read under the lock: a stop that
+            // takes the lock after this reclaims the socket itself.
+            if shared.is_stopped() {
+                stack.reclaim_finished();
+            }
+        });
     }
 }
 

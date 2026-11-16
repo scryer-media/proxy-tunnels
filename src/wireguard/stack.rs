@@ -38,7 +38,7 @@
 //! other one has been, which is longer than any TIME-WAIT this stack can
 //! produce.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -436,6 +436,11 @@ impl StackShared {
                     _ => {}
                 }
             }
+            // Every retired socket is closed now and nothing will poll it
+            // again: give back its buffers, and drop its tokens, at once
+            // rather than when the last handle on the stack goes.
+            let now = inner.now();
+            inner.reclaim(now);
         }
         self.stopped_notify.notify_waiters();
     }
@@ -504,10 +509,18 @@ impl SocketSlots {
     }
 }
 
+/// A value held beside a socket's buffers and dropped once they are freed.
+pub(crate) type FreedToken = Box<dyn Send + 'static>;
+
 /// The smoltcp state itself. Only ever touched under [`StackShared`]'s lock.
 pub(crate) struct StackInner {
     iface: Interface,
     sockets: SocketSet<'static>,
+    /// What callers asked to be dropped when a socket's buffers are freed,
+    /// by socket. Declared after `sockets`, so a stack dropped whole frees
+    /// every socket before it drops a token. Touched only when a token is
+    /// handed over and when a socket is removed.
+    freed_tokens: HashMap<SocketHandle, FreedToken>,
     phy: WgPhy,
     dns: Option<SocketHandle>,
     started: std::time::Instant,
@@ -643,7 +656,32 @@ impl StackInner {
 
     /// Remove a socket immediately, for one that never reached a peer.
     pub(crate) fn discard(&mut self, handle: SocketHandle) {
-        self.sockets.remove(handle);
+        self.remove_socket(handle);
+    }
+
+    /// Hold `token` until `handle`'s socket is removed and its buffers are
+    /// freed, then drop it. A socket given a second token holds both.
+    pub(crate) fn hold_until_freed(&mut self, handle: SocketHandle, token: FreedToken) {
+        let token = match self.freed_tokens.remove(&handle) {
+            Some(held) => Box::new((held, token)),
+            None => token,
+        };
+        self.freed_tokens.insert(handle, token);
+    }
+
+    /// Reclaim, now, every retired socket that has finished closing.
+    pub(crate) fn reclaim_finished(&mut self) {
+        let now = self.now();
+        self.reclaim(now);
+    }
+
+    /// The one way a socket leaves the set. smoltcp hands the removed socket
+    /// back by value and both its buffers are owned vectors, so dropping it
+    /// frees them; only then is the socket's token dropped. The handle may
+    /// be reused by the next socket added, so its token goes with it.
+    fn remove_socket(&mut self, handle: SocketHandle) {
+        drop(self.sockets.remove(handle));
+        drop(self.freed_tokens.remove(&handle));
     }
 
     pub(crate) fn dns_socket(&mut self) -> Option<(&mut dns::Socket<'static>, SocketHandle)> {
@@ -724,7 +762,7 @@ impl StackInner {
                 // The far side never finished the close. Take the slot back.
                 socket.abort();
             }
-            self.sockets.remove(handle);
+            self.remove_socket(handle);
             if counted {
                 self.open_sockets.release();
             }
@@ -850,6 +888,7 @@ impl WgStack {
                 tcp_buffers: TcpBuffers::default_for(config.download_tuning),
                 iface,
                 sockets,
+                freed_tokens: HashMap::new(),
                 phy,
                 dns,
                 started,
@@ -1627,6 +1666,127 @@ mod resource_tests {
         });
         assert_eq!(shared.open_sockets.open.load(Ordering::SeqCst), 0);
         assert!(shared.claim_socket().is_ok());
+    }
+
+    /// A token whose drop is seen through the count of its clones.
+    fn token() -> Arc<()> {
+        Arc::new(())
+    }
+
+    fn held(token: &Arc<()>) -> bool {
+        Arc::strong_count(token) > 1
+    }
+
+    /// A stack with nothing driving it, built as the engine builds one.
+    fn engine_built_stack() -> WgStack {
+        WgStack::build_for_engine(StackConfig {
+            addresses: vec!["10.0.0.1/24".parse().unwrap()],
+            dns_servers: Vec::new(),
+            mtu: 1280,
+            proxy_config_id: "freed-test".into(),
+            download_tuning: false,
+            max_sockets: DEFAULT_MAX_SOCKETS,
+        })
+    }
+
+    /// Add a TCP socket dialling a peer that never answers, holding `token`.
+    fn dialling_socket(inner: &mut StackInner, token: &Arc<()>) -> SocketHandle {
+        let handle = inner.add_tcp_socket(None);
+        let port = inner.next_ephemeral_port();
+        let (sockets, context) = inner.socket_and_context();
+        sockets
+            .get_mut::<tcp::Socket>(handle)
+            .connect(
+                context,
+                (IpAddress::from(std::net::Ipv4Addr::new(10, 0, 0, 2)), 80),
+                port,
+            )
+            .unwrap();
+        inner.hold_until_freed(handle, Box::new(Arc::clone(token)));
+        handle
+    }
+
+    fn holds(inner: &StackInner, handle: SocketHandle) -> bool {
+        inner.sockets.iter().any(|(held, _)| held == handle)
+    }
+
+    /// A retired socket whose peer never finishes the close keeps its
+    /// token until the linger runs out, and drops it with the socket then.
+    #[test]
+    fn a_token_waits_out_the_linger_of_a_close_never_finished() {
+        let stack = engine_built_stack();
+        let token = token();
+        stack.shared.peek_stack(|inner| {
+            let handle = dialling_socket(inner, &token);
+            inner.retire(handle, false);
+            let deadline = inner.closing[0].deadline;
+            inner.reclaim(inner.now());
+            assert!(holds(inner, handle) && held(&token));
+            inner.reclaim(deadline - smoltcp::time::Duration::from_micros(1));
+            assert!(
+                holds(inner, handle),
+                "still closing just before the deadline"
+            );
+            assert!(held(&token), "so the token is still held");
+            inner.reclaim(deadline);
+            assert!(!holds(inner, handle), "freed at the deadline");
+            assert!(!held(&token), "and the token with it");
+        });
+    }
+
+    /// A discarded socket is freed at once, and every token it held goes
+    /// with it.
+    #[test]
+    fn a_discard_drops_every_token_at_once() {
+        let stack = engine_built_stack();
+        let first = token();
+        let second = token();
+        stack.shared.peek_stack(|inner| {
+            let handle = dialling_socket(inner, &first);
+            inner.hold_until_freed(handle, Box::new(Arc::clone(&second)));
+            assert!(held(&first) && held(&second), "both held beside the socket");
+            inner.discard(handle);
+            assert!(!holds(inner, handle));
+            assert!(!held(&first) && !held(&second));
+            assert!(inner.freed_tokens.is_empty());
+        });
+    }
+
+    /// A stack dropped with a socket still closing frees the socket and
+    /// drops its token; neither is leaked.
+    #[test]
+    fn dropping_a_stack_with_a_closing_socket_drops_its_token() {
+        let stack = engine_built_stack();
+        let token = token();
+        stack.shared.peek_stack(|inner| {
+            let handle = dialling_socket(inner, &token);
+            inner.retire(handle, false);
+            inner.reclaim(inner.now());
+            assert!(holds(inner, handle), "still closing");
+        });
+        assert!(held(&token));
+        drop(stack);
+        assert!(!held(&token));
+    }
+
+    /// When the engine ends, a socket still closing is freed with its token
+    /// at once, not when the last handle on the stack goes.
+    #[test]
+    fn an_engine_ending_frees_closing_sockets_and_their_tokens() {
+        let stack = engine_built_stack();
+        let token = token();
+        let handle = stack.shared.peek_stack(|inner| {
+            let handle = dialling_socket(inner, &token);
+            inner.retire(handle, false);
+            handle
+        });
+        assert!(held(&token));
+        drop(stack.shared.stop_on_exit());
+        stack.shared.peek_stack(|inner| {
+            assert!(!holds(inner, handle));
+            assert!(inner.closing.is_empty());
+        });
+        assert!(!held(&token));
     }
 
     #[tokio::test]
@@ -2627,6 +2787,107 @@ mod link_tests {
         assert_eq!(socket_count(&pair.near), sockets_before - 1);
         assert_eq!(open_slots(&pair.near), 0);
         drop(accepted);
+    }
+
+    fn held(token: &Arc<()>) -> bool {
+        Arc::strong_count(token) > 1
+    }
+
+    /// A dialled stream's token outlives the stream while its socket is
+    /// still in the set, and is dropped by the reclaim that frees the socket
+    /// once the close finished, long before the linger.
+    #[tokio::test]
+    async fn a_finished_close_drops_the_token_before_the_linger() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, mut dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let mut accepted = accepted.unwrap();
+        drop(listener);
+        let token = Arc::new(());
+        dialled.hold_until_freed(Arc::clone(&token));
+        let sockets_before = socket_count(&pair.near);
+
+        dialled.shutdown().await.unwrap();
+        accepted.read_to_end(&mut Vec::new()).await.unwrap();
+        accepted.shutdown().await.unwrap();
+        while dialled.socket_state().0 != tcp::State::TimeWait {
+            tokio::task::yield_now().await;
+        }
+
+        // The current-thread runtime runs no pump between these lines.
+        drop(dialled);
+        pair.near.shared.peek_stack(|inner| {
+            assert_eq!(inner.closing.len(), 1, "retired, not yet reclaimed");
+            assert_eq!(inner.sockets.iter().count(), sockets_before);
+            assert!(held(&token), "the socket is still in the set");
+            let linger_ends = inner.closing[0].deadline;
+            let now = inner.now();
+            assert!(now < linger_ends);
+            inner.reclaim(now);
+            assert_eq!(inner.sockets.iter().count(), sockets_before - 1);
+        });
+        assert!(!held(&token), "dropped with the socket, before the linger");
+        drop(accepted);
+    }
+
+    /// An accepted stream's token is held through its close and dropped by
+    /// the pump in the same pass that frees the socket, never before.
+    #[tokio::test]
+    async fn an_accepted_streams_token_drops_when_its_socket_is_freed() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, mut dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let accepted = accepted.unwrap();
+        // The listener's pool socket is discarded with it, and its refill
+        // with it; neither is the accepted socket.
+        drop(listener);
+        let token = Arc::new(());
+        accepted.hold_until_freed(Arc::clone(&token));
+        let sockets_before = socket_count(&pair.far);
+        assert_eq!(sockets_before, 1, "only the accepted socket");
+
+        drop(accepted);
+        assert!(held(&token), "retired, not freed");
+        dialled.read_to_end(&mut Vec::new()).await.unwrap();
+        dialled.shutdown().await.unwrap();
+        loop {
+            // Read together under the lock, so the pump cannot run between.
+            let (sockets, still_held) = pair
+                .far
+                .shared
+                .peek_stack(|inner| (inner.sockets.iter().count(), held(&token)));
+            assert_eq!(
+                still_held,
+                sockets == sockets_before,
+                "the token is held exactly while its socket is in the set"
+            );
+            if !still_held {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(open_slots(&pair.far), 0);
+    }
+
+    /// A stream dropped after its stack stopped is freed at once, token and
+    /// all: nothing will ever poll that stack again.
+    #[tokio::test]
+    async fn a_stream_dropped_after_its_stack_stopped_drops_its_token_at_once() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let _accepted = accepted.unwrap();
+        let token = Arc::new(());
+        dialled.hold_until_freed(Arc::clone(&token));
+        let sockets_before = socket_count(&pair.near);
+
+        pair.near.shared.stop();
+        assert!(held(&token), "the stream still holds its socket");
+        assert_eq!(socket_count(&pair.near), sockets_before);
+        drop(dialled);
+        assert!(!held(&token));
+        assert_eq!(socket_count(&pair.near), sockets_before - 1);
+        assert_eq!(open_slots(&pair.near), 0);
     }
 
     /// Every tunnel TCP socket, dialled or accepted, has Nagle off, so a
