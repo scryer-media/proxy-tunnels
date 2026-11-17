@@ -12,7 +12,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -22,7 +22,9 @@ use smoltcp::wire::IpEndpoint;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::TunnelError;
-use crate::wireguard::stack::{MAX_LISTEN_BACKLOG, StackInner, StackShared, TcpBuffers};
+use crate::wireguard::stack::{
+    MAX_LISTEN_BACKLOG, StackInner, StackShared, TcpBuffers, is_stand_in,
+};
 
 /// A TCP connection to something on the far side of the tunnel.
 pub struct WgTcpStream {
@@ -35,6 +37,81 @@ pub struct WgTcpStream {
     /// Set once a read saw the far side's FIN. Only then is the end of the
     /// connection an end of stream; any other end is an error.
     fin_seen: bool,
+    /// Set by [`Self::abort`], which has freed the socket already, so the
+    /// drop that follows does nothing.
+    released: bool,
+}
+
+/// A handle that resets one [`WgTcpStream`]'s connection, made by
+/// [`WgTcpStream::aborter`].
+///
+/// It is cheap to clone, can be sent to any task, and holds the tunnel
+/// weakly, so it never keeps the tunnel, the socket or its buffers alive.
+#[derive(Clone, Debug)]
+pub struct WgTcpAborter {
+    shared: Weak<StackShared>,
+    handle: SocketHandle,
+    /// Which socket this handle was made for: the stack forgets it when the
+    /// socket leaves, so a later socket given the same slot is never reset.
+    id: u64,
+}
+
+impl WgTcpAborter {
+    /// Reset the connection and free its socket's buffers now.
+    ///
+    /// The far side is sent a reset (RST), not a FIN. Before this returns,
+    /// both buffers are freed, the socket slot is given back, and every
+    /// token passed to [`WgTcpStream::hold_until_freed`] is dropped, on the
+    /// calling thread and after the tunnel's lock is released, with no
+    /// linger and nothing waited for from the far side. Unsent and unread
+    /// data is discarded.
+    ///
+    /// A stream still alive stays a valid value. From now on every read,
+    /// write, flush and shutdown on it fails with
+    /// [`io::ErrorKind::ConnectionAborted`], and a task parked in one is
+    /// woken to see that; only a read into an empty buffer still returns
+    /// `Ok` at once, as it does on any stream. Its socket is replaced by an
+    /// empty stand-in that holds no buffers and no socket slot, so it does
+    /// not count against the tunnel's socket cap, but it stays in the
+    /// tunnel's socket set until the stream is dropped: drop an aborted
+    /// stream promptly. Dropping it frees nothing more.
+    ///
+    /// A stream already dropped and still closing is freed at once instead
+    /// of at the end of its linger.
+    ///
+    /// On a tunnel that has stopped the socket is freed all the same, and
+    /// nothing is sent: nothing leaves a stopped tunnel.
+    ///
+    /// Prefer this to dropping the stream when nothing is left to deliver,
+    /// such as an idle connection whose memory is wanted back, or when the
+    /// stream is owned by code that will not drop it now.
+    ///
+    /// Calling it again, or after the socket was freed by any path, does
+    /// nothing, and it never touches a later socket that takes the same
+    /// place in the tunnel. Once the tunnel itself is dropped it does
+    /// nothing.
+    pub fn abort(&self) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let (handle, id) = (self.handle, self.id);
+        // The stop flag is read under the lock, as a stream's drop reads it.
+        let (reset, tokens) =
+            shared.peek_stack(|stack| stack.reset_by_aborter(handle, id, shared.is_stopped()));
+        if reset {
+            // The reset is queued on the link; the pump carries it.
+            shared.wake();
+        }
+        // Outside the lock, so a token's drop may call into this tunnel.
+        drop(tokens);
+    }
+}
+
+fn aborted() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "this tunnel connection was aborted",
+    )
 }
 
 impl WgTcpStream {
@@ -65,15 +142,55 @@ impl WgTcpStream {
         })
     }
 
-    /// Reset the connection: the peer is sent an RST, not a FIN.
+    /// The stack's handle for this stream's socket.
     #[cfg(test)]
-    pub(crate) fn abort(&mut self) {
-        self.shared.with_stack(|stack| {
-            stack
-                .sockets_mut()
-                .get_mut::<tcp::Socket>(self.handle)
-                .abort();
-        });
+    pub(crate) fn socket_handle(&self) -> SocketHandle {
+        self.handle
+    }
+
+    /// A detached handle that can reset this connection from anywhere, even
+    /// while the stream itself is owned by other code. See [`WgTcpAborter`].
+    ///
+    /// The handle holds the tunnel weakly: it keeps neither the tunnel, the
+    /// socket nor its buffers alive. Every handle made for one stream points
+    /// at that stream's socket and no other.
+    pub fn aborter(&self) -> WgTcpAborter {
+        let handle = self.handle;
+        let id = self.shared.peek_stack(|stack| stack.abort_id(handle));
+        WgTcpAborter {
+            shared: Arc::downgrade(&self.shared),
+            handle,
+            id,
+        }
+    }
+
+    /// Reset this connection and free its socket now, consuming the stream.
+    ///
+    /// The far side is sent a reset (RST), not a FIN, and the socket leaves
+    /// the tunnel's stack before this returns: both buffers are freed, the
+    /// socket slot is given back, and every token passed to
+    /// [`Self::hold_until_freed`] is dropped, with no linger and nothing
+    /// waited for from the far side. Anything written and not yet
+    /// acknowledged, and anything received and not yet read, is discarded.
+    ///
+    /// Prefer this to dropping the stream when nothing is left to deliver,
+    /// such as an idle connection whose memory is wanted back: a dropped
+    /// stream closes gracefully, and its buffers stay held until the far
+    /// side finishes the close or ten seconds pass. Drop it instead when
+    /// the far side must see a clean end, as after a complete request.
+    ///
+    /// Every token passed to [`Self::hold_until_freed`] is dropped on the
+    /// calling thread, after the tunnel's lock is released and before this
+    /// returns. On a stopped tunnel nothing is sent, and the socket is still
+    /// freed.
+    pub fn abort(mut self) {
+        self.released = true;
+        let handle = self.handle;
+        let shared = &self.shared;
+        // Read under the lock, as `Drop` does.
+        let tokens = shared.with_stack(|stack| stack.reset_owned(handle, shared.is_stopped()));
+        // Outside the lock, so a token's drop may call into this tunnel.
+        drop(tokens);
     }
 
     /// Dial `remote` and wait for the connection to establish, on a socket
@@ -151,6 +268,7 @@ impl WgTcpStream {
                 peer: remote,
                 shut_down: false,
                 fin_seen: false,
+                released: false,
             }),
             Ok(false) => {
                 shared.with_stack(|stack| stack.discard(handle));
@@ -187,6 +305,7 @@ impl WgTcpStream {
             peer,
             shut_down: false,
             fin_seen: false,
+            released: false,
         }
     }
 
@@ -201,19 +320,39 @@ impl WgTcpStream {
     /// Dropping the stream does not free the socket: the tunnel keeps it
     /// until the close finishes, or until a linger of ten seconds runs out
     /// if the far side never finishes it. The token is dropped then, or
-    /// when the tunnel stops, or when the stack is dropped, whichever comes
-    /// first, and never while the buffers still exist. A caller that
-    /// budgets socket memory puts its permit here and hands the bytes back
-    /// exactly when they are gone. A stream given a second token holds both.
+    /// when the tunnel stops, or when the stack is dropped, or when the
+    /// connection is aborted, whichever comes first, and never while the
+    /// buffers still exist. A caller that budgets socket memory puts its
+    /// permit here and hands the bytes back exactly when they are gone. A
+    /// stream given a second token holds both.
     ///
-    /// The token is dropped on whichever thread frees the socket (the
-    /// tunnel's engine, or a task opening a socket), with the tunnel's stack
-    /// lock held. Its drop must therefore be quick and must not call into
-    /// this tunnel; waking a task or giving back to a counter is fine.
+    /// Where the token is dropped depends on what freed the socket:
+    ///
+    /// - a close that finished, or a linger that ran out: on the tunnel's
+    ///   engine thread, with the tunnel's stack lock held;
+    /// - a task opening a socket on a full tunnel, which frees finished
+    ///   closes first: on that task's thread, with the lock held;
+    /// - the tunnel stopping, or a stream dropped after it stopped: on the
+    ///   thread that stops it or drops the stream, with the lock held;
+    /// - the stack itself being dropped: on the thread that drops the last
+    ///   handle on it, with no lock held;
+    /// - [`Self::abort`] or [`WgTcpAborter::abort`]: on the calling thread,
+    ///   after the lock is released and before the call returns;
+    /// - a token handed to a stream whose connection an aborter already
+    ///   reset: at once, on the calling thread, with no lock held, before
+    ///   this returns.
+    ///
+    /// Because some of these paths hold the lock, a token's drop must be
+    /// quick, must not block, and must not call into this tunnel: no
+    /// stream, listener, aborter or stack method, which would deadlock on
+    /// that lock. Waking a task or giving back to a counter is fine.
     pub fn hold_until_freed<T: Send + 'static>(&self, token: T) {
         let handle = self.handle;
-        self.shared
+        let refused = self
+            .shared
             .peek_stack(|stack| stack.hold_until_freed(handle, Box::new(token)));
+        // Outside the lock: the buffers were already freed by an aborter.
+        drop(refused);
     }
 
     fn close_half(&mut self) {
@@ -230,16 +369,28 @@ impl WgTcpStream {
 
 impl Drop for WgTcpStream {
     fn drop(&mut self) {
+        if self.released {
+            // `abort` freed the socket, its slot and its tokens already.
+            return;
+        }
         // Close rather than abort: a consumer that drops a stream after a
         // complete HTTP response should still send its FIN, or the far side
         // logs a reset for every request. The pump reclaims the socket once
         // the close finishes, or gives up on it after the linger window.
         self.close_half();
+        #[cfg(test)]
+        self.shared.run_before_retire();
         // Every stream holds one of the stack's socket slots, dialled or
         // accepted; reclaiming the socket frees it.
         let handle = self.handle;
         let shared = &self.shared;
         shared.with_stack(|stack| {
+            if stack.was_reset(handle) {
+                // An aborter freed the buffers, the slot and the tokens; only
+                // the empty stand-in is left to remove.
+                stack.discard(handle);
+                return;
+            }
             stack.retire(handle, true);
             // A stopped stack is never polled again, and stopping closed
             // this socket, so it is freed now rather than when the last
@@ -322,6 +473,10 @@ impl AsyncRead for WgTcpStream {
                     *fin_seen = true;
                     Poll::Ready(Ok((0, false)))
                 }
+                // Reset through an aborter: whatever was unread is gone.
+                Err(tcp::RecvError::InvalidState) if is_stand_in(socket) => {
+                    Poll::Ready(Err(aborted()))
+                }
                 Err(tcp::RecvError::InvalidState) if *fin_seen => Poll::Ready(Ok((0, false))),
                 // The connection ended without a FIN: reset by the far side,
                 // timed out, or torn down with the tunnel. What arrived may be
@@ -366,16 +521,25 @@ impl AsyncWrite for WgTcpStream {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if this.shut_down {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "this tunnel connection has been shut down",
-            )));
-        }
         let handle = this.handle;
+        if this.shut_down {
+            // An abort outranks a local shutdown, as it does everywhere.
+            let reset = this.shared.peek_stack(|stack| stack.was_reset(handle));
+            return Poll::Ready(Err(if reset {
+                aborted()
+            } else {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "this tunnel connection has been shut down",
+                )
+            }));
+        }
         let written = this.shared.peek_stack(|stack| {
             let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
             if !socket.may_send() {
+                if is_stand_in(socket) {
+                    return Poll::Ready(Err(aborted()));
+                }
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "the far side closed this tunnel connection",
@@ -406,6 +570,11 @@ impl AsyncWrite for WgTcpStream {
         let handle = this.handle;
         this.shared.peek_stack(|stack| {
             let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+            // Reset through an aborter: what was queued was discarded, so
+            // it was never flushed.
+            if is_stand_in(socket) {
+                return Poll::Ready(Err(aborted()));
+            }
             if socket.send_queue() == 0 {
                 return Poll::Ready(Ok(()));
             }
@@ -426,7 +595,27 @@ impl AsyncWrite for WgTcpStream {
         // reads keep working. That is what `AsyncWrite::shutdown` means, and
         // it is what a SOCKS5 relay needs when one direction finishes first.
         let this = self.get_mut();
-        this.close_half();
+        let handle = this.handle;
+        let first = !this.shut_down;
+        this.shut_down = true;
+        // One hold of the lock: refuse an aborted connection, or queue the
+        // FIN the first time.
+        let reset = this.shared.peek_stack(|stack| {
+            if stack.was_reset(handle) {
+                return true;
+            }
+            if first {
+                stack.sockets_mut().get_mut::<tcp::Socket>(handle).close();
+            }
+            false
+        });
+        if reset {
+            return Poll::Ready(Err(aborted()));
+        }
+        if first {
+            // The FIN is queued; only a poll sends it.
+            this.shared.wake();
+        }
         Poll::Ready(Ok(()))
     }
 }

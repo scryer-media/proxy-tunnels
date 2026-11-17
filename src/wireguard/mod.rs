@@ -96,7 +96,7 @@ pub use stack::{
     DEFAULT_MAX_SOCKETS, MAX_LISTEN_BACKLOG, MAX_MAX_SOCKETS, MAX_TCP_BUFFER_BYTES,
     MIN_MAX_SOCKETS, MIN_TCP_BUFFER_BYTES, TcpBuffers, WgStack, socket_cap,
 };
-pub use tcp::{WgTcpListener, WgTcpStream};
+pub use tcp::{WgTcpAborter, WgTcpListener, WgTcpStream};
 pub use udp::WgUdpSocket;
 
 #[cfg(any(test, feature = "test-support"))]

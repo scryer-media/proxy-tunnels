@@ -292,6 +292,11 @@ pub(crate) struct StackShared {
     /// together.
     #[cfg(test)]
     pub(crate) before_listen: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Run by a dropped stream between its two holds of the lock, after it
+    /// queued its FIN and before it retires its socket, so a test can act
+    /// in that gap.
+    #[cfg(test)]
+    pub(crate) before_retire: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// How often the stack's lock was taken and its pump woken.
@@ -341,6 +346,18 @@ impl StackShared {
         self.counts.lock();
         let mut inner = self.inner.lock().expect("tunnel stack lock poisoned");
         f(&mut inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_before_retire(&self) {
+        let hook = self
+            .before_retire
+            .lock()
+            .expect("retire hook lock poisoned")
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     #[cfg(test)]
@@ -509,8 +526,22 @@ impl SocketSlots {
     }
 }
 
+/// Whether `socket` is the empty stand-in an aborter leaves under a living
+/// stream's handle. Every real TCP socket holds both buffers at no less than
+/// [`MIN_TCP_BUFFER_BYTES`], so empty buffers mark the stand-in alone.
+pub(crate) fn is_stand_in(socket: &tcp::Socket<'_>) -> bool {
+    socket.recv_capacity() == 0 && socket.send_capacity() == 0
+}
+
 /// A value held beside a socket's buffers and dropped once they are freed.
 pub(crate) type FreedToken = Box<dyn Send + 'static>;
+
+/// What the stack knows of a socket an aborter was made for.
+struct Abortable {
+    id: u64,
+    /// Its index in `closing`, once its stream has been dropped.
+    closing: Option<usize>,
+}
 
 /// The smoltcp state itself. Only ever touched under [`StackShared`]'s lock.
 pub(crate) struct StackInner {
@@ -521,6 +552,13 @@ pub(crate) struct StackInner {
     /// every socket before it drops a token. Touched only when a token is
     /// handed over and when a socket is removed.
     freed_tokens: HashMap<SocketHandle, FreedToken>,
+    /// Each socket a [`crate::wireguard::WgTcpAborter`] was made for: its
+    /// identity, so a handle never reaches a later socket that reuses the
+    /// slot, and its place in `closing` once its stream is dropped, so an
+    /// abort finds it without a scan. Filled only when an aborter is made;
+    /// emptied with the socket.
+    abort_ids: HashMap<SocketHandle, Abortable>,
+    next_abort_id: u64,
     phy: WgPhy,
     dns: Option<SocketHandle>,
     started: std::time::Instant,
@@ -652,6 +690,25 @@ impl StackInner {
             deadline,
             counted,
         });
+        // Free when no aborter was ever made, which is the common case.
+        if !self.abort_ids.is_empty()
+            && let Some(abortable) = self.abort_ids.get_mut(&handle)
+        {
+            abortable.closing = Some(self.closing.len() - 1);
+        }
+    }
+
+    /// Take `closing[index]` out, keeping the index an aborter's socket
+    /// records right for the entry moved into its place.
+    fn take_closing(&mut self, index: usize) -> Closing {
+        let taken = self.closing.swap_remove(index);
+        if !self.abort_ids.is_empty()
+            && let Some(moved) = self.closing.get(index)
+            && let Some(abortable) = self.abort_ids.get_mut(&moved.handle)
+        {
+            abortable.closing = Some(index);
+        }
+        taken
     }
 
     /// Remove a socket immediately, for one that never reached a peer.
@@ -660,13 +717,24 @@ impl StackInner {
     }
 
     /// Hold `token` until `handle`'s socket is removed and its buffers are
-    /// freed, then drop it. A socket given a second token holds both.
-    pub(crate) fn hold_until_freed(&mut self, handle: SocketHandle, token: FreedToken) {
+    /// freed, then drop it. A socket given a second token holds both. A
+    /// socket already reset by an aborter has no buffers left: its token is
+    /// handed back, for the caller to drop once the lock is released.
+    #[must_use = "a token handed back is dropped by the caller, outside the lock"]
+    pub(crate) fn hold_until_freed(
+        &mut self,
+        handle: SocketHandle,
+        token: FreedToken,
+    ) -> Option<FreedToken> {
+        if self.was_reset(handle) {
+            return Some(token);
+        }
         let token = match self.freed_tokens.remove(&handle) {
             Some(held) => Box::new((held, token)),
             None => token,
         };
         self.freed_tokens.insert(handle, token);
+        None
     }
 
     /// Reclaim, now, every retired socket that has finished closing.
@@ -682,6 +750,131 @@ impl StackInner {
     fn remove_socket(&mut self, handle: SocketHandle) {
         drop(self.sockets.remove(handle));
         drop(self.freed_tokens.remove(&handle));
+        self.abort_ids.remove(&handle);
+    }
+
+    /// The identity an aborter for `handle`'s socket checks, made on first
+    /// use and kept until the socket leaves the set.
+    pub(crate) fn abort_id(&mut self, handle: SocketHandle) -> u64 {
+        if let Some(abortable) = self.abort_ids.get(&handle) {
+            return abortable.id;
+        }
+        let id = self.next_abort_id;
+        self.next_abort_id += 1;
+        self.abort_ids
+            .insert(handle, Abortable { id, closing: None });
+        id
+    }
+
+    /// Whether `handle`'s socket is the empty stand-in a reset through an
+    /// aborter leaves for a stream still alive. A real TCP socket never has
+    /// empty buffers: both are at least [`MIN_TCP_BUFFER_BYTES`].
+    pub(crate) fn was_reset(&mut self, handle: SocketHandle) -> bool {
+        is_stand_in(self.sockets.get_mut::<tcp::Socket>(handle))
+    }
+
+    /// Reset the socket of a stream that is going away with this call, and
+    /// free it whole, now: buffers and slot. A socket already reset through
+    /// an aborter only has its stand-in removed. Returns the socket's
+    /// tokens, for the caller to drop once the lock is released.
+    #[must_use = "the tokens are dropped by the caller, outside the lock"]
+    pub(crate) fn reset_owned(
+        &mut self,
+        handle: SocketHandle,
+        stopped: bool,
+    ) -> Option<FreedToken> {
+        if self.was_reset(handle) {
+            self.remove_socket(handle);
+            return None;
+        }
+        let send = self.abort_socket(handle, stopped);
+        let socket = self.sockets.remove(handle);
+        self.open_sockets.release();
+        self.free_reset(handle, socket, send)
+    }
+
+    /// Reset the socket an aborter made with `id` points at, if it is still
+    /// that socket and still holds its buffers, and free them now; on a
+    /// stopped stack nothing is sent. A stream still alive keeps an empty
+    /// stand-in under its handle, so its reads and writes fail rather than
+    /// reach another socket; one already dropped and lingering is removed
+    /// whole. Returns whether anything was reset, and the socket's tokens,
+    /// for the caller to drop once the lock is released.
+    #[must_use = "the tokens are dropped by the caller, outside the lock"]
+    pub(crate) fn reset_by_aborter(
+        &mut self,
+        handle: SocketHandle,
+        id: u64,
+        stopped: bool,
+    ) -> (bool, Option<FreedToken>) {
+        let closing = match self.abort_ids.get(&handle) {
+            Some(abortable) if abortable.id == id => abortable.closing,
+            _ => return (false, None),
+        };
+        if self.was_reset(handle) {
+            return (false, None);
+        }
+        let send = self.abort_socket(handle, stopped);
+        let token = match closing {
+            Some(index) => {
+                let closing = self.take_closing(index);
+                debug_assert!(closing.handle == handle);
+                let socket = self.sockets.remove(handle);
+                if closing.counted {
+                    self.open_sockets.release();
+                }
+                self.free_reset(handle, socket, send)
+            }
+            None => {
+                let stand_in = tcp::Socket::new(
+                    tcp::SocketBuffer::new(Vec::new()),
+                    tcp::SocketBuffer::new(Vec::new()),
+                );
+                let socket =
+                    std::mem::replace(self.sockets.get_mut::<tcp::Socket>(handle), stand_in);
+                // A living stream always holds a slot; its drop will not
+                // release it again.
+                self.open_sockets.release();
+                self.free_reset(handle, smoltcp::socket::Socket::Tcp(socket), send)
+            }
+        };
+        (true, token)
+    }
+
+    /// Abort `handle`'s socket, which wakes every task parked on it, and say
+    /// whether it still owes the far side a reset. A connection already in
+    /// TIME-WAIT has finished both ways and is owed nothing, and a stopped
+    /// stack sends nothing again.
+    fn abort_socket(&mut self, handle: SocketHandle, stopped: bool) -> bool {
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        let finished = socket.state() == tcp::State::TimeWait;
+        socket.abort();
+        !finished && !stopped
+    }
+
+    /// Send the reset an aborted socket owes, if `send`, then free the socket
+    /// and hand back its tokens. The socket is polled for egress alone, out
+    /// of the set, so no other socket is touched; the reset lands in the
+    /// link's outbound queue and the caller wakes the pump to carry it. A
+    /// full link drops it, and the far side's next segment, meeting no
+    /// socket, is answered with a reset instead.
+    fn free_reset(
+        &mut self,
+        handle: SocketHandle,
+        socket: smoltcp::socket::Socket<'static>,
+        send: bool,
+    ) -> Option<FreedToken> {
+        if send {
+            let now = self.now();
+            let mut alone = SocketSet::new(Vec::with_capacity(1));
+            alone.add(socket);
+            self.iface.poll_egress(now, &mut self.phy, &mut alone);
+            drop(alone);
+        } else {
+            drop(socket);
+        }
+        self.abort_ids.remove(&handle);
+        self.freed_tokens.remove(&handle)
     }
 
     pub(crate) fn dns_socket(&mut self) -> Option<(&mut dns::Socket<'static>, SocketHandle)> {
@@ -766,7 +959,7 @@ impl StackInner {
             if counted {
                 self.open_sockets.release();
             }
-            self.closing.swap_remove(index);
+            self.take_closing(index);
         }
     }
 }
@@ -889,6 +1082,8 @@ impl WgStack {
                 iface,
                 sockets,
                 freed_tokens: HashMap::new(),
+                abort_ids: HashMap::new(),
+                next_abort_id: 0,
                 phy,
                 dns,
                 started,
@@ -910,6 +1105,8 @@ impl WgStack {
             counts: StackCounts::default(),
             #[cfg(test)]
             before_listen: Mutex::new(None),
+            #[cfg(test)]
+            before_retire: Mutex::new(None),
         });
 
         WgStack { shared }
@@ -1702,7 +1899,11 @@ mod resource_tests {
                 port,
             )
             .unwrap();
-        inner.hold_until_freed(handle, Box::new(Arc::clone(token)));
+        assert!(
+            inner
+                .hold_until_freed(handle, Box::new(Arc::clone(token)))
+                .is_none()
+        );
         handle
     }
 
@@ -1743,7 +1944,11 @@ mod resource_tests {
         let second = token();
         stack.shared.peek_stack(|inner| {
             let handle = dialling_socket(inner, &first);
-            inner.hold_until_freed(handle, Box::new(Arc::clone(&second)));
+            assert!(
+                inner
+                    .hold_until_freed(handle, Box::new(Arc::clone(&second)))
+                    .is_none()
+            );
             assert!(held(&first) && held(&second), "both held beside the socket");
             inner.discard(handle);
             assert!(!holds(inner, handle));
@@ -2336,7 +2541,7 @@ mod link_tests {
                 tokio::task::yield_now().await;
             }
             if reset {
-                stream.abort();
+                stream.aborter().abort();
             } else {
                 stream.shutdown().await.unwrap();
             }
@@ -2888,6 +3093,579 @@ mod link_tests {
         assert!(!held(&token));
         assert_eq!(socket_count(&pair.near), sockets_before - 1);
         assert_eq!(open_slots(&pair.near), 0);
+    }
+
+    /// Counts the drops of the tokens it hands out, so a test sees a token
+    /// dropped exactly once.
+    #[derive(Clone, Default)]
+    struct Drops(Arc<AtomicUsize>);
+
+    struct Counted(Arc<AtomicUsize>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drops {
+        fn token(&self) -> Counted {
+            Counted(Arc::clone(&self.0))
+        }
+
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Stop the far stack's pump and wait until it has stopped: from then on
+    /// the far side answers nothing.
+    async fn silence_far(pair: &Pair) {
+        pair.tasks[1].abort();
+        pair.far.shared.wait_stopped().await;
+    }
+
+    /// Nothing an aborted socket held is left in the stack's books.
+    fn no_trace_left(stack: &WgStack) {
+        stack.shared.peek_stack(|inner| {
+            assert!(inner.closing.is_empty(), "nothing lingering");
+            assert!(inner.freed_tokens.is_empty(), "no token kept");
+            assert!(inner.abort_ids.is_empty(), "no identity kept");
+        });
+    }
+
+    /// Two stacks back to back whose clocks both run on the paused tokio
+    /// clock, so nothing a test asserts depends on real time.
+    fn paused_pair() -> Pair {
+        let pair = pair();
+        for stack in [&pair.near, &pair.far] {
+            stack.shared.with_stack(|inner| {
+                inner.tokio_started = Some(tokio::time::Instant::now() - inner.started.elapsed());
+            });
+        }
+        pair
+    }
+
+    /// With the far side silent, a graceful drop holds its token until the
+    /// linger runs out, while an abort drops its token before it returns,
+    /// with no clock moved and nothing heard from the far side. Both stacks
+    /// run on the paused clock, so a stalled runner cannot move the linger.
+    #[tokio::test(start_paused = true)]
+    async fn an_abort_frees_an_idle_stream_at_once_where_a_drop_lingers() {
+        let pair = paused_pair();
+        let mut listener = pair.far.listen(PORT, 2).unwrap();
+        let sockets_before = socket_count(&pair.near);
+        let (first, dropped) = tokio::join!(listener.accept(), dial(&pair));
+        let (second, aborted) = tokio::join!(listener.accept(), dial(&pair));
+        let (_first, _second) = (first.unwrap(), second.unwrap());
+        let (graceful, reset) = (Drops::default(), Drops::default());
+        dropped.hold_until_freed(graceful.token());
+        aborted.hold_until_freed(reset.token());
+        silence_far(&pair).await;
+        assert_eq!(socket_count(&pair.near), sockets_before + 2);
+        assert_eq!(open_slots(&pair.near), 2);
+
+        let linger = smoltcp::time::Duration::from_micros(LINGER.as_micros() as u64);
+        drop(dropped);
+        let linger_ends = pair.near.shared.peek_stack(|inner| {
+            assert_eq!(inner.closing.len(), 1);
+            let linger_ends = inner.closing[0].deadline;
+            assert_eq!(linger_ends - inner.now(), linger, "the clock stands still");
+            inner.reclaim(linger_ends - smoltcp::time::Duration::from_micros(1));
+            assert_eq!(inner.closing.len(), 1, "held until the linger ends");
+            linger_ends
+        });
+        assert_eq!(graceful.count(), 0, "a dropped stream keeps its bytes");
+
+        aborted.abort();
+        assert_eq!(reset.count(), 1, "freed before abort returned");
+        pair.near.shared.peek_stack(|inner| {
+            assert_eq!(linger_ends - inner.now(), linger, "with no clock moved");
+        });
+        assert_eq!(
+            socket_count(&pair.near),
+            sockets_before + 1,
+            "only the dropped one"
+        );
+        assert_eq!(open_slots(&pair.near), 1);
+        assert_eq!(graceful.count(), 0, "the lingering one is untouched");
+    }
+
+    /// The far side, still listening, sees the abort as a reset: its read
+    /// fails, where a FIN would have ended its stream cleanly. Nothing of
+    /// the aborted socket is left on the near stack.
+    #[tokio::test]
+    async fn an_abort_sends_the_far_side_a_reset_not_a_fin() {
+        let pair = pair();
+        let sockets_before = socket_count(&pair.near);
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let mut accepted = accepted.unwrap();
+        let drops = Drops::default();
+        dialled.hold_until_freed(drops.token());
+
+        dialled.abort();
+        assert_eq!(drops.count(), 1);
+        assert_eq!(socket_count(&pair.near), sockets_before);
+        assert_eq!(open_slots(&pair.near), 0);
+        no_trace_left(&pair.near);
+
+        let error = accepted
+            .read(&mut [0u8; 16])
+            .await
+            .expect_err("a reset, not the end of the stream");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// A stream the far side already ended, by FIN or by reset, is freed
+    /// once by an abort; an aborter used afterwards finds nothing to do.
+    #[tokio::test]
+    async fn an_abort_after_the_far_side_ended_frees_once() {
+        for reset in [false, true] {
+            let pair = pair();
+            let sockets_before = socket_count(&pair.near);
+            let stream = ended_after(&pair, b"done", reset).await;
+            let drops = Drops::default();
+            stream.hold_until_freed(drops.token());
+            let aborter = stream.aborter();
+
+            stream.abort();
+            assert_eq!(drops.count(), 1, "reset {reset}");
+            aborter.abort();
+            assert_eq!(drops.count(), 1, "freed once, reset {reset}");
+            assert_eq!(socket_count(&pair.near), sockets_before);
+            assert_eq!(open_slots(&pair.near), 0);
+            no_trace_left(&pair.near);
+        }
+    }
+
+    /// An aborter used while another task is parked in a read wakes that
+    /// read with an error and drops the token at once, with the far side
+    /// silent. The living stream then fails every read, write and flush,
+    /// drops a token handed to it at once, and its drop frees nothing more.
+    #[tokio::test]
+    async fn an_aborter_wakes_a_parked_read_and_frees_at_once() {
+        let pair = pair();
+        let sockets_before = socket_count(&pair.near);
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let _accepted = accepted.unwrap();
+        let drops = Drops::default();
+        dialled.hold_until_freed(drops.token());
+        let aborter = dialled.aborter();
+        silence_far(&pair).await;
+
+        let (parked_tx, parked) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            let mut stream = dialled;
+            let mut parked_tx = Some(parked_tx);
+            let mut buffer = [0u8; 16];
+            let result = {
+                let mut read = std::pin::pin!(stream.read(&mut buffer));
+                std::future::poll_fn(|context| {
+                    let poll = read.as_mut().poll(context);
+                    if poll.is_pending()
+                        && let Some(parked_tx) = parked_tx.take()
+                    {
+                        let _ = parked_tx.send(());
+                    }
+                    poll
+                })
+                .await
+            };
+            (stream, result)
+        });
+        parked.await.unwrap();
+
+        aborter.abort();
+        assert_eq!(drops.count(), 1, "freed before abort returned");
+        assert_eq!(open_slots(&pair.near), 0, "the slot is back");
+
+        let (mut stream, result) = reader.await.unwrap();
+        let aborted = std::io::ErrorKind::ConnectionAborted;
+        assert_eq!(result.expect_err("woken with an error").kind(), aborted);
+        let read = stream.read(&mut [0u8; 16]).await;
+        assert_eq!(read.expect_err("still aborted").kind(), aborted);
+        let write = stream.write(b"x").await;
+        assert_eq!(write.expect_err("writes fail").kind(), aborted);
+        let flush = stream.flush().await;
+        assert_eq!(flush.expect_err("flushes fail").kind(), aborted);
+        let shutdown = stream.shutdown().await;
+        assert_eq!(shutdown.expect_err("shutdowns fail").kind(), aborted);
+        let write = stream.write(b"x").await;
+        assert_eq!(write.expect_err("after a shutdown too").kind(), aborted);
+        assert_eq!(
+            stream.read(&mut []).await.unwrap(),
+            0,
+            "an empty read is Ok"
+        );
+
+        let late = Drops::default();
+        stream.hold_until_freed(late.token());
+        assert_eq!(late.count(), 1, "no buffers left to wait for");
+        aborter.abort();
+        assert_eq!(drops.count(), 1, "a second abort does nothing");
+
+        assert_eq!(socket_count(&pair.near), sockets_before + 1, "the stand-in");
+        drop(stream);
+        assert_eq!(socket_count(&pair.near), sockets_before);
+        assert_eq!(open_slots(&pair.near), 0, "not released twice");
+        assert_eq!(drops.count(), 1);
+        no_trace_left(&pair.near);
+    }
+
+    /// Streams dropped gracefully whose far side never finishes the close
+    /// are freed by their aborters at once, instead of at the linger's end,
+    /// in any order, each one alone, while the rest keep lingering.
+    #[tokio::test]
+    async fn an_aborter_frees_a_lingering_stream_at_once() {
+        let pair = pair();
+        let sockets_before = socket_count(&pair.near);
+        let mut listener = pair.far.listen(PORT, 3).unwrap();
+        let mut accepted = Vec::new();
+        let mut lingering = Vec::new();
+        for _ in 0..3 {
+            let (far, near) = tokio::join!(listener.accept(), dial(&pair));
+            accepted.push(far.unwrap());
+            let drops = Drops::default();
+            near.hold_until_freed(drops.token());
+            lingering.push((near.aborter(), drops));
+            drop(near);
+        }
+        silence_far(&pair).await;
+        pair.near
+            .shared
+            .peek_stack(|inner| assert_eq!(inner.closing.len(), 3, "all lingering"));
+        let counts = |lingering: &[(crate::wireguard::WgTcpAborter, Drops)]| -> Vec<usize> {
+            lingering.iter().map(|(_, drops)| drops.count()).collect()
+        };
+        assert_eq!(counts(&lingering), [0, 0, 0]);
+
+        // The first closing entry goes; the last moves into its place.
+        lingering[0].0.abort();
+        assert_eq!(counts(&lingering), [1, 0, 0]);
+        // The moved one is still found where it now is.
+        lingering[2].0.abort();
+        assert_eq!(counts(&lingering), [1, 0, 1]);
+        assert_eq!(socket_count(&pair.near), sockets_before + 1);
+        assert_eq!(open_slots(&pair.near), 1);
+        pair.near.shared.peek_stack(|inner| {
+            assert_eq!(inner.closing.len(), 1, "the middle one lingers on");
+            // The one left still reclaims at its own deadline.
+            let deadline = inner.closing[0].deadline;
+            inner.reclaim(deadline);
+        });
+        assert_eq!(counts(&lingering), [1, 1, 1]);
+        assert_eq!(socket_count(&pair.near), sockets_before);
+        assert_eq!(open_slots(&pair.near), 0);
+        no_trace_left(&pair.near);
+        for (aborter, _) in &lingering {
+            aborter.abort();
+        }
+        assert_eq!(counts(&lingering), [1, 1, 1], "each freed once");
+    }
+
+    /// An aborter whose socket is gone never touches the stream that takes
+    /// the same slot of the socket set next, before or after that stream
+    /// makes an aborter of its own.
+    #[tokio::test]
+    async fn an_aborter_never_reaches_a_socket_that_reuses_its_slot() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, first) = tokio::join!(listener.accept(), dial(&pair));
+        let mut accepted = accepted.unwrap();
+        let first_drops = Drops::default();
+        first.hold_until_freed(first_drops.token());
+        let stale = first.aborter();
+        let slot = first.socket_handle();
+
+        // A graceful close the far side finishes, so the pump frees it.
+        drop(first);
+        accepted.read_to_end(&mut Vec::new()).await.unwrap();
+        accepted.shutdown().await.unwrap();
+        while first_drops.count() == 0 {
+            tokio::task::yield_now().await;
+        }
+        drop(accepted);
+
+        let (accepted, mut second) = tokio::join!(listener.accept(), dial(&pair));
+        let mut accepted = accepted.unwrap();
+        assert_eq!(second.socket_handle(), slot, "the slot was reused");
+        let second_drops = Drops::default();
+        second.hold_until_freed(second_drops.token());
+
+        stale.abort();
+        let own = second.aborter();
+        stale.abort();
+        assert_eq!(second_drops.count(), 0, "the new stream is untouched");
+        assert_eq!(first_drops.count(), 1);
+        assert!(matches!(second.socket_state().0, tcp::State::Established));
+        second.write_all(b"ping").await.unwrap();
+        let mut ping = [0u8; 4];
+        accepted.read_exact(&mut ping).await.unwrap();
+        assert_eq!(&ping, b"ping");
+
+        own.abort();
+        assert_eq!(second_drops.count(), 1, "its own aborter still works");
+    }
+
+    /// On a tunnel that has stopped, an aborter still frees the socket's
+    /// buffers, its slot and its token at once, sending nothing; the living
+    /// stream fails and its drop frees nothing more. The aborter keeps
+    /// nothing alive: once the tunnel is dropped it does nothing.
+    #[tokio::test]
+    async fn an_aborter_frees_on_a_stopped_tunnel_and_outlives_a_dropped_one() {
+        let mut pair = pair();
+        let sockets_before = socket_count(&pair.near);
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let _accepted = accepted.unwrap();
+        let mut dialled = dialled;
+        let drops = Drops::default();
+        dialled.hold_until_freed(drops.token());
+        let aborter = dialled.aborter();
+        let near = Arc::downgrade(&pair.near.shared);
+
+        pair.near.shared.stop();
+        aborter.abort();
+        assert_eq!(drops.count(), 1, "freed on a stopped tunnel");
+        assert_eq!(open_slots(&pair.near), 0);
+        assert_eq!(socket_count(&pair.near), sockets_before + 1, "the stand-in");
+        let read = dialled.read(&mut [0u8; 16]).await;
+        assert_eq!(
+            read.expect_err("aborted").kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+        drop(dialled);
+        assert_eq!(drops.count(), 1, "once");
+        assert_eq!(socket_count(&pair.near), sockets_before);
+        assert_eq!(open_slots(&pair.near), 0);
+        no_trace_left(&pair.near);
+
+        let tasks = std::mem::take(&mut pair.tasks);
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        drop(listener);
+        drop(pair);
+        assert!(near.upgrade().is_none(), "the aborter kept nothing alive");
+        aborter.abort();
+        assert_eq!(drops.count(), 1);
+    }
+
+    /// An aborter fired in the gap a stream's drop leaves between its two
+    /// holds of the lock, after the FIN was queued and before the socket is
+    /// retired, frees the socket once; the retire then finds the stand-in
+    /// and only removes it.
+    #[tokio::test]
+    async fn an_aborter_fired_inside_a_drop_frees_once() {
+        let pair = pair();
+        let sockets_before = socket_count(&pair.near);
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let mut accepted = accepted.unwrap();
+        let drops = Drops::default();
+        dialled.hold_until_freed(drops.token());
+        let aborter = dialled.aborter();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let fired = Arc::clone(&fired);
+            let drops = drops.clone();
+            move || {
+                aborter.abort();
+                assert_eq!(drops.count(), 1, "freed inside the gap");
+                fired.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        *pair.near.shared.before_retire.lock().unwrap() = Some(Arc::new(hook));
+
+        drop(dialled);
+        *pair.near.shared.before_retire.lock().unwrap() = None;
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.count(), 1, "freed once");
+        assert_eq!(socket_count(&pair.near), sockets_before);
+        assert_eq!(open_slots(&pair.near), 0, "released once");
+        no_trace_left(&pair.near);
+        let error = accepted
+            .read(&mut [0u8; 16])
+            .await
+            .expect_err("the reset outran the FIN");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// Records, at its drop, whether the stack's lock was free.
+    struct LockProbe {
+        stack: std::sync::Weak<StackShared>,
+        seen: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl Drop for LockProbe {
+        fn drop(&mut self) {
+            let free = self
+                .stack
+                .upgrade()
+                .is_some_and(|stack| stack.inner.try_lock().is_ok());
+            self.seen.lock().unwrap().push(free);
+        }
+    }
+
+    /// Both aborts, and a token handed over after an aborter fired, drop
+    /// their tokens with the stack's lock released, so a token's drop may
+    /// call into the tunnel. The probe is shown to see the lock held when
+    /// it is: the linger's reclaim drops its token under the lock.
+    #[tokio::test]
+    async fn an_abort_drops_tokens_outside_the_stack_lock() {
+        let pair = pair();
+        let mut listener = pair.far.listen(PORT, 4).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let probe = || LockProbe {
+            stack: Arc::downgrade(&pair.near.shared),
+            seen: Arc::clone(&seen),
+        };
+        let mut streams = Vec::new();
+        let mut far = Vec::new();
+        for _ in 0..4 {
+            let (accepted, dialled) = tokio::join!(listener.accept(), dial(&pair));
+            far.push(accepted.unwrap());
+            dialled.hold_until_freed(probe());
+            streams.push(dialled);
+        }
+        let control = streams.pop().unwrap();
+        let lingering = streams.pop().unwrap();
+        let living = streams.pop().unwrap();
+        let owned = streams.pop().unwrap();
+        silence_far(&pair).await;
+
+        owned.abort();
+        let living_aborter = living.aborter();
+        living_aborter.abort();
+        living.hold_until_freed(probe());
+        let lingering_aborter = lingering.aborter();
+        drop(lingering);
+        lingering_aborter.abort();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [true; 4],
+            "every drop outside the lock"
+        );
+
+        // The control: a stream left to its linger, reclaimed under the lock.
+        drop(control);
+        pair.near.shared.peek_stack(|inner| {
+            let deadline = inner.closing[0].deadline;
+            inner.reclaim(deadline);
+        });
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [true, true, true, true, false],
+            "the probe sees a held lock"
+        );
+        drop((living, far));
+    }
+
+    /// The tag of one TCP segment's control field, if `packet` is TCP.
+    fn tcp_control(packet: &[u8]) -> Option<smoltcp::wire::TcpControl> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{Ipv4Packet, TcpPacket, TcpRepr};
+        let ip = Ipv4Packet::new_checked(packet).ok()?;
+        let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+        TcpRepr::parse(
+            &tcp,
+            &ip.src_addr().into(),
+            &ip.dst_addr().into(),
+            &ChecksumCapabilities::ignored(),
+        )
+        .ok()
+        .map(|repr| repr.control)
+    }
+
+    /// Drive two engine-built stacks back to back as the engine does: a
+    /// `pass` on each, handing each the other's outbound packets, waking on
+    /// either stack's wake or its next protocol timer.
+    async fn drive_engines(near: WgStack, far: WgStack) {
+        let (mut to_far, mut to_near) = (Vec::new(), Vec::new());
+        loop {
+            let near_woken = near.shared.notified();
+            let far_woken = far.shared.notified();
+            tokio::pin!(near_woken, far_woken);
+            near_woken.as_mut().enable();
+            far_woken.as_mut().enable();
+            let near_delay = near
+                .shared
+                .peek_stack(|inner| inner.pass(&mut to_near, &mut to_far));
+            let far_delay = far
+                .shared
+                .peek_stack(|inner| inner.pass(&mut to_far, &mut to_near));
+            if !to_near.is_empty() || !to_far.is_empty() {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            // Far above any run when no timer is due; the runner bounds it.
+            let delay = [near_delay, far_delay]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(Duration::from_secs(3600));
+            tokio::select! {
+                () = &mut near_woken => {}
+                () = &mut far_woken => {}
+                () = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    /// On the production path, a stack whose packets wait in the outbound
+    /// queue for the engine, the reset an abort composes is in that queue
+    /// when the abort returns, leaves it on the engine's next `pass`, and
+    /// resets the far side's connection.
+    #[tokio::test]
+    async fn an_abort_on_an_engine_driven_stack_leaves_on_the_next_pass() {
+        let near = WgStack::build_for_engine(config("10.9.0.1/24"));
+        let far = WgStack::build_for_engine(config("10.9.0.2/24"));
+        let driver = tokio::spawn(drive_engines(near.clone(), far.clone()));
+        let mut listener = far.listen(PORT, 1).unwrap();
+        let (accepted, dialled) = tokio::join!(
+            listener.accept(),
+            near.connect(
+                SocketAddr::from(([10, 9, 0, 2], PORT)),
+                // Far above any run; the test runner bounds the test.
+                Duration::from_secs(3600),
+            )
+        );
+        let (mut accepted, dialled) = (accepted.unwrap(), dialled.unwrap());
+        driver.abort();
+        let _ = driver.await;
+        let drops = Drops::default();
+        dialled.hold_until_freed(drops.token());
+
+        dialled.abort();
+        assert_eq!(drops.count(), 1);
+        let mut to_far = Vec::new();
+        near.shared
+            .peek_stack(|inner| inner.pass(&mut Vec::new(), &mut to_far));
+        let mut carried = Vec::new();
+        let mut resets = 0;
+        for packet in to_far {
+            let bytes: gotatun::packet::Packet = packet.into();
+            if tcp_control(&bytes[..]) == Some(smoltcp::wire::TcpControl::Rst) {
+                resets += 1;
+            }
+            carried.push(bytes.try_into_ip().expect("an IP packet"));
+        }
+        assert_eq!(resets, 1, "one reset left the queue on the pass");
+        far.shared
+            .peek_stack(|inner| inner.pass(&mut carried, &mut Vec::new()));
+
+        let mut buffer = [0u8; 16];
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let read = std::pin::pin!(accepted.read(&mut buffer)).poll(&mut context);
+        let Poll::Ready(Err(error)) = read else {
+            panic!("the far side was not reset: {read:?}");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     }
 
     /// Every tunnel TCP socket, dialled or accepted, has Nagle off, so a
