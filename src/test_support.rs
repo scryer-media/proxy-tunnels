@@ -252,9 +252,9 @@ impl server::Handler for DoubleHandler {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        public_key: &russh::keys::PublicKey,
+        key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        let offered = public_key.fingerprint(HashAlg::Sha256).to_string();
+        let offered = key.public_key.fingerprint(HashAlg::Sha256).to_string();
         let accepted = user == self.options.username
             && self.authorized_fingerprint.as_deref() == Some(offered.as_str());
         if accepted {

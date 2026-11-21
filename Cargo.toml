@@ -30,7 +30,7 @@ http3 = ["dep:bytes", "dep:http", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:ru
 #
 # Pinned to a fork until the algorithm feature gates land upstream
 # (https://github.com/Eugeny/russh/pull/777); go back to crates.io then.
-russh = { git = "https://github.com/NZBMan/russh.git", tag = "v0.63.3-algorithm-gates.1", default-features = false, features = ["aws-lc-rs", "aes-gcm"] }
+russh = { git = "https://github.com/NZBMan/russh.git", tag = "v0.65.3-algorithm-gates.1", default-features = false, features = ["aws-lc-rs", "aes-gcm"] }
 # The WireGuard half. `gotatun` owns the protocol — handshakes, encryption,
 # rekeying, keepalives, peers, timers — and the Tokio UDP transport; `smoltcp`
 # owns IP/TCP/UDP/DNS above it. Neither ever touches an OS interface: the two
@@ -47,14 +47,14 @@ russh = { git = "https://github.com/NZBMan/russh.git", tag = "v0.63.3-algorithm-
 # families, and the TCP/UDP/DNS sockets. `async` is what makes the Tokio
 # wrappers real futures — smoltcp registers our task wakers on its sockets and
 # wakes them from the stack pump, so nothing in this crate spins.
-gotatun = { version = "0.9.2", default-features = false, features = ["aws-lc-rs", "device"] }
-smoltcp = { version = "0.13.1", default-features = false, features = ["std", "async", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-dns", "socket-tcp", "socket-udp", "socket-dns", "assembler-max-segment-count-32"] }
+gotatun = { version = "0.10.3", default-features = false, features = ["aws-lc-rs", "device"] }
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "async", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-dns", "socket-tcp", "socket-udp", "socket-dns", "assembler-max-segment-count-32"] }
 # gotatun's `Peer::allowed_ips` is `Vec<ipnetwork::IpNetwork>` and gotatun does
 # not re-export the crate, so a peer cannot be built without naming it. Pinned
 # to the version gotatun already resolves, so no second copy enters the tree.
 ipnetwork = "0.21"
-base64 = "0.22"
-tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+base64 = "0.23"
+tokio = { version = "1.54", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 async-trait = "0.1"
 thiserror = "2.0"
 tracing = "0.1"
@@ -66,12 +66,12 @@ bytes = { version = "1", optional = true }
 http = { version = "1", optional = true }
 h3 = { version = "0.0.8", path = "vendor/h3", optional = true }
 h3-quinn = { version = "0.0.10", path = "vendor/h3-quinn", optional = true }
-quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"], optional = true }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"], optional = true }
 webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "test-util"] }
+tokio = { version = "1.54", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "test-util"] }
 
 [[example]]
 name = "http3_interop"
