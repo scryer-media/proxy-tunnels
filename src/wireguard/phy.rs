@@ -18,6 +18,7 @@ use smoltcp::time::Instant;
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::wireguard::adapter::OutboundTx;
+use crate::wireguard::capture::Capture;
 
 /// How many packets may wait in either direction of the link before the
 /// producer feels back-pressure.
@@ -72,7 +73,7 @@ impl Outbound {
 pub(crate) struct WgPhy {
     /// Decrypted packets waiting to be handed to the interface. Filled by the
     /// stack pump, drained by `receive`.
-    inbound: VecDeque<Packet<Ip>>,
+    inbound: VecDeque<Packet<[u8]>>,
     /// Where composed packets go to be encrypted.
     outbound: Outbound,
     /// Buffers for outbound packets. Sized to the in-flight depth of the
@@ -86,6 +87,8 @@ pub(crate) struct WgPhy {
     /// Inbound packets discarded because the interface was not draining. Same
     /// reasoning, other direction.
     overrun: u64,
+    /// The diagnostic tap, when the provider was given one.
+    capture: Option<Capture>,
 }
 
 impl WgPhy {
@@ -97,7 +100,13 @@ impl WgPhy {
             mtu: usize::from(mtu),
             dropped: 0,
             overrun: 0,
+            capture: None,
         }
+    }
+
+    /// Note the headers of every packet in both directions in `capture`.
+    pub(crate) fn capture_into(&mut self, capture: Capture) {
+        self.capture = Some(capture);
     }
 
     /// Queue a decrypted packet for the next `poll`.
@@ -106,6 +115,10 @@ impl WgPhy {
     /// keeping up there is no point holding packets a sender has long since
     /// retransmitted, so the oldest is dropped.
     pub(crate) fn push_inbound(&mut self, packet: Packet<Ip>) {
+        let packet = Packet::<[u8]>::from(packet);
+        if let Some(capture) = &self.capture {
+            capture.note(&packet[..]);
+        }
         if self.inbound.len() >= PACKET_QUEUE_DEPTH {
             self.inbound.pop_front();
             self.overrun += 1;
@@ -162,7 +175,7 @@ impl phy::Device for WgPhy {
 
 /// One decrypted packet, waiting to be parsed by the interface.
 pub(crate) struct WgRxToken {
-    packet: Packet<Ip>,
+    packet: Packet<[u8]>,
 }
 
 impl phy::RxToken for WgRxToken {
@@ -170,8 +183,7 @@ impl phy::RxToken for WgRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let bytes = Packet::<[u8]>::from(self.packet);
-        f(bytes.as_ref())
+        f(&self.packet[..])
     }
 }
 
@@ -196,6 +208,9 @@ impl phy::TxToken for WgTxToken<'_> {
         }
 
         let result = f(&mut packet[..]);
+        if let Some(capture) = &self.device.capture {
+            capture.note(&packet[..]);
+        }
 
         match packet.try_into_ip() {
             Ok(packet) => {
@@ -235,6 +250,39 @@ mod tests {
         let mut packet = Packet::copy_from(&header).into_bytes();
         packet.buf_mut().extend_from_slice(payload);
         packet.try_into_ip().expect("a valid IP packet")
+    }
+
+    #[test]
+    fn a_capture_notes_packets_in_both_directions_and_none_without_one() {
+        let path = std::env::temp_dir().join(format!(
+            "proxy-tunnels-capture-{}-device.pcap",
+            std::process::id()
+        ));
+        let mut phy = WgPhy::new(Outbound::queue(), 1280);
+        // Before the tap is set nothing is noted.
+        phy.push_inbound(packet(b"before"));
+        phy.capture_into(Capture::start(path.clone(), "test").expect("the writer starts"));
+
+        phy.push_inbound(packet(&[7; 100]));
+        let tx = phy.transmit(Instant::from_micros(0)).expect("a tx token");
+        tx.consume(40, |buffer| {
+            buffer.fill(0);
+            buffer[0] = 0x45;
+            buffer[2..4].copy_from_slice(&40_u16.to_be_bytes());
+            buffer[9] = 6;
+            buffer[32] = 5 << 4;
+        });
+        phy.capture.take().expect("the tap is set").finish();
+
+        let file = std::fs::read(&path).expect("the capture is on disk");
+        std::fs::remove_file(&path).expect("the capture is removed");
+        let word = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().expect("four bytes"));
+        // Inbound: a 120-byte datagram, 48 bytes kept.
+        assert_eq!((word(24 + 8), word(24 + 12)), (48, 120));
+        // Outbound: a bare 40-byte segment, whole.
+        let second = 24 + 16 + 48;
+        assert_eq!((word(second + 8), word(second + 12)), (40, 40));
+        assert_eq!(file.len(), second + 16 + 40);
     }
 
     #[tokio::test]

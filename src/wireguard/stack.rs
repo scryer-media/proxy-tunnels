@@ -56,6 +56,7 @@ use tokio::sync::Notify;
 use crate::error::{SlotFreed, TunnelError};
 #[cfg(any(test, feature = "test-support"))]
 use crate::wireguard::adapter::{InboundRx, OutboundTx};
+use crate::wireguard::capture::Capture;
 use crate::wireguard::phy::{Outbound, PACKET_QUEUE_DEPTH, WgPhy};
 use crate::wireguard::spec::IpCidr;
 use crate::wireguard::tcp::{WgTcpListener, WgTcpStream};
@@ -1025,15 +1026,25 @@ impl WgStack {
         shutdown: Arc<Notify>,
         runtime: &tokio::runtime::Handle,
     ) -> (WgStack, tokio::task::JoinHandle<()>) {
-        let stack = Self::build(config, Outbound::Channel(outbound));
+        let stack = Self::build(config, Outbound::Channel(outbound), None);
         let pump = runtime.spawn(pump(Arc::clone(&stack.shared), inbound, shutdown));
         (stack, pump)
     }
 
     /// Build the interface with nothing driving it yet. Its composed packets
     /// wait in a queue for the engine that drives it to take.
+    #[cfg(test)]
     pub(crate) fn build_for_engine(config: StackConfig) -> WgStack {
-        Self::build(config, Outbound::queue())
+        Self::build(config, Outbound::queue(), None)
+    }
+
+    /// [`Self::build_for_engine`], with the headers of every packet in both
+    /// directions noted in `capture`.
+    pub(crate) fn build_for_engine_captured(
+        config: StackConfig,
+        capture: Option<Capture>,
+    ) -> WgStack {
+        Self::build(config, Outbound::queue(), capture)
     }
 
     /// The state the engine driving this stack shares with its sockets.
@@ -1041,8 +1052,11 @@ impl WgStack {
         &self.shared
     }
 
-    fn build(config: StackConfig, outbound: Outbound) -> WgStack {
+    fn build(config: StackConfig, outbound: Outbound, capture: Option<Capture>) -> WgStack {
         let mut phy = WgPhy::new(outbound, config.mtu);
+        if let Some(capture) = capture {
+            phy.capture_into(capture);
+        }
         let started = std::time::Instant::now();
 
         // The seed only has to differ between tunnels so two stacks do not

@@ -57,6 +57,7 @@
 
 #[cfg(any(test, feature = "test-support"))]
 mod adapter;
+mod capture;
 mod engine;
 mod phy;
 mod spec;
@@ -308,6 +309,7 @@ pub struct WireGuardTunnelProvider {
     observer: Arc<dyn TunnelObserver>,
     tunnel: tokio::sync::Mutex<Option<Arc<WgTunnel>>>,
     download_tuning: bool,
+    capture: Option<std::path::PathBuf>,
     udp_factory: Option<Arc<dyn crate::endpoint::UdpSocketFactory>>,
     datagram: Option<Arc<dyn DatagramTransport>>,
     endpoint_resolver: Option<Arc<dyn crate::endpoint::EndpointResolver>>,
@@ -330,6 +332,7 @@ impl WireGuardTunnelProvider {
             observer,
             tunnel: tokio::sync::Mutex::new(None),
             download_tuning: false,
+            capture: None,
             udp_factory: None,
             datagram: None,
             endpoint_resolver: None,
@@ -351,6 +354,23 @@ impl WireGuardTunnelProvider {
     /// runtime workers. Each tunnel then uses at most one core.
     pub fn with_download_tuning(mut self) -> Self {
         self.download_tuning = true;
+        self
+    }
+
+    /// A diagnostic tap: write the headers of every packet inside the tunnel,
+    /// in both directions, to a pcap file at `path`, replacing any file there
+    /// each time the tunnel comes up.
+    ///
+    /// Each record is the IP header, then a TCP header with its options, or a
+    /// UDP header and the 20 bytes after it (a uTP header). No TCP payload is
+    /// written. The file names both ends of every flow the tunnel carries, so
+    /// it is readable by its owner only. Records are dropped, never waited
+    /// for, when the disk cannot keep up. A path that cannot be opened is
+    /// logged and the tunnel runs without the tap.
+    ///
+    /// Off unless called. Not for an instance in ordinary use.
+    pub fn with_packet_capture(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.capture = Some(path.into());
         self
     }
 
@@ -651,14 +671,21 @@ impl WireGuardTunnelProvider {
             }
         };
 
-        let stack = WgStack::build_for_engine(StackConfig {
-            addresses: self.spec.addresses.clone(),
-            dns_servers: self.spec.dns_servers.clone(),
-            mtu,
-            proxy_config_id: self.spec.proxy_config_id.clone(),
-            download_tuning: self.download_tuning,
-            max_sockets: stack::socket_cap(self.spec.max_sockets),
-        });
+        let capture = self
+            .capture
+            .clone()
+            .and_then(|path| capture::Capture::start(path, &self.spec.proxy_config_id));
+        let stack = WgStack::build_for_engine_captured(
+            StackConfig {
+                addresses: self.spec.addresses.clone(),
+                dns_servers: self.spec.dns_servers.clone(),
+                mtu,
+                proxy_config_id: self.spec.proxy_config_id.clone(),
+                download_tuning: self.download_tuning,
+                max_sockets: stack::socket_cap(self.spec.max_sockets),
+            },
+            capture,
+        );
 
         // An ephemeral local port on an ordinary UDP socket. No listen port is
         // configured: nothing dials *us*. The socket is bound on the runtime
