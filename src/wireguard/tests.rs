@@ -689,6 +689,61 @@ async fn a_listener_takes_the_port_it_is_asked_for_and_refuses_a_second_one_ther
 }
 
 #[tokio::test]
+async fn a_datagram_socket_takes_the_port_it_is_asked_for_and_refuses_a_second_one_there() {
+    use crate::endpoint::DatagramTransport;
+    let peer = WireGuardTestPeer::start().await;
+    let observer = Arc::new(RecordingObserver::default());
+    let provider = WireGuardTunnelProvider::new(
+        peer.client_spec("proxy-bind-port"),
+        Arc::clone(&observer) as Arc<dyn TunnelObserver>,
+    );
+
+    let socket = provider.bind_datagrams(6881).await.expect("bind");
+    assert_eq!(
+        socket.local_addr(),
+        Some(SocketAddr::new(
+            IpAddr::V4(crate::wireguard::TEST_CLIENT_ADDRESS),
+            6881
+        )),
+        "the socket reports the tunnel's address and the port asked for"
+    );
+    assert!(
+        provider.bind_datagrams(6881).await.is_err(),
+        "a port one UDP socket holds is not shared with another"
+    );
+    drop(socket);
+    let again = provider
+        .bind_datagrams(6881)
+        .await
+        .expect("a dropped socket frees its port");
+    assert_eq!(again.local_addr().map(|local| local.port()), Some(6881));
+
+    for socket in [
+        provider.bind_datagrams(0).await.expect("bind 0"),
+        provider
+            .bind(peer.endpoint())
+            .await
+            .expect("transport bind"),
+    ] {
+        let port = socket.local_addr().expect("bound").port();
+        assert!(port >= 49152, "port 0 picks an ephemeral port: {port}");
+    }
+    let successes = observer.successes.lock().expect("successes").clone();
+    let failures = observer.failures.lock().expect("failures").clone();
+    assert_eq!(
+        successes.len(),
+        4,
+        "every bind that worked is reported: {successes:?}"
+    );
+    assert_eq!(
+        failures.len(),
+        1,
+        "the refused bind is reported: {failures:?}"
+    );
+    provider.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_provider_says_whether_its_current_tunnel_listens_on_a_port() {
     let peer = WireGuardTestPeer::start().await;
     let provider = WireGuardTunnelProvider::new(

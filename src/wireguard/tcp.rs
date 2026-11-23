@@ -767,12 +767,15 @@ impl WgTcpListener {
                     // look like an immediate end of stream. Wait for the
                     // handshake to finish.
                     if socket.may_send() || socket.may_recv() {
+                        // The handshake is done, and its time limit with it.
+                        socket.set_timeout(None);
                         let peer = socket.remote_endpoint();
                         return Poll::Ready(Ok((index, peer)));
                     }
                     if socket.state() == tcp::State::Closed {
-                        // A connection that was reset before it was taken
-                        // leaves its socket closed; put it back to work.
+                        // A connection that was reset before it was taken,
+                        // or whose handshake ran out of time, leaves its
+                        // socket closed; put it back to work.
                         let _ = socket.listen(port);
                     }
                     socket.register_recv_waker(context.waker());
@@ -818,6 +821,13 @@ impl Drop for WgTcpListener {
     }
 }
 
+/// How long a listener's socket waits for a peer to finish the handshake it
+/// began. A peer that is there answers within a round trip, and the reply is
+/// sent again after 1, 3, 7 and 15 seconds; one that has said nothing by now
+/// has gone, and its socket listens again. Without this a half-open socket
+/// is never given back, and a pool of them leaves the listener deaf.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
 fn stopped() -> TunnelError {
     TunnelError::Engine("the tunnel has stopped".to_string())
 }
@@ -830,11 +840,13 @@ fn listen_on(
     buffers: Option<TcpBuffers>,
 ) -> Result<SocketHandle, TunnelError> {
     let handle = stack.add_tcp_socket(buffers);
-    match stack
-        .sockets_mut()
-        .get_mut::<tcp::Socket>(handle)
-        .listen(port)
-    {
+    let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+    // Counted from the peer's last packet, so it runs only once a peer has
+    // begun a handshake; `accept` lifts it as it hands the socket out.
+    socket.set_timeout(Some(smoltcp::time::Duration::from_micros(
+        HANDSHAKE_TIMEOUT.as_micros() as u64,
+    )));
+    match socket.listen(port) {
         Ok(()) => Ok(handle),
         Err(error) => {
             stack.discard(handle);

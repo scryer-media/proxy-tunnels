@@ -418,6 +418,34 @@ impl WireGuardTunnelProvider {
             .listen_with(port, backlog, buffers)
     }
 
+    /// Bind a UDP socket on `port` inside the tunnel, bringing the tunnel up
+    /// if it is not. This is the socket peers outside reach through a port
+    /// the tunnel's gateway forwards. `0` picks a free ephemeral port; the
+    /// socket's [`DatagramSocket::local_addr`] says which. A port another UDP
+    /// socket on this tunnel holds is refused, and it is free again once
+    /// that socket is dropped.
+    ///
+    /// Like [`Self::listen`], the socket belongs to the tunnel that is
+    /// current now, and is sized to carry another tunnel's packets.
+    pub async fn bind_datagrams(&self, port: u16) -> Result<Arc<dyn DatagramSocket>, TunnelError> {
+        let bound = match self.tunnel().await {
+            Ok(tunnel) => tunnel.stack.bind_transport_udp(port),
+            Err(error) => Err(error),
+        };
+        match bound {
+            Ok(socket) => {
+                self.observer
+                    .tunnel_dial_succeeded(&self.spec.proxy_config_id);
+                Ok(Arc::new(socket))
+            }
+            Err(error) => {
+                self.observer
+                    .tunnel_dial_failed(&self.spec.proxy_config_id, &error.to_string());
+                Err(error)
+            }
+        }
+    }
+
     /// Like [`TunnelProvider::dial`], the connection's socket holding
     /// `buffers` instead of the tunnel's default sizes.
     ///
@@ -1093,22 +1121,7 @@ impl DatagramTransport for WireGuardTunnelProvider {
     }
 
     async fn bind(&self, _peer: SocketAddr) -> Result<Arc<dyn DatagramSocket>, TunnelError> {
-        let bound = match self.tunnel().await {
-            Ok(tunnel) => tunnel.stack.bind_transport_udp(0),
-            Err(error) => Err(error),
-        };
-        match bound {
-            Ok(socket) => {
-                self.observer
-                    .tunnel_dial_succeeded(&self.spec.proxy_config_id);
-                Ok(Arc::new(socket))
-            }
-            Err(error) => {
-                self.observer
-                    .tunnel_dial_failed(&self.spec.proxy_config_id, &error.to_string());
-                Err(error)
-            }
-        }
+        self.bind_datagrams(0).await
     }
 }
 
