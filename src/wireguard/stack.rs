@@ -2321,6 +2321,9 @@ mod link_tests {
         far: WgStack,
         /// Every SYN that crossed the wire, in order.
         syns: Arc<std::sync::Mutex<Vec<Syn>>>,
+        /// While set, the wire drops what it carries, near to far (`[0]`)
+        /// or far to near (`[1]`), and keeps both stacks running.
+        cuts: [Arc<std::sync::atomic::AtomicBool>; 2],
         tasks: Vec<tokio::task::JoinHandle<()>>,
     }
 
@@ -2408,14 +2411,20 @@ mod link_tests {
             &runtime,
         );
         let syns = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cuts: [Arc<std::sync::atomic::AtomicBool>; 2] = Default::default();
         let wire = |mut from: crate::wireguard::adapter::StackToDevice,
-                    mut to: crate::wireguard::adapter::DeviceToStack| {
+                    mut to: crate::wireguard::adapter::DeviceToStack,
+                    cut: &Arc<std::sync::atomic::AtomicBool>| {
             let syns = Arc::clone(&syns);
+            let cut = Arc::clone(cut);
             tokio::spawn(async move {
                 let mut pool = PacketBufPool::new(1);
                 while let Ok(packets) = from.recv(&mut pool).await {
                     let packets: Vec<_> = packets.collect();
                     for packet in packets {
+                        if cut.load(Ordering::SeqCst) {
+                            continue;
+                        }
                         let bytes: gotatun::packet::Packet = packet.into();
                         if let Some(syn) = syn_in(&bytes[..]) {
                             syns.lock().unwrap().push(syn);
@@ -2432,12 +2441,13 @@ mod link_tests {
             tasks: vec![
                 near_pump,
                 far_pump,
-                wire(near_out, far_in),
-                wire(far_out, near_in),
+                wire(near_out, far_in, &cuts[0]),
+                wire(far_out, near_in, &cuts[1]),
             ],
             near,
             far,
             syns,
+            cuts,
         }
     }
 
@@ -3144,6 +3154,107 @@ mod link_tests {
             });
         }
         pair
+    }
+
+    fn half_open_count(stack: &WgStack) -> usize {
+        stack.shared.peek_stack(|inner| {
+            inner
+                .sockets
+                .iter()
+                .filter(|(_, socket)| match socket {
+                    smoltcp::socket::Socket::Tcp(socket) => {
+                        socket.state() == smoltcp::socket::tcp::State::SynReceived
+                    }
+                    _ => false,
+                })
+                .count()
+        })
+    }
+
+    /// A peer that asks to connect and then vanishes does not keep the
+    /// listener's socket: once the handshake has gone unanswered for
+    /// [`HANDSHAKE_TIMEOUT`] the socket listens again. With a backlog of one,
+    /// a socket kept half-open would leave the listener deaf for good.
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_never_finished_gives_the_listeners_socket_back() {
+        use crate::wireguard::tcp::HANDSHAKE_TIMEOUT;
+        let pair = paused_pair();
+        let listener = pair.far.listen(PORT, 1).unwrap();
+        assert_eq!(socket_count(&pair.far), 1);
+        assert_eq!(open_slots(&pair.far), 1);
+        // Nothing the far side says reaches the dialler, so its handshake
+        // never finishes. Both stacks keep running.
+        pair.cuts[1].store(true, Ordering::SeqCst);
+        let near = pair.near.clone();
+        let dialling = tokio::spawn(async move { near.connect(FAR, FOREVER).await.map(|_| ()) });
+        while half_open_count(&pair.far) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // The dialler vanishes: nothing more of it, its reset included,
+        // reaches the far side.
+        pair.cuts[0].store(true, Ordering::SeqCst);
+        dialling.abort();
+        assert_eq!(listening_count(&pair.far), 0, "the one socket is taken");
+
+        let accepting = tokio::spawn(async move {
+            let mut listener = listener;
+            listener.accept().await.unwrap()
+        });
+        // One poll of the far stack just short of the limit, so the check
+        // below sees what smoltcp decided at that moment.
+        tokio::time::advance(HANDSHAKE_TIMEOUT - Duration::from_millis(1)).await;
+        pair.far.shared.with_stack(|inner| {
+            inner.poll();
+        });
+        assert_eq!(half_open_count(&pair.far), 1, "kept until the time is up");
+        assert_eq!(listening_count(&pair.far), 0);
+
+        // At the limit the far pump's own timer closes it, and the waiting
+        // accept puts it back to listening.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        while listening_count(&pair.far) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(half_open_count(&pair.far), 0);
+        assert_eq!(socket_count(&pair.far), 1, "the same socket, no new one");
+        assert_eq!(open_slots(&pair.far), 1, "no new slot");
+        assert!(!accepting.is_finished(), "nothing was accepted");
+
+        // The listener hears again: a later dial is accepted.
+        pair.cuts[0].store(false, Ordering::SeqCst);
+        pair.cuts[1].store(false, Ordering::SeqCst);
+        let (accepted, mut dialled) = tokio::join!(accepting, dial(&pair));
+        let mut accepted = accepted.unwrap();
+        dialled.write_all(b"heard").await.unwrap();
+        let mut heard = [0u8; 5];
+        accepted.read_exact(&mut heard).await.unwrap();
+        assert_eq!(&heard, b"heard");
+    }
+
+    /// The handshake's time limit ends with the handshake: an accepted
+    /// connection that then says nothing for far longer stays open.
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_connection_outlives_the_handshake_time() {
+        use crate::wireguard::tcp::HANDSHAKE_TIMEOUT;
+        let pair = paused_pair();
+        let mut listener = pair.far.listen(PORT, 1).unwrap();
+        let (accepted, mut dialled) = tokio::join!(listener.accept(), dial(&pair));
+        let mut accepted = accepted.unwrap();
+
+        // Twenty times the limit in half-limit steps, with nothing said
+        // either way; each step polls the far stack at that moment, so a
+        // limit still set on the socket would close it at the second step.
+        for _ in 0..20 {
+            tokio::time::advance(HANDSHAKE_TIMEOUT / 2).await;
+            pair.far.shared.with_stack(|inner| {
+                inner.poll();
+            });
+            assert_eq!(accepted.socket_state().0, tcp::State::Established);
+        }
+        dialled.write_all(b"still here").await.unwrap();
+        let mut heard = [0u8; 10];
+        accepted.read_exact(&mut heard).await.unwrap();
+        assert_eq!(&heard, b"still here");
     }
 
     /// With the far side silent, a graceful drop holds its token until the
