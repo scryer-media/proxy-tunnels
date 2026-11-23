@@ -49,33 +49,30 @@ pub(crate) struct UdpQueue {
 
 impl WgUdpSocket {
     /// Bind `port`, or an ephemeral port when it is `0`, queueing up to
-    /// `receive` arriving and `send` departing datagrams.
+    /// `receive` arriving and `send` departing datagrams. A port another UDP
+    /// socket on this stack holds is refused.
     pub(crate) fn bind(
         shared: Arc<StackShared>,
         port: u16,
         receive: UdpQueue,
         send: UdpQueue,
     ) -> Result<Self, TunnelError> {
-        let (handle, local_port, bound) = shared.with_stack(|stack| {
+        let (handle, local_port) = shared.with_stack(|stack| {
+            let local_port = stack.take_udp_port(port)?;
             let handle = stack.add_udp_socket_sized(receive, send);
-            let local_port = if port == 0 {
-                stack.next_ephemeral_port()
-            } else {
-                port
-            };
             let bound = stack
                 .sockets_mut()
                 .get_mut::<udp::Socket>(handle)
                 .bind(local_port);
-            (handle, local_port, bound)
-        });
-
-        if let Err(error) = bound {
-            shared.with_stack(|stack| stack.discard(handle));
-            return Err(TunnelError::Engine(format!(
-                "the tunnel could not bind UDP port {local_port}: {error:?}"
-            )));
-        }
+            if let Err(error) = bound {
+                stack.discard(handle);
+                stack.release_udp_port(local_port);
+                return Err(TunnelError::Engine(format!(
+                    "the tunnel could not bind UDP port {local_port}: {error:?}"
+                )));
+            }
+            Ok((handle, local_port))
+        })?;
 
         Ok(Self {
             shared,
@@ -240,6 +237,7 @@ impl Drop for WgUdpSocket {
             // Unlike TCP there is nothing to flush and no close to complete,
             // so the socket goes straight back.
             stack.discard(handle);
+            stack.release_udp_port(self.local_port);
         });
         self.shared.release_socket();
     }
